@@ -30,7 +30,7 @@ You can also use this repository (or a fork of it) as a [git submodule](https://
 $ cd my-project
 
 # Or use your fork
-$ git submodule add git@github.com:mattvonrocketstein/.cmk.git
+$ git submodule add git@github.com:robot-wranglers/.cmk.git
 ```
 
 *(Note: Users and CI/CD must now use `--recursive` now when cloning parent!)*
