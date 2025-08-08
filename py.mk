@@ -13,7 +13,8 @@ py.done.glyph=${sep} ${no_ansi}${bold}${green}${GLYPH_CHECK}
 pip.install=pip install \
 	--disable-pip-version-check $${pip_args:-} \
 	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo ) -e
-
+py.pkg.install/%:
+	@# Treats argument as 
 pip.install.build:; $(call log.target, installing build module with pip); pip install build
 pip.install/%: mk.require.tool/pip
 	@# NB: Pass `verbose=1` to avoid pip --quiet
@@ -21,10 +22,16 @@ pip.install/%: mk.require.tool/pip
 	$(call log.target.pad_bottom, ${pip.install} .[${*}] ${sep} ${cyan_flow_right} ) 
 	set -x && ${pip.install} .[${*}]
 	$(call log.target.pad_top, ${dim}${pip.install} .[${*}] ${py.done.glyph})
+py.pkg.extra.install/%:; ${make} pip.install/.[${*}]
+	@#
 pip.install.many/%:
+	@#
 	echo ${*} | ${stream.comma.to.nl} | ${make} flux.each/pip.install
-
+py.pkg.extra.install.many/%:
+	@#
+	echo ${*} | ${stream.comma.to.nl} | ${make} flux.each/py.pkg.extra.install
 pip.release pypi.release: mk.require.tool/twine mk.assert/PYPI_USER,PYPI_TOKEN
+	@#
 	PYPI_RELEASE=1 ${make} py.build \
 	&& twine upload \
 		--user $${PYPI_USER} \
@@ -42,8 +49,6 @@ py.stat:
 	_version=`python --version | awk -F' ' '{print $$2}'` \
 	&& _bin=`which python` \
 	&& $(call log.target, $${_version} ${sep} $${_bin}) 
-# && ${jb} version=$${_version} bin=$${_bin}
-	
 
 py.build py.pkg.build: py.clean
 	@# Build python package in working directory

@@ -30,9 +30,10 @@ css.pretty/%: Dockerfile.build/css.pretty
 
 # Diagramming Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
+mmd.config=.cmk/.mmd.config
+# mmd.config=${CMK_PLUGINS_DIR}
 define Dockerfile.mermaid 
-FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:10.6.1
+FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
 USER root 
 RUN apk add -q --update --no-cache coreutils build-base bash procps-ng
 RUN ln -s /home/mermaidcli/node_modules/.bin/mmdc /usr/local/bin/mmd
@@ -41,6 +42,8 @@ docs.mmd.stat: docs.mmd.build
 	${jb} version=`${make} docs.mmd.version|tr -d '\r'`
 docs.mmd.version:; cmd="--version" ${make} mk.docker/mermaid
 docs.mmd.build: Dockerfile.build/mermaid
+docs.mmd/%:; ${make} self.mmd.render/${*}
+	
 docs.mermaid docs.mmd: docs.mmd.build
 	@# Renders all diagrams for use with the documentation 
 	$(call log.target, rendering all mermaid diagrams)
@@ -49,7 +52,8 @@ docs.mermaid docs.mmd: docs.mmd.build
 docs.mmd.shell:; entrypoint=bash ${make} mk.docker/mermaid
 self.mmd.render/%:
 	output=`dirname ${*}`/`basename -s.mmd ${*}`.png \
-	&& cmd="-i ${*} -o $${output} --theme neutral -b transparent" \
+	&& mmd_config=`ls ${mmd.config} && echo '--configFile ${mmd.config}' || echo ''`\
+	&& cmd="-i ${*} $${mmd_config} -o $${output}" \
 		img=mermaid ${make} mk.docker \
 	&& cat $${output} | ${stream.img}
 
