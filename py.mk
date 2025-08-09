@@ -81,12 +81,13 @@ py.version py.pkg.version:; python setup.py --version
 
 tox.clean:; rm -rf .tox
 	@# Clean working directory
-tox/%: mk.require.tool/tox
+tox/%: mk.require.tool/tox 
 	@# Runs the named tox environment.
 	@#
 	@# USAGE: tox/<tox_env_name>
 	${_tox.force} \
 	&& $(call log.target.pad_bottom, env=${*} ${sep} ${cyan_flow_right} ) \
+	&& filler="-" label="tox env=${*}" && ${io.print.banner}  \
 	&& tox $${force:-} -e ${*} $${tox_args:-} \
 	&& $(call log.target.pad_top, ${dim}env=${*} ${py.done.glyph})
 	
