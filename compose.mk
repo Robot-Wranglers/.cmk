@@ -3113,7 +3113,11 @@ flux.map/% flux.for.each/%:
 	| xargs -I% echo "${make} `printf "${*}" | cut -d, -f1`/%" \
 	> $${tmpf} \
 	&& bash ${dash_x_maybe} $${tmpf}
-	
+
+flux.NIY:
+	@# Shorthand for "not implemented yet".  Exits immediately as failure.
+	$(call log.target, ${red}Target Not Implemented Yet); exit 1
+
 flux.or/% flux.any/%:
 	@# Performs an 'or' operation with the named comma-delimited targets.
 	@# This is equivalent to 'make target1 || .. || make targetN'.  See also 'flux.and'.
