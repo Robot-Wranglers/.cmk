@@ -111,6 +111,18 @@ docs.pynchon.render.io/%:
 	cmd='-x -c "pynchon jinja render $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)"' \
 	${make} docs.pynchon
 
+docs.render.mirror/%:
+	@# USAGE:
+	@#  .PHONY: README.md
+	@#   README.md:; ${make} docs.render.mirror/${@}
+	@#
+	dest="${*}" \
+	&& src="${docs.root}/${*}.j2" \
+	&& $(call log.io, docs.render.mirror ${sep} ${no_ansi}${bold}$${dest} ${cyan_flow_left} ${dim}$${src}) \
+	&& ${make} docs.pynchon.render.io/$${src},$${dest} \
+	&& cat $${dest} | ${stream.glow}
+docs.render.mirror=${make} docs.render.mirror/${@}
+
 docs.init: docs.pynchon.build
 
 docs.footnotes:; python -c '\
