@@ -30,14 +30,17 @@ css.pretty/%: Dockerfile.build/css.pretty
 
 # Diagramming Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 mmd.config=.cmk/.mmd.config
 # mmd.config=${CMK_PLUGINS_DIR}
+
 define Dockerfile.mermaid 
 FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
 USER root 
 RUN apk add -q --update --no-cache coreutils build-base bash procps-ng
 RUN ln -s /home/mermaidcli/node_modules/.bin/mmdc /usr/local/bin/mmd
 endef
+
 docs.mmd.stat: docs.mmd.build
 	${jb} version=`${make} docs.mmd.version|tr -d '\r'`
 docs.mmd.version:; cmd="--version" ${make} mk.docker/mermaid
@@ -57,10 +60,47 @@ self.mmd.render/%:
 		img=mermaid ${make} mk.docker \
 	&& cat $${output} | ${stream.img}
 
-## Mkdocs Support
+## Top-level Docs Support
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 docs.root=docs
+
+docs.render.mirror/%:
+	@# USAGE:
+	@#  .PHONY: README.md
+	@#   README.md:; ${make} docs.render.mirror/${@}
+	@#
+	dest="${*}" \
+	&& src="${docs.root}/${*}.j2" \
+	&& $(call log.io, docs.render.mirror ${sep} ${no_ansi}${bold}$${dest} ${cyan_flow_left} ${dim}$${src}) \
+	&& ${make} docs.pynchon.render.io/$${src},$${dest} \
+	&& cat $${dest} | ${stream.glow}
+docs.render.mirror=${make} docs.render.mirror/${@}
+
+docs.init: docs.pynchon.build
+
+docs.footnotes:; python -c '\
+import json,pathlib;\
+skip_list = ["README"]; tmp = { p.stem.split(".")[0]:p \
+      for p in pathlib.Path("docs/").iterdir() if str(p).endswith(".md.j2") }; \
+tmp={ p:open(f"docs/{p}.md.j2","r").readlines() for p in tmp }; \
+tmp={ \
+  p:[":".join(l.split(":")[1:]).strip() for l in lines if l.startswith("[^")] \
+  for p,lines in tmp.items() }; \
+tmp={ k:v for k,v in tmp.items() if v and k not in skip_list}; \
+tmp={k:tmp[k] for k in sorted(tmp.keys())}; \
+print(json.dumps(tmp,indent=2)) \
+'
+
+docs.serve:
+	@# Like `mkdocs.serve` but runs via a container, with port-forwarding.
+	@#
+	docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" \
+		${make} docs.pynchon.dispatch/mkdocs.serve
+
+## Mkdocs Support
+##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 mkdocs.site_name=`cat mkdocs.yml|${yq} -r .site_name`
 
 mkdocs: mkdocs.build mkdocs.serve
@@ -90,11 +130,8 @@ mkdocs.serve:
 	$(call log.target, serving)
 	mkdocs serve --dev-addr $${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}
 
-docs.serve:
-	@# Like `mkdocs.serve` but runs via a container, with port-forwarding.
-	@#
-	docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" \
-		${make} docs.pynchon.dispatch/mkdocs.serve
+## Jinja Support
+##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 define Dockerfile.pynchon
 FROM python:3.9-bookworm
@@ -102,6 +139,7 @@ RUN pip3 install --break-system-packages pynchon==2025.3.20.17.28 mkdocs==1.5.3 
 RUN apt-get update && apt-get install -y tree jq make procps
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
+
 docs.pynchon.render/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# Render a single file, fuzzy matching input and automatically determining output
 
@@ -110,33 +148,6 @@ docs.pynchon.render.io/%:
 	entrypoint=sh \
 	cmd='-x -c "pynchon jinja render $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)"' \
 	${make} docs.pynchon
-
-docs.render.mirror/%:
-	@# USAGE:
-	@#  .PHONY: README.md
-	@#   README.md:; ${make} docs.render.mirror/${@}
-	@#
-	dest="${*}" \
-	&& src="${docs.root}/${*}.j2" \
-	&& $(call log.io, docs.render.mirror ${sep} ${no_ansi}${bold}$${dest} ${cyan_flow_left} ${dim}$${src}) \
-	&& ${make} docs.pynchon.render.io/$${src},$${dest} \
-	&& cat $${dest} | ${stream.glow}
-docs.render.mirror=${make} docs.render.mirror/${@}
-
-docs.init: docs.pynchon.build
-
-docs.footnotes:; python -c '\
-import json,pathlib;\
-skip_list = ["README"]; tmp = { p.stem.split(".")[0]:p \
-      for p in pathlib.Path("docs/").iterdir() if str(p).endswith(".md.j2") }; \
-tmp={ p:open(f"docs/{p}.md.j2","r").readlines() for p in tmp }; \
-tmp={ \
-  p:[":".join(l.split(":")[1:]).strip() for l in lines if l.startswith("[^")] \
-  for p,lines in tmp.items() }; \
-tmp={ k:v for k,v in tmp.items() if v and k not in skip_list}; \
-tmp={k:tmp[k] for k in sorted(tmp.keys())}; \
-print(json.dumps(tmp,indent=2)) \
-'
 
 docs.jinja_templates:; find ${docs.root} | grep .j2 | sort  | grep -v ${docs.root}/macros/
 	@# Find all templates under docs root.
