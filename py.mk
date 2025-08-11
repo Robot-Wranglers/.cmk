@@ -8,7 +8,7 @@
 # What will be installed by py.init 
 py.pkg_optional_extras?=dev,testing,publish
 
-py.done.glyph=${sep} ${no_ansi}${bold}${green}${GLYPH_CHECK}
+py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 
 pip.install=pip install \
 	--disable-pip-version-check $${pip_args:-} \
@@ -21,7 +21,7 @@ pip.install/%: mk.require.tool/pip
 	$(call log.target, verbose=$${verbose:-0} ${sep} ${dim}pip_args=$${pip_args:-})
 	$(call log.target.pad_bottom, ${pip.install} .[${*}] ${sep} ${cyan_flow_right} ) 
 	set -x && ${pip.install} .[${*}]
-	$(call log.target.pad_top, ${dim}${pip.install} .[${*}] ${py.done.glyph})
+	$(call log.target.pad_top, ${dim}${pip.install} .[${*}] ${sep} ${py.done.glyph})
 py.pkg.extra.install/%:; ${make} pip.install/.[${*}]
 	@#
 pip.install.many/%:
@@ -79,6 +79,11 @@ py.version py.pkg.version:; python setup.py --version
 ## Tox Support 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+_tox.force=case $${force:-0} in \
+		1) force="--recreate";; \
+		*) force="";; \
+	esac
+
 tox.clean:; rm -rf .tox
 	@# Clean working directory
 tox/%: mk.require.tool/tox 
@@ -86,15 +91,16 @@ tox/%: mk.require.tool/tox
 	@#
 	@# USAGE: tox/<tox_env_name>
 	${_tox.force} \
-	&& $(call log.target.pad_bottom, env=${*} ${sep} ${cyan_flow_right} ) \
-	&& filler="-" label="tox env=${*}" && ${io.print.banner}  \
+	&& filler="-" label="tox/env=${*} " && ${io.print.banner}  \
+	&& $(call log.target.part1, env=${*} ${sep} ${cyan_flow_right} ) \
 	&& tox $${force:-} -e ${*} $${tox_args:-} \
-	&& $(call log.target.pad_top, ${dim}env=${*} ${py.done.glyph})
-	
-_tox.force=case $${force:-0} in \
-		1) force="--recreate";; \
-		*) force="";; \
-	esac
+	; exit_code="$$?" \
+	&& case $${exit_code} in \
+		0) label="${py.done.glyph} tox/env=${*}";; \
+		*) label="${red}failed!${no_ansi} tox/env=${*} exit=$${exit_code}";;  \
+	esac \
+	&& filler="-" ${io.print.banner}  \
+	&& exit $${exit_code}
 
 tox.dispatch/%:
 	@# Dispatches the given make target in the given tox-environment

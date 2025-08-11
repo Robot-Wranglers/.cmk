@@ -1518,9 +1518,9 @@ define io.print.banner
 		label=" $${label//-/ } " && default="#" \
 		&& filler=$${filler:-$${default}} && label_length=$${#label} \
 		&& side_length=$$(( ($${width} - $${label_length} - 2) / 2 )) \
-		&& printf "\n${dim}%*s" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
+		&& printf "${dim}%*s" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
 		&& printf "${no_ansi_dim}${bold}${green}$${label}${no_ansi_dim}" > /dev/stderr \
-		&& printf "%*s${no_ansi}\n\n" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
+		&& printf "%*s${no_ansi}\n" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
 	; fi
 endef
 io.print.banner/%:; label="${*}"; ${io.print.banner}
