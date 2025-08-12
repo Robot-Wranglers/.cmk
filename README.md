@@ -1,14 +1,14 @@
 ## CMK Plugins / Extensions
 ----------------------------------------
 
-[compose.mk](http://robot-wranglers.github.io/compose.mk) is a framework for writing domain-agnostic project automation that runs anywhere and uses any programming language.
+[compose.mk](http://robot-wranglers.github.io/compose.mk) is a standard library for `make` that supports docker, polyglots, and domain-agnostic project automation.
 
-This is an opinionated starter kit of plugins / extensions for more specific types of projects and tasks.
+This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.
 
 ## Installation
 ----------------------------------------
 
-See also the upstream [compose.mk quickstart](https://robot-wranglers.github.io/compose.mk/quickstart/)
+See also the upstream [compose.mk quickstart](https://robot-wranglers.github.io/compose.mk/quickstart/#plugins-forks-versioning).
 
 ### Fork and Forget
 
@@ -33,7 +33,14 @@ $ cd my-project
 $ git submodule add git@github.com:robot-wranglers/.cmk.git
 ```
 
-*(Note: Users and CI/CD must now use `--recursive` now when cloning parent!)*
+Note that users and CI/CD must now use `--recursive` now when cloning parent!  In github actions, the correct configuration for `jobs.my_job_name.steps` looks like this:
+
+```yaml
+- name: Checkout
+  uses: actions/checkout@v4
+  with:
+    submodules: recursive
+```
 
 ## Usage
 ----------------------------------------
@@ -57,4 +64,4 @@ $(call mk.import.plugins, docs.mk actions.mk)
 $(call mk.import.plugin.maybe, site.mk local.mk)
 ```
 
-To avoid hardcoded paths, you can also set or use the environment variable `CMK_PLUGINS_DIR`.  After `compose.mk` is included, this defaults to `.cmk/` if it's not already set.
+Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.  After `compose.mk` is included, this defaults to `.cmk/` if it's not already set.
