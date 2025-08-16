@@ -62,13 +62,16 @@ py.build py.pkg.build: py.clean
 
 py.clean: tox.clean
 	@# Clean working directory
-	$(call log.target, cleaning python tmp files)
+	$(call log.target.part1, cleaning eggs/build/dist)
+	$(call log.target.part2, ${GLYPH_CHECK})
 	rm -rf tmp.pypi* dist/* build/* 
 	rm -rf src/*.egg-info/
+	rm -rf .ruff_cache
+	$(call log.target.part1, cleaning pycs/cache)
+	$(call log.target.part2, ${GLYPH_CHECK})
 	find . -name '*.tmp.*' -delete
 	find . -name '*.pyc' -delete
 	find . -name  __pycache__ -delete
-	find . -type d -name .tox | xargs -I% bash -x -c "rm -rf %"
 	rmdir build 2>/dev/null || true
 	$(call log.target, done cleaning python tmp files)
 
@@ -84,8 +87,12 @@ _tox.force=case $${force:-0} in \
 		*) force="";; \
 	esac
 
-tox.clean:; rm -rf .tox
+tox.clean:
 	@# Clean working directory
+	$(call log.target.part1,cleaning)
+	rm -rf .tox
+	# find . -type d -name .tox | xargs -I% bash -x -c "rm -rf %"
+	$(call log.target.part2,${GLYPH_CHECK})
 tox/%: mk.require.tool/tox 
 	@# Runs the named tox environment.
 	@#
