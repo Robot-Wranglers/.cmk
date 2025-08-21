@@ -71,6 +71,7 @@ py.clean: tox.clean
 	$(call log.target.part2, ${GLYPH_CHECK})
 	find . -name '*.tmp.*' -delete
 	find . -name '*.pyc' -delete
+	rm -rf .mypy_cache
 	find . -name  __pycache__ -delete
 	rmdir build 2>/dev/null || true
 	$(call log.target, done cleaning python tmp files)

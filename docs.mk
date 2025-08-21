@@ -54,10 +54,14 @@ docs.mermaid docs.mmd: docs.mmd.build
 	$(call log.target, ${dim}rendering all mermaid diagrams ${sep} ${green}${bold}${GLYPH_CHECK})
 docs.mmd.shell:; entrypoint=bash ${make} mk.docker/mermaid
 self.mmd.render/%:
+	@# Renders the given mermaid file,
+	@# including some post-processing that does trim-to-content
+	@#
 	output=`dirname ${*}`/`basename -s.mmd ${*}`.png \
-	&& mmd_config=`ls ${mmd.config} && echo '--configFile ${mmd.config}' || echo ''`\
-	&& cmd="-i ${*} $${mmd_config} -o $${output}" \
+	&& mmd_config=`ls ${mmd.config}2>/dev/null && echo '--configFile ${mmd.config}' || echo ''`\
+	&& cmd="-i ${*} $${mmd_config} -o $${output} $${mmd_args:--b transparent }" \
 		img=mermaid ${make} mk.docker \
+	&& set -x && docker run --rm -v `pwd`:/workspace -w /workspace dpokidov/imagemagick $${output} -flatten -fuzz 1% -trim +repage tmp.png && mv tmp.png $${output} \
 	&& cat $${output} | ${stream.img}
 
 ## Top-level Docs Support
