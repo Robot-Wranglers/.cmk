@@ -33,7 +33,7 @@ css.pretty/%: Dockerfile.build/css.pretty
 
 mmd.config=.cmk/.mmd.config
 # mmd.config=${CMK_PLUGINS_DIR}
-
+img.imagemagick=dpokidov/imagemagick
 define Dockerfile.mermaid 
 FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
 USER root 
@@ -42,26 +42,44 @@ RUN ln -s /home/mermaidcli/node_modules/.bin/mmdc /usr/local/bin/mmd
 endef
 
 docs.mmd.stat: docs.mmd.build
-	${jb} version=`${make} docs.mmd.version|tr -d '\r'`
+	@# Show availability/version info for mermaid
+	${jb} version=`${make} docs.mmd.version | tr -d '\r'`
+
 docs.mmd.version:; cmd="--version" ${make} mk.docker/mermaid
+	@# Show availability/version info for mermaid
+
 docs.mmd.build: Dockerfile.build/mermaid
+	@# Build the mermaid base container
 docs.mmd/%:; ${make} self.mmd.render/${*}
+	@# Render a single mermaid file.
+	@# In-place, except that .mmd extension becomes .png
 	
 docs.mermaid docs.mmd: docs.mmd.build
 	@# Renders all diagrams for use with the documentation 
 	$(call log.target, rendering all mermaid diagrams)
 	find ${docs.root} | grep '[.]mmd$$' | ${stream.peek} | ${flux.each}/self.mmd.render
 	$(call log.target, ${dim}rendering all mermaid diagrams ${sep} ${green}${bold}${GLYPH_CHECK})
+
 docs.mmd.shell:; entrypoint=bash ${make} mk.docker/mermaid
+	@# Starts debugging shell for the mermaid base container
+
 self.mmd.render/%:
 	@# Renders the given mermaid file,
 	@# including some post-processing that does trim-to-content
-	@#
 	output=`dirname ${*}`/`basename -s.mmd ${*}`.png \
-	&& mmd_config=`ls ${mmd.config}2>/dev/null && echo '--configFile ${mmd.config}' || echo ''`\
+	&& mmd_config=`ls ${mmd.config} >/dev/null 2>/dev/null \
+		&& echo '--configFile ${mmd.config}' \
+		|| echo ''` \
 	&& cmd="-i ${*} $${mmd_config} -o $${output} $${mmd_args:--b transparent }" \
 		img=mermaid ${make} mk.docker \
-	&& set -x && docker run --rm -v `pwd`:/workspace -w /workspace dpokidov/imagemagick $${output} -flatten -fuzz 1% -trim +repage tmp.png && mv tmp.png $${output} \
+	&& ${io.mktemp} \
+	&& cmd='-flatten -fuzz 1% -trim +repage' \
+	&& cmd="$${output} $${cmd}" \
+	&& bash -x -c "${docker.run.base} \
+		--entrypoint magick ${img.imagemagick} \
+		$${output} $${cmd} $${tmpf}" \
+	&& mv -f $${tmpf} $${output} \
+	&& $(call log.target,previewing $${output}) \
 	&& cat $${output} | ${stream.img}
 
 ## Top-level Docs Support
