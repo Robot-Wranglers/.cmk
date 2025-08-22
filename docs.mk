@@ -1,12 +1,12 @@
-## docs.mk: Populates `docs.*` namespace with documentation-related tasks.
-##
-## This covers especially things related to markdown, mkdocs, and jinja.  
-## See `pdoc.mk` for something more centric to docs on python packages or apis.
-##
-##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# docs.mk: Populates `docs.*` namespace with documentation-related tasks.
+#
+# This covers especially things related to markdown, mkdocs, and jinja.  
+# See `pdoc.mk` for something more centric to docs on python packages or apis.
+#
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
-## CSS Support
-##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# CSS Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 define Dockerfile.css.min
 FROM node:18-alpine
@@ -82,8 +82,8 @@ self.mmd.render/%:
 	&& $(call log.target,previewing $${output}) \
 	&& cat $${output} | ${stream.img}
 
-## Top-level Docs Support
-##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# Top-level Docs Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 docs.root=docs
 
@@ -120,8 +120,8 @@ docs.serve:
 	docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" \
 		${make} docs.pynchon.dispatch/mkdocs.serve
 
-## Mkdocs Support
-##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# Mkdocs Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 mkdocs.site_name=`cat mkdocs.yml|${yq} -r .site_name`
 
@@ -152,8 +152,8 @@ mkdocs.serve:
 	$(call log.target, serving)
 	mkdocs serve --dev-addr $${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}
 
-## Jinja Support
-##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# Jinja Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 define Dockerfile.pynchon
 FROM python:3.9-bookworm
@@ -175,6 +175,10 @@ docs.jinja_templates:; find ${docs.root} | grep .j2 | sort  | grep -v ${docs.roo
 	@# Find all templates under docs root.
 docs.jinja: docs.pynchon.dispatch/self.docs.jinja
 	@# Render all templates under docs-root
+	$(call log.mk, Normalizing permissions)
+	cmd="-x -c \"chown -R $${UID} ${docs.root}\"" \
+	entrypoint='sh' ${make} docs.pynchon 
+
 self.docs.jinja:
 	@# Render all templates under docs-root
 	@# (Runs inside the pynchon container)
