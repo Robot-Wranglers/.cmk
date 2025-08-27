@@ -9,8 +9,7 @@ pdocs.args=--no-search -d markdown
 pdocs.theme_dir=docs/theme/pdoc/
 pdocs.output_dir=docs/api
 
-pdoc/%:
-	@#
+pdoc/%: mk.require.tool/pdoc
 	@#
 	set -x \
 	&& ls ${pdocs.theme_dir} \

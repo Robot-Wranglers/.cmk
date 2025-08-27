@@ -1,25 +1,33 @@
 ## actions.mk: Populates `actions.*` namespace with tasks on Github-Actions 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
-actions.lint:; cmd='-color' ${docker.image.run}/rhysd/actionlint:latest 
+actions.lint:
 	@# Helper for linting all action-yaml
+	cmd='-color' ${docker.image.run}/rhysd/actionlint:latest 
 
-actions.clean cicd.clean clean.github.actions:
+actions.clean: mk.require.tool/gh
 	@# Cleans all action-runs that are cancelled or failed
-	@#
 	${make} actions.list/failure actions.list/cancelled \
 	| ${stream.peek} | ${jq} -r '.[].databaseId' \
 	| ${make} flux.each/actions.run.delete
 
-actions.clean.old:
+actions.clean.old: mk.require.tool/gh
+	@# Cleans actions older than a week
 	gh run list --limit 1000 --json databaseId,createdAt \
-	| ${jq} '.[] | select(.createdAt | fromdateiso8601 < now - (60*60*24*7)) | .databaseId' \
+	| ${jq} '\
+		.[] | select(.createdAt \
+		| fromdateiso8601 < now - (60*60*24*7)) | .databaseId' \
 	| xargs -I{} gh run delete {}
 
-actions.run.delete/%:; gh run delete ${*}
-	@# Helper for deleting an action
+actions.run.delete/%: mk.require.tool/gh
+	@# Deletes the given action.
+	gh run delete ${*}
 
-actions.list/%:; gh run list --status ${*} --json databaseId
-	@# Helper for filtering action runs
+actions.list: mk.require.tool/gh
+	gh run list --json
+
+actions.list/%: mk.require.tool/gh
+	@# Filters all action-runs with the given status, returning ID
+	gh run list --status ${*} --json databaseId
 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░

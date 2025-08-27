@@ -131,7 +131,7 @@ mkdocs.get/%:
 	@# Gets a single value from a mkdocs.yml file with `yq`
 	cat mkdocs.yml|${yq} -r .${*}
 
-mkdocs.build: 
+mkdocs.build:
 	@# Runs mkdocs build
 	$(call log.target, building..)
 	mkdocs build
@@ -140,11 +140,6 @@ mkdocs.open:
 	@# Opens (local) mkdocs webpage in browser.  (Assumes mkdocs.serve)
 	$(call log.target, opening page in browser)
 	set -x && $${BROWSER:-firefox} http://$${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}
-
-.mkdocs.build: docs/schema
-	$(call log.target, building)
-	set -x && (make docs && mkdocs build --clean --verbose && tree site) \
-	; find site docs | xargs chmod o+rw; ls site/index.html
 
 mkdocs.serve:
 	@# Runs `mkdocs serve` in the working directory, 

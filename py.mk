@@ -11,7 +11,7 @@ py.pkg_optional_extras?=dev,testing,publish
 py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 
 pip.install=pip install \
-	--disable-pip-version-check $${pip_args:-} \
+	-q --disable-pip-version-check $${pip_args:-} \
 	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo ) -e
 py.pkg.install/%:
 	@# Treats argument as 
