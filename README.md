@@ -29,8 +29,14 @@ You can also use this repository (or a fork of it) as a [git submodule](https://
 # Add .cmk plugins to existing project
 $ cd my-project
 
-# Or use your fork
+# Add this repository as a submodule (or your fork)
 $ git submodule add git@github.com:robot-wranglers/.cmk.git
+```
+
+Sometimes the HTTPS version for the submodule works better, for example if you're running pip-install directly from your repository.
+
+```bash
+$ git submodule add https://github.com/Robot-Wranglers/.cmk.git
 ```
 
 With the submodules approach, note that users and CI/CD must now use `--recursive` now when cloning parent!  
@@ -69,7 +75,7 @@ Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.
 
 ## Contents
 
-* [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
+* [actions.mk](blob/main/actions.mk): Github actions helpers, mostly assuming that `gh` CLI is already available.
 * [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on mermaid, mkdocs, and jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
 * [pdoc.mk](blob/main/pdoc.mk): Python documentation, focusing especially on [pdoc](https://pypi.org/project/pdoc/).
-* [actions.mk](blob/main/actions.mk): Github actions helpers, mostly assuming that `gh` CLI is already available.
+* [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
