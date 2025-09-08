@@ -11,12 +11,11 @@ actions.clean: mk.require.tool/gh
 	| ${stream.peek} | ${jq} -r '.[].databaseId' \
 	| ${make} flux.each/actions.run.delete
 
+_actions.filter.old=.[] | select(.createdAt | fromdateiso8601 < now - (60*60*24*7)) | .databaseId
 actions.clean.old: mk.require.tool/gh
 	@# Cleans actions older than a week
 	gh run list --limit 1000 --json databaseId,createdAt \
-	| ${jq} '\
-		.[] | select(.createdAt \
-		| fromdateiso8601 < now - (60*60*24*7)) | .databaseId' \
+	| ${jq} '${_actions.filter.old}' \
 	| xargs -I{} gh run delete {}
 
 actions.run.delete/%: mk.require.tool/gh
