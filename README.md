@@ -2,7 +2,9 @@
 
 [compose.mk](http://robot-wranglers.github.io/compose.mk) is a standard library for `make` that supports docker, polyglots, and domain-agnostic project automation.
 
-This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.  See also [k8s-tools.git](https://github.com/Robot-Wranglers/k8s-tools) for kubernetes-specific automation.
+This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.  They are perhaps *too opinionated* for you to be interested in them!, but they do demonstrate one want to integrate projects with `compose.mk` and to extend that more basic functionality.
+
+See also [k8s-tools.git](https://github.com/Robot-Wranglers/k8s-tools) for kubernetes-specific automation.
 
 ## Installation
 
@@ -31,7 +33,9 @@ $ cd my-project
 $ git submodule add git@github.com:robot-wranglers/.cmk.git
 ```
 
-Note that users and CI/CD must now use `--recursive` now when cloning parent!  In github actions, the correct configuration for `jobs.my_job_name.steps` looks like this:
+With the submodules approach, note that users and CI/CD must now use `--recursive` now when cloning parent!  
+
+In github actions, the correct configuration for `jobs.my_job_name.steps` looks like this:
 
 ```yaml
 - name: Checkout
@@ -62,3 +66,10 @@ $(call mk.import.plugin.maybe, site.mk local.mk)
 ```
 
 Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.  After `compose.mk` is included, this defaults to `.cmk/` if it's not already set.
+
+## Contents
+
+* [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
+* [pdoc.mk](blob/main/pdoc.mk): Python documentation, focusing especially on [pdoc](https://pypi.org/project/pdoc/).
+* [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
+* [actions.mk](blob/main/actions.mk): Github actions helpers, mostly assuming that `gh` CLI is already available.
