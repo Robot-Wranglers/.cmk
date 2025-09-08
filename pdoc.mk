@@ -10,7 +10,7 @@ pdocs.theme_dir=docs/theme/pdoc/
 pdocs.output_dir=docs/api
 
 pdoc/%: mk.require.tool/pdoc
-	@#
+	@# Runs `pdoc` for the given python module.
 	set -x \
 	&& ls ${pdocs.theme_dir} \
 	&& export SITE_RELATIVE_URL=/${mkdocs.site_name} \

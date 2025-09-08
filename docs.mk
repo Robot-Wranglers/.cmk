@@ -32,7 +32,6 @@ css.pretty/%: Dockerfile.build/css.pretty
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 mmd.config=.cmk/.mmd.config
-# mmd.config=${CMK_PLUGINS_DIR}
 img.imagemagick=dpokidov/imagemagick
 define Dockerfile.mermaid 
 FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
@@ -195,9 +194,8 @@ self.docs.jinja/%:
 		*) ${make} .self.docs.jinja/${*}.md.j2;; \
 	esac
 .self.docs.jinja/%:
-	@#
 	ls ${*} ${stream.obliviate} || ($(call log,${red} no such file ${*}); exit 39)
 	$(call io.mktemp) && first=$${tmpf} \
-	&& set -x && pynchon jinja render ${*} -o $${tmpf} --print \
+	&& pynchon jinja render ${*} -o $${tmpf} --print \
 	&& set +x && dest="`dirname ${*}`/`basename -s .j2 ${*}`" \
 	&& set -x && mv $${tmpf} $${dest}

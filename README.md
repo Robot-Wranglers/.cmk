@@ -70,6 +70,6 @@ Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.
 ## Contents
 
 * [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
+* [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on mermaid, mkdocs, and jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
 * [pdoc.mk](blob/main/pdoc.mk): Python documentation, focusing especially on [pdoc](https://pypi.org/project/pdoc/).
-* [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
 * [actions.mk](blob/main/actions.mk): Github actions helpers, mostly assuming that `gh` CLI is already available.
