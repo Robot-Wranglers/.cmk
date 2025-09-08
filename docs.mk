@@ -150,8 +150,9 @@ mkdocs.serve:
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 define Dockerfile.pynchon
-FROM python:3.9-bookworm
-RUN pip3 install --break-system-packages pynchon==2025.3.20.17.28 mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
+FROM python:3.11-bookworm
+RUN pip3 install --break-system-packages 'pynchon @ git+https://github.com/robot-wranglers/pynchon@2025.9.8'
+RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
 RUN apt-get update && apt-get install -y tree jq make procps
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
