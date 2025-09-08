@@ -1,12 +1,10 @@
 ## CMK Plugins / Extensions
-----------------------------------------
 
 [compose.mk](http://robot-wranglers.github.io/compose.mk) is a standard library for `make` that supports docker, polyglots, and domain-agnostic project automation.
 
-This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.
+This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.  See also [k8s-tools.git](https://github.com/Robot-Wranglers/k8s-tools) for kubernetes-specific automation.
 
 ## Installation
-----------------------------------------
 
 See also the upstream [compose.mk quickstart](https://robot-wranglers.github.io/compose.mk/quickstart/#plugins-forks-versioning).
 
@@ -43,7 +41,6 @@ Note that users and CI/CD must now use `--recursive` now when cloning parent!  I
 ```
 
 ## Usage
-----------------------------------------
 
 Besides plugins, a stable version of the standard library for `compose.mk` is *also* tracked in the plugin folder.  You can use it, or overwrite it with a preferred version, or ignore it in favor of one you are tracking in your project root.. just make sure you adjust paths accordingly.  
 
