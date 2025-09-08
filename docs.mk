@@ -151,9 +151,11 @@ mkdocs.serve:
 
 define Dockerfile.pynchon
 FROM python:3.11-bookworm
+# allow for ambiguous permissions
+RUN git config --global --add safe.directory /workspace
 RUN pip3 install --break-system-packages 'pynchon @ git+https://github.com/robot-wranglers/pynchon@2025.9.8'
 RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
-RUN apt-get update && apt-get install -y tree jq make procps
+RUN apt-get update && apt-get install -y tree jq make procps nano
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
 
@@ -186,8 +188,8 @@ self.docs.jinja/%:
 	@# Render the named docs twice (once to use includes, then to get the ToC)
 	ls ${*}/*.j2 2>/dev/null >/dev/null \
 	&& ( \
-		$(call log,is dir); ls ${*}/*.j2 \
-			| xargs -I% sh -x -c "${make} j/%") \
+		$(call log.mk, ${*} is a directory!); ls ${*}/*.j2 \
+			| xargs -I% sh -x -c "${make} self.docs.jinja/%") \
 	|| case ${*} in \
 		*.md.j2) ${make} .self.docs.jinja/${*};; \
 		*.bib.j2) ${make} .self.docs.jinja/${*};; \
