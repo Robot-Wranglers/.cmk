@@ -1,13 +1,12 @@
 # docs.mk: Populates `docs.*` namespace with documentation-related tasks.
 #
-# This covers especially things related to markdown, mkdocs, and jinja.  
+# Covers things related to markdown, mkdocs, jinja, css, diagramming, etc
 # See `pdoc.mk` for something more centric to docs on python packages or apis.
 #
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 # CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
 define Dockerfile.css.min
 FROM node:18-alpine
 RUN npm install -g clean-css-cli
@@ -28,12 +27,51 @@ css.pretty/%: Dockerfile.build/css.pretty
 	@# CSS Pretty / Un-minify
 	img=css.pretty cmd="--write ${*}" ${make} mk.docker
 
-# Diagramming Support
+# Diagramming Support: drawio
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+define Dockerfile.drawio
+FROM rlespinasse/drawio-export
+RUN apt-get update -qq && apt-get install -qq -y make procps
+endef
 
+drawio.args=-f png -t
+
+docs.drawio.init: Dockerfile.build/drawio
+
+docs.drawio: docs.drawio/${docs.root}
+	@# Find and render all drawio files under documentation root.
+
+docs.drawio/%: docs.drawio.init
+	@# Render a file or a whole directory
+	test -d "${*}" \
+	; case $$? in \
+		0) \
+			$(call log.target.part1, ${ital}${*} ${sep} looking for diagrams in folder) \
+			&& diagrams=`find ${*} | grep -E '[.](dio|drawio)$$' | ${stream.nl.to.space}` \
+			&& count=`echo "$${diagrams}" | ${stream.count.words}` \
+			&& $(call log.target.part2, ${yellow}$${count} total) \
+			&& echo "$${diagrams}" | ${stream.space.to.nl} | ${make} flux.each/docs.drawio ;; \
+		*) \
+			ls ${*} > /dev/null \
+			&& outf=`dirname ${*}`/`basename -s.drawio ${*}`.png \
+			&& $(call log.target, ${*} ${cyan_flow_right} $${outf}) \
+			&& img=drawio ${make} mk.docker.dispatch/.docs.drawio/${*},$${outf} \
+			&& $(call log.target, preview ${sep} $${outf}) \
+			&& cat $${outf} | ${stream.img} ;; \
+	esac
+.docs.drawio/%:
+	@# Runs inside the drawio container
+	outf=$(call mk.unpack.arg, 2) && inf=$(call mk.unpack.arg, 1) \
+	&& ${trace_maybe} && cp $${inf} /tmp && pushd /tmp >/dev/null \
+	&& /opt/drawio-desktop/entrypoint.sh ${drawio.args} -o . >/dev/null \
+	&& popd >/dev/null && mv /tmp/*.png $${outf} \
+	&& chown 1000 $${outf}
+
+# Diagramming Support: mermaid
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 mmd.config=.cmk/.mmd.config
 img.imagemagick=dpokidov/imagemagick
-define Dockerfile.mermaid 
+define Dockerfile.mermaid
 FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
 USER root 
 RUN apk add -q --update --no-cache coreutils build-base bash procps-ng
