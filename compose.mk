@@ -924,11 +924,10 @@ docker.from.def/% docker.build.def/% Dockerfile.build/%:
 	&& header="${GLYPH.DOCKER} Dockerfile.build ${sep} ${dim_cyan}${ital}$${def_name}${no_ansi_dim}" \
 	&& $(call log.trace, $${header} ) \
 	&& $(trace_maybe) \
-	&& $(call io.mktemp) \
-	&& ${mk.def.to.file}/$${def_name}/$${tmpf} \
 	&& case `${make} docker.def.is.cached/$${inp}` in \
 		yes) true;; \
-		no) ( $(call log.docker, $(shell echo ${@}|cut -d/ -f1) \
+		no) ( $(call io.mktemp) && ${mk.def.to.file}/$${def_name}/$${tmpf} \
+			  && $(call log.docker, $(shell echo ${@}|cut -d/ -f1) \
 					${sep} ${ital}${dim_cyan}$(shell echo ${@}|cut -d/ -f2) ${sep} ${dim}tag=${no_ansi}$${tag}${no_ansi_dim}) \
 				&& cat $${tmpf} | ${stream.as.log} \
 				&& $(call log, ${cyan_flow_right} ${bold}Building..) \
