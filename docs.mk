@@ -37,6 +37,7 @@ endef
 drawio.args=-f png -t
 
 docs.drawio.init: Dockerfile.build/drawio
+	@# Builds the container for drawio if necessary
 
 docs.drawio: docs.drawio/${docs.root}
 	@# Find and render all drawio files under documentation root.
@@ -208,18 +209,19 @@ docs.pynchon.render.io/%:
 
 docs.jinja_templates:; find ${docs.root} | grep .j2 | sort  | grep -v ${docs.root}/macros/
 	@# Find all templates under docs root.
+
 docs.jinja: docs.pynchon.dispatch/self.docs.jinja
 	@# Render all templates under docs-root
 	$(call log.mk, Normalizing permissions)
 	cmd="-x -c \"chown -R $${UID} ${docs.root}\"" \
 	entrypoint='sh' ${make} docs.pynchon 
-
 self.docs.jinja:
 	@# Render all templates under docs-root
 	@# (Runs inside the pynchon container)
 	pynchon --version
 	${make} docs.jinja_templates \
 	| xargs -I% sh -x -c "make self.docs.jinja/% || exit 255"
+
 docs.jinja/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# (Runs inside the pynchon container)
 self.docs.jinja/%:

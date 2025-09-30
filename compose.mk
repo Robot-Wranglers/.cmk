@@ -993,9 +993,8 @@ docker.prune docker.system.prune:
 	@# 
 	$(call log.target) && set -x && docker system prune --all --force
 
-docker.prune.old:
+docker.prune.old: flux.timer/.docker.prune.old
 	@# Debugging only! Runs 'docker system prune --all --force --filter "until="'
-	$(call log.target,pruning oldest containers) && $(call _flux.timer,.docker.prune.old)
 
 .docker.prune.old:; docker system prune --all --force --filter "until=$${docker_max_age:-168h}"
 
