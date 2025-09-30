@@ -991,10 +991,13 @@ docker.panic: docker.stop.all docker.network.panic docker.volume.prune docker.sy
 docker.prune docker.system.prune:
 	@# Debugging only! Runs 'docker system prune' for the entire system.
 	@# 
-	set -x && docker system prune -a -f
+	$(call log.target) && set -x && docker system prune --all --force
 
-docker.prune.old:; docker system prune --all --force --filter "until=168h"
-	@# Debugging only! Runs 'docker system prune --all --force --filter "until=168h"'
+docker.prune.old:
+	@# Debugging only! Runs 'docker system prune --all --force --filter "until="'
+	$(call log.target,pruning oldest containers) && $(call _flux.timer,.docker.prune.old)
+
+.docker.prune.old:; docker system prune --all --force --filter "until=$${docker_max_age:-168h}"
 
 docker.ps:; docker ps --format json | ${jq} .
 	@# Like 'docker ps', but always returns JSON.
@@ -3479,18 +3482,19 @@ flux.starmap/%:
 	&& iterable="`printf ${*}|cut -d, -f2-`" \
 	&& ${make} $${iterable} | ${make} flux.each/$${target}
 
-flux.timer/%:
+define _flux.timer
+${trace_maybe} && start_time=$$(date +%s) \
+	&& ${make} ${1} \
+	&& end_time=$$(date +%s) \
+	&& time_diff_ns=$$((end_time - start_time)) \
+	&& delta=$$(awk -v ns="$$time_diff_ns" 'BEGIN {printf "%.9f", ns }') \
+	&& $(call log.flux, flux.timer ${sep} `echo ${1}|cut -d/ -f2-` ${sep} ${dim}$${label:-done in} ${yellow}$${delta}s)
+endef
+flux.timer/%:; $(call _flux.timer,${*})
 	@# Emits run time for the given make-target in seconds.
 	@#
 	@# USAGE:
 	@#   ./compose.mk flux.timer/<target_to_run>
-	@#
-	${trace_maybe} && start_time=$$(date +%s) \
-	&& ${make} ${*} \
-	&& end_time=$$(date +%s) \
-	&& time_diff_ns=$$((end_time - start_time)) \
-	&& delta=$$(awk -v ns="$$time_diff_ns" 'BEGIN {printf "%.9f", ns }') \
-	&& $(call log.flux, flux.timer ${sep} `echo ${*}|cut -d/ -f2-` ${sep} ${dim}$${label:-done in} ${yellow}$${delta}s)
 
 flux.timeout/%:
 	@# Runs the given target for the given number of seconds, then stops it with TERM.
