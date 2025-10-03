@@ -3854,10 +3854,11 @@ stream.nl.enum:; ${stream.nl.enum}
 
 stream.nl.to.comma=( ${stream.stdin} | awk 'BEGIN{ORS=","} {print}' | sed 's/,$$//' )
 stream.nl.to.comma:; ${stream.nl.to.comma}
+	@#  Converts newline-delimited input stream into a CSV row
 
-stream.nl.to.json.array:; ${stream.stdin} | ${jq} -s '.'
+stream.nl.to.json.array=( _tmp="`cat /dev/stdin | ${stream.nl.to.space}`"; ${jb.array} $${_tmp} )  
+stream.nl.to.json.array:; ${stream.nl.to.json.array}
 	@#  Converts newline-delimited input stream into a JSON array
-	
 stream.space.enum:; ${stream.stdin} | ${stream.space.to.nl} | ${stream.nl.enum}
 	@# Enumerates the space-delimited input list, 
 	@# zipping indexes with values in newline delimited output.
@@ -4912,7 +4913,6 @@ ${compose_file_stem}/$(compose_service_name).stop:
 $(eval ifeq ($$(import_to_root), TRUE)
 $(compose_service_name): $(target_namespace)/$(compose_service_name)
 	@# Target wrapping the '$(compose_service_name)' container (via compose file @ ${compose_file})
-
 $(compose_service_name).build: ${compose_file_stem}.build/$(compose_service_name)
 	@# Shorthand for ${compose_file_stem}.build/$(compose_service_name)
 
@@ -4974,19 +4974,21 @@ $(compose_service_name).shell.pipe: ${compose_file_stem}/$(compose_service_name)
 
 endif)
 
-${target_namespace}/$(compose_service_name).pipe:; pipe=yes ${make} ${target_namespace}/$(compose_service_name)
-${target_namespace}/$(compose_service_name).command/%:; cmd="$${*}" ${make} ${compose_file_stem}/$(compose_service_name)
-${target_namespace}/$(compose_service_name): 
+${namespaced_service}.pipe:; pipe=yes ${make} ${namespaced_service}
+${target_namespace}.$(compose_service_name).build: ${compose_file_stem}.build/$(compose_service_name)
+${target_namespace}.up: ${compose_file_stem}.up
+${namespaced_service}.command/%:; cmd="$${*}" ${make} ${compose_file_stem}/$(compose_service_name)
+${namespaced_service}: 
 	@# Target dispatch for $(compose_service_name)
 	@#
 	[ -z "${MAKE_CLI_EXTRA}" ] && true || verbose=0 \
 	&& ${trace_maybe} && ${make} ${compose_file_stem}/${compose_service_name}
-${target_namespace}/$(compose_service_name)/%:
+${namespaced_service}/%:
 	@# Dispatches the named target inside the $(compose_service_name) service, as defined in the ${compose_file} file.
 	@#
 	@# EXAMPLE: 
 	@#  # mapping a public Makefile target to a private one that is executed in a container
-	@#  my-public-target: ${target_namespace}/$(compose_service_name)/myprivate-target
+	@#  my-public-target: ${namespaced_service}/myprivate-target
 	@#
 	#
 	@$$(eval export pipe:=$(shell \
