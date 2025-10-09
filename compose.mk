@@ -2316,7 +2316,7 @@ mk.namespace.list help.namespaces:
 	&& printf "$${tmp}\n" \
 	&& $(call log, ${no_ansi}${GLYPH_MK} help.namespaces ${sep} ${dim}count=${no_ansi}$${count} )
 
-_mk.parse=${pynchon} parse --markdown ${1} 2>/dev/null
+_mk.parse=${trace_maybe} && ${pynchon} parse --markdown ${1} 2>/dev/null
 mk.parse/%:; $(call _mk.parse,${*})
 	@# Parses the given Makefile, returning JSON output that describes the targets, docs, etc.
 	@# This parsing is "deep", i.e. it returns docs & metadata for *included* targets as well.
