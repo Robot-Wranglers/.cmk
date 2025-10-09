@@ -1854,7 +1854,7 @@ help.local:
 	@#
 	$(call log.mk, ${no_ansi_dim}${@} ${sep} ${dim}Rendering help for${no_ansi} ${bold}${underline}${MAKEFILE}${no_ansi} ${dim_ital}(no includes)\n)
 	targets="`${mk.targets.local.public} | grep -v '%' | grep "$${filter:-.}"`" \
-	&& width=`echo|awk "{print int(.6*${io.term.width})}"` \
+	&& width=`echo | awk "{print int(.6*${io.term.width})}"` \
 	&& printf "$${targets}" | ${stream.fold} | ${stream.as.log} \
 	&& printf '\n' \
 	&& printf "$${targets}" \
@@ -2316,7 +2316,7 @@ mk.namespace.list help.namespaces:
 	&& printf "$${tmp}\n" \
 	&& $(call log, ${no_ansi}${GLYPH_MK} help.namespaces ${sep} ${dim}count=${no_ansi}$${count} )
 
-_mk.parse=${trace_maybe} && ${pynchon} parse --markdown ${1} 2>/dev/null
+_mk.parse=${pynchon} parse --markdown ${1} 2>/dev/null
 mk.parse/%:; $(call _mk.parse,${*})
 	@# Parses the given Makefile, returning JSON output that describes the targets, docs, etc.
 	@# This parsing is "deep", i.e. it returns docs & metadata for *included* targets as well.
@@ -2325,7 +2325,10 @@ mk.parse/%:; $(call _mk.parse,${*})
 	@# REFS:
 	@#   * `[1]`: https://github.com/elo-enterprises/pynchon/
 	@#
-
+mk.parse:
+	@# Parse / merge for each Makefile in MAKEFILE_LIST
+	echo "${MAKEFILE_LIST}" | ${stream.space.to.nl} \
+	| ${flux.each}/mk.parse | ${jq} -s '.[0] * .[1]'
 mk.pkg:
 	@# Like `mk.self`, but includes `compose.mk` source also.
 	set -x && archive="$${archive} ${CMK_SRC}" ${make} mk.self
