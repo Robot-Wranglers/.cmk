@@ -1480,7 +1480,6 @@ io.print.banner:; ${io.print.banner}
 	@#
 	@# USAGE:
 	@#  label=".." filler=".." width="..." ./compose.mk io.print.banner 
-# io.print.banner=label="${@}" ${make} io.print.banner
 define io.print.banner
 	export width=$${width:-${io.terminal.cols}} \
 	&& label=$${label:-${io.timestamp}} \
@@ -1492,7 +1491,7 @@ define io.print.banner
 		&& filler=$${filler:-$${default}} && label_length=$${#label} \
 		&& side_length=$$(( ($${width} - $${label_length} - 2) / 2 )) \
 		&& printf "${dim}%*s" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
-		&& printf "${no_ansi_dim}${bold}${green}$${label}${no_ansi_dim}" > /dev/stderr \
+		&& printf "${no_ansi_dim}${bold}$${label_color:-${green}}$${label}${no_ansi_dim}" > /dev/stderr \
 		&& printf "%*s${no_ansi}\n" "$${side_length}" | sed "s/ /$${filler}/g" > /dev/stderr \
 	; fi
 endef
