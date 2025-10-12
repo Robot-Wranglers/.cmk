@@ -83,6 +83,13 @@ py.version py.pkg.version:; python setup.py --version
 ## Linters, formatters, checkers. (Typically combined with tox)
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+py.flake8:
+	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
+	ls .flake8 > /dev/null \
+		&& flake8 --config .flake8 ${py.src_root} \
+		|| $(call log.io, ${@} ${sep} skipping (.flake8 missing))
+	vulture ${py.src_root} --min-confidence 90
+
 py.isort:
 	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
 	ls .isort.cfg > /dev/null \
@@ -97,6 +104,13 @@ py.autopep:
 	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
 	autopep8 --recursive --in-place ${py.src_root}
 
+py.normalize: 
+	$(call log.target, Normalizing py.src_root @ ${dim_cyan}${py.src_root})
+	${make} py.isort py.autopep py.shed
+
+py.static-analysis: 
+	$(call log.target, Analyzing py.src_root @ ${dim_cyan}${py.src_root})
+	${make} py.flake8
 ## Tox Support 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
