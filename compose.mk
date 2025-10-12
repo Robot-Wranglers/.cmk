@@ -4978,6 +4978,9 @@ $(compose_service_name).shell.pipe: ${compose_file_stem}/$(compose_service_name)
 endif)
 
 ${namespaced_service}.pipe:; pipe=yes ${make} ${namespaced_service}
+${target_namespace}.$(compose_service_name).up: ${compose_file_stem}.up/$(compose_service_name)
+${target_namespace}.$(compose_service_name).up.detach: ${compose_file_stem}.up.detach/$(compose_service_name)
+${target_namespace}.$(compose_service_name).ps: ${compose_file_stem}/$(compose_service_name).ps
 ${target_namespace}.$(compose_service_name).build: ${compose_file_stem}.build/$(compose_service_name)
 ${target_namespace}.up: ${compose_file_stem}.up
 ${namespaced_service}.command/%:; cmd="$${*}" ${make} ${compose_file_stem}/$(compose_service_name)
