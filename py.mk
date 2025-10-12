@@ -7,7 +7,7 @@
 
 # What will be installed by py.init 
 py.pkg_optional_extras?=dev,testing,publish
-
+py.src_root?=src
 py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 
 pip.install=pip install \
@@ -38,7 +38,7 @@ pip.release pypi.release: mk.require.tool/twine mk.assert/PYPI_USER,PYPI_TOKEN
 		--password $${PYPI_TOKEN} \
 		dist/*
 
-## Generic Support
+## Generic support for packaging, venvs, etc
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 py.init: pip.install.build pip.install.many/$(strip ${py.pkg_optional_extras})
@@ -80,6 +80,23 @@ py.version py.pkg.version:; python setup.py --version
 	@# Answer version info for the current project.
 	@# Relies on (python setup.py --version)
 
+## Linters, formatters, checkers. (Typically combined with tox)
+##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+py.isort:
+	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
+	ls .isort.cfg > /dev/null \
+		&& isort --settings-file .isort.cfg ${py.src_root} \
+		|| $(call log.io, ${@} ${sep} skipping (.isort.cfg missing))
+
+py.shed:
+	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
+	pushd ${py.src_root}; shed; popd; 
+
+py.autopep:
+	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
+	autopep8 --recursive --in-place ${py.src_root}
+
 ## Tox Support 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -99,15 +116,16 @@ tox/%: mk.require.tool/tox
 	@#
 	@# USAGE: tox/<tox_env_name>
 	${_tox.force} \
-	&& filler="-" label="tox/env=${*} " && ${io.print.banner}  \
-	&& $(call log.target.part1, env=${*} ${sep} ${cyan_flow_right} ) \
+	&& label="tox env=${*}" \
+	&& ${io.print.banner} \
 	&& tox $${force:-} -e ${*} $${tox_args:-} \
 	; exit_code="$$?" \
 	&& case $${exit_code} in \
-		0) label="${py.done.glyph} tox/env=${*}";; \
-		*) label="${red}failed!${no_ansi} tox/env=${*} exit=$${exit_code}";;  \
+		0) label_color="${dim}"; msg="${py.done.glyph}${no_ansi_dim} ok";; \
+		*) label_color="${red}"; msg="${red}failed!${no_ansi} exit=$${exit_code}";;  \
 	esac \
-	&& filler="-" ${io.print.banner}  \
+	&& $(call log.target, env=${*} ${sep} $${msg}) \
+	&& ${io.print.banner} \
 	&& exit $${exit_code}
 
 tox.dispatch/%:
