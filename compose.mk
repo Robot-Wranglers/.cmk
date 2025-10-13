@@ -4780,7 +4780,7 @@ windows:
     panes: ${panes:-[]}
 EOF
 endef
-
+export COMPOSE_PROFILES?=
 # Macro to yank all the compose-services out of YAML.  Important Note:
 # This runs for each invocation of make, and unfortunately the command
 # 'docker compose config' is actually pretty slow compared to parsing the
@@ -4796,7 +4796,7 @@ endef
 # here, but note that these are not available for some versions of compose.
 define compose.get_services
 	$(shell if [ "${CMK_INTERNAL}" = "0" ]; then \
-		(${trace_maybe} && ([ "$(strip ${1})" = "" ] && echo -n "" || ${docker.compose} -f ${1} config --services))  ; \
+		(${trace_maybe} && ([ "$(strip ${1})" = "" ] && echo -n "" || COMPOSE_PROFILES=${COMPOSE_PROFILES} ${docker.compose} -f ${1} config --services))  ; \
 	else echo -n ""; fi)
 endef
 
