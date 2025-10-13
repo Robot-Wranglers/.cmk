@@ -5284,8 +5284,15 @@ ${compose_file_stem}.up:
 	@# Stops all services for the ${compose_file} file.  
 	@# Provided for completeness; the stop, start, up, and 
 	@# down verbs are not really what you want for tool containers!
-	$$(call log.docker, ${compose_file_stem}.up ${sep} ${dim_ital} $${svc:-all services})
-	${docker.compose} -f $${compose_file} up $${svc:-}
+	$$(call log.docker, ${compose_file_stem}.up ${sep} ${dim_ital} $$$${svc:-all services})
+	${docker.compose} -f $${compose_file} up $$$${svc:-}
+${compose_file_stem}.up.detach:
+	@# Brings up all services in the given compose file.
+	@# Stops all services for the ${compose_file} file.  
+	@# Provided for completeness; the stop, start, up, and 
+	@# down verbs are not really what you want for tool containers!
+	$$(call log.docker, ${compose_file_stem}.up.detach ${sep} ${dim_ital} $$$${svc:-all services})
+	${docker.compose} -f $${compose_file} up -d $$$${svc:-}
 
 ${compose_file_stem}.clean:
 	@# Runs 'compose.clean' for the given service(s), or for all services in the '${compose_file}' file if no specific service is provided.
