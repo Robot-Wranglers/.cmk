@@ -5,6 +5,8 @@
 #
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+docs.root=$${DOCS_ROOT:-docs}
+
 # CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 define Dockerfile.css.min
@@ -35,11 +37,11 @@ RUN apt-get update -qq && apt-get install -qq -y make procps
 endef
 
 drawio.args=-f png -t
-
 docs.drawio.init: Dockerfile.build/drawio
 	@# Builds the container for drawio if necessary
 
-docs.drawio: docs.drawio/${docs.root}
+
+docs.drawio:; ${make} docs.drawio/${docs.root}
 	@# Find and render all drawio files under documentation root.
 
 docs.drawio/%: docs.drawio.init
@@ -122,8 +124,6 @@ self.mmd.render/%:
 
 # Top-level Docs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
-docs.root=docs
 
 docs.render.mirror/%:
 	@# USAGE:
