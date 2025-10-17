@@ -434,7 +434,7 @@ compose.build/%:
 	@#   svc=<svc_name> ./compose.mk compose.build/<compose_file>
 	@#
 	$(call log.docker, \
-		compose.build ${sep} ${green}$(shell basename ${*}) ${sep} ${dim_ital}$${svc:-all services})
+		${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}$${svc:-all services})
 	label='build finished.' ${make} flux.timer/.compose.build/${*}
 .compose.build/%:
 	case $${force:-0} in \
@@ -461,7 +461,7 @@ compose.clean/%:
 	@#
 	$(trace_maybe) \
 	&& $(call log.docker, \
-		compose.clean ${dim}file=${*} ${sep} ${dim_ital}$${svc:-all services}) \
+		${compose.ctx.display} ${bold_cyan}compose.clean ${dim} ${sep} ${dim_ital}$${svc:-all services}) \
 	&& ${docker.compose} -f ${*} \
 		--progress quiet down -t 1 --remove-orphans --rmi local $${svc:-}
 
@@ -1172,7 +1172,7 @@ docker.stop.all:
 	@#
 	ids=`docker ps -q | tr '\n' ' '` \
 	&& count=`printf "$${ids:-}" | ${stream.count.words}` \
-	&& $(call log.docker, docker.stop.all ${sep} ${dim}(${dim_green}$${count}${no_ansi_dim} containers total)) \
+	&& $(call log.target.part1, ) && $(call log.target.part2, ${yellow}$${count}${no_ansi_dim} containers total) \
 	&& [ -z "$${ids}" ] && true || (set -x && docker stop -t $${timeout:-1} $${ids})
 
 
@@ -4781,9 +4781,10 @@ windows:
 EOF
 endef
 export COMPOSE_PROFILES?=
-compose.profile.disp=$(shell [ "$(COMPOSE_PROFILES)" = "" ] && echo "" || echo "${no_ansi}${bold_cyan}<${no_ansi_dim}[$(COMPOSE_PROFILES)]${no_ansi}${bold_cyan}> ${sep}")
+compose.ctx.display=${bold_green}$(or ${target_namespace},${compose_file_stem}) ${sep} $(shell [ "$(COMPOSE_PROFILES)" = "" ] && echo "" || echo "${dim}${bold_cyan}▐░${no_ansi}${ital}$(COMPOSE_PROFILES)${no_ansi_dim}${bold_cyan}░▌") ${sep} 
 compose.with_profile/%:
-	@# Runs the given targets with the given COMPOSE_PROFILE
+	@# Runs the given targets with the given COMPOSE_PROFILE.  
+	@# Comma-separated profile-names is "and", not "intersection"!
 	@#
 	@# USAGE:
 	@#   compose.with_profile/<profile>/<t1>,<t2>,..
@@ -4866,9 +4867,9 @@ ${compose_file_stem}.exec/%:
 	&& tmp="${no_ansi}${bold}::" \
 	&& case $$$${target} in \
 		"") disp="${no_ansi}${bold}[${no_ansi}${dim_ital}$$$${cmd:-?}${no_ansi}${bold}]";; \
-		*) disp="${no_ansi_dim}${ital}$$$${target}";; \
+		*) disp="${no_ansi}${ital}$$$${target}";; \
 	esac \
-	&& $$(call log.target, ${no_ansi}$$$${svc} ${sep} $$$${disp} ${cyan_flow_right}) \
+	&& $$(call log.docker, ${compose.ctx.display} ${bold_cyan}exec ${sep} ${dim}$$$${svc} ${sep} $$$${disp} ${cyan_flow_right}) \
 	&& set -x && docker compose -f ${compose_file} exec $${detach} \
 		$$$${svc} $$$${cmd} 
 # 2> >(grep -v 'variable is not set' >&2)
@@ -4909,6 +4910,10 @@ ${compose_file_stem}/$(compose_service_name).shell.pipe:
 	  entrypoint="bash" \
 	  ${make} ${compose_file_stem}/$(compose_service_name)"
 
+$(compose_service_name).assert_running ${compose_file_stem}.assert_running/$(compose_service_name):
+	[ -n "`${make} ${compose_file_stem}/$(compose_service_name).ps`" ] \
+		&& exit 0 || exit 23
+
 ${compose_file_stem}/$(compose_service_name).pipe:
 	@# A pipe into the $(compose_service_name) container @ $(compose_file).
 	@# Specify 'entrypoint=...' to override the default spec.
@@ -4917,6 +4922,11 @@ ${compose_file_stem}/$(compose_service_name).pipe:
 	@#   echo echo hello-world | ./compose.mk  ${compose_file_stem}/$(compose_service_name).pipe
 	@#
 	${stream.stdin} | pipe=yes ${make} ${compose_file_stem}/$(compose_service_name)
+
+${compose_file_stem}.restart: ${compose_file_stem}.down ${compose_file_stem}.up.detach
+${compose_file_stem}.restart.fg: ${compose_file_stem}.down ${compose_file_stem}.up
+${compose_file_stem}.restart/$(compose_service_name): \
+	${compose_file_stem}/$(compose_service_name).stop ${compose_file_stem}.up/$(compose_service_name)
 
 ${compose_file_stem}/$(compose_service_name).ps:
 	@# Returns docker process-JSON for affiliated service.
@@ -5004,20 +5014,27 @@ $(compose_service_name).shell.pipe: ${compose_file_stem}/$(compose_service_name)
 endif)
 
 ${namespaced_service}.pipe:; pipe=yes ${make} ${namespaced_service}
+${target_namespace}.$(compose_service_name).exec/%:; ${make} ${compose_file_stem}.exec/$(compose_service_name)/$${*}
+${target_namespace}.$(compose_service_name).exec:; ${make} ${compose_file_stem}.exec/$(compose_service_name)
+${target_namespace}.$(compose_service_name).dispatch/%:
+	${make} ${compose_file_stem}.dispatch/$(compose_service_name)/$${*}
 ${target_namespace}.get_config: ${compose_file_stem}/$(compose_service_name).get_config
 ${target_namespace}.ps: ${compose_file_stem}.ps
-${target_namespace}.$(compose_service_name).up: ${compose_file_stem}.up/$(compose_service_name)
+${target_namespace}.$(compose_service_name).assert_running: ${compose_file_stem}.assert_running/$(compose_service_name)
+${target_namespace}.$(compose_service_name).restart: ${compose_file_stem}.restart/$(compose_service_name)
+
 ${target_namespace}.$(compose_service_name).stop: ${compose_file_stem}/$(compose_service_name).stop
+${target_namespace}.$(compose_service_name).up: ${compose_file_stem}.up/$(compose_service_name)
 ${target_namespace}.$(compose_service_name).up.detach: ${compose_file_stem}.up.detach/$(compose_service_name)
+${target_namespace}.up.detach: ${compose_file_stem}.up.detach
+${target_namespace}.restart: ${compose_file_stem}.restart
+${target_namespace}.restart.fg: ${compose_file_stem}.restart.fg
+# ${target_namespace}.down: ${compose_file_stem}.down
 ${target_namespace}.$(compose_service_name).shell: ${compose_file_stem}/$(compose_service_name).shell
 ${target_namespace}.$(compose_service_name).ps: ${compose_file_stem}/$(compose_service_name).ps
 ${target_namespace}.$(compose_service_name).build: ${compose_file_stem}.build/$(compose_service_name)
 ${target_namespace}.$(compose_service_name).shell.pipe: ${compose_file_stem}/$(compose_service_name).shell.pipe
 ${target_namespace}.$(compose_service_name): ${compose_file_stem}/$(compose_service_name)
-${target_namespace}.$(compose_service_name).exec/%:; ${make} ${compose_file_stem}.exec/$(compose_service_name)/$${*}
-${target_namespace}.$(compose_service_name).exec:; ${make} ${compose_file_stem}.exec/$(compose_service_name)
-${target_namespace}.$(compose_service_name).dispatch/%:
-	${make} ${compose_file_stem}.dispatch/$(compose_service_name)/$${*}
 ${target_namespace}.up: ${compose_file_stem}.up
 ${namespaced_service}.command/%:; cmd="$${*}" ${make} ${compose_file_stem}/$(compose_service_name)
 ${namespaced_service}: 
@@ -5230,7 +5247,7 @@ ${compose_file_stem}.build $(target_namespace).build:
 	@# WARNING: This is not actually safe for all legal compose files, because
 	@# compose handles run-ordering for defined services, but not build-ordering.
 	@#
-	$$(call log.docker, ${bold_green}${target_namespace} ${sep} ${bold_cyan}build ${sep} ${dim_ital}all services) \
+	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}all services) \
 	&&  $(trace_maybe) \
 	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build -q 
 
@@ -5243,7 +5260,7 @@ ${compose_file_stem}.build.quiet $(target_namespace).build.quiet:
 	@# compose handles run-ordering for defined services, but not build-ordering.
 	@#
 	@$$(eval export svc_disp:=$(shell echo echo $$$${svc:-all services}))
-	$(call log.docker, ${bold_green}${target_namespace} ${sep} ${bold_cyan}build ${sep} ${dim_ital}$${svc_disp})
+	$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}$${svc_disp})
 	$(trace_maybe) \
 	&& quiet=1 label="build finished in" ${make} flux.timer/compose.build/${compose_file}
 
@@ -5267,6 +5284,8 @@ ${compose_file_stem}.build/%:
 	$$(call log.docker, ${target_namespace} ${sep} ${green}$${*} ${sep} ${no_ansi_dim}building..) 
 	echo $${*} | ${stream.comma.to.nl} \
 	| xargs -I% sh ${dash_x_maybe} -c "${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build %"
+
+
 
 ${compose_file_stem}.up/%:
 	@# Ups the given service(s) for the ${compose_file} file.
@@ -5301,7 +5320,7 @@ ${compose_file_stem}.stop $(target_namespace).stop:
 	@# Stops all services for the ${compose_file} file.  
 	@# Provided for completeness; the stop, start, up, and 
 	@# down verbs are not really what you want for tool containers!
-	$$(call log.docker, ${bold_green}${target_namespace} ${sep} ${compose.profile.disp} ${bold_cyan}stop ${sep} ${dim_ital}all services)
+	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}stop ${sep} ${dim_ital}all services)
 	${trace_maybe} && ${docker.compose} -f $${compose_file} stop -t 1 2> >(grep -v '\] Stopping'|grep -v '^ Container ' >&2)
  
 
@@ -5309,7 +5328,7 @@ ${compose_file_stem}.down $(target_namespace).down:
 	@# Bring down all services for the ${compose_file} file.  
 	@# Provided for completeness; the stop, start, up, and 
 	@# down verbs are not really what you want for tool containers!
-	$$(call log.docker, ${bold_green}${target_namespace} ${sep} ${compose.profile.disp} ${bold_cyan}down ${sep} ${dim_ital}all services)
+	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}down ${sep} ${dim_ital}all services)
 	${trace_maybe} && ${docker.compose} -f $${compose_file} down -t 1 2> >(grep -v '^Network.*Removing'|grep -v '^Network.*Removed' >&2)
 
 ${compose_file_stem}.up:
@@ -5317,14 +5336,14 @@ ${compose_file_stem}.up:
 	@# Stops all services for the ${compose_file} file.  
 	@# Provided for completeness; the stop, start, up, and 
 	@# down verbs are not really what you want for tool containers!
-	$$(call log.docker, ${compose_file_stem}.up ${sep} ${compose.profile.disp} ${dim_ital} $$$${svc:-all services})
+	$$(call log.docker, ${compose.ctx.display} ${dim_ital} $$$${svc:-all services})
 	${docker.compose} -f $${compose_file} up $$$${svc:-}
 ${compose_file_stem}.up.detach:
 	@# Brings up all services in the given compose file.
 	@# Stops all services for the ${compose_file} file.  
 	@# Provided for completeness; the stop, start, up, and 
 	@# down verbs are not really what you want for tool containers!
-	$$(call log.docker, ${compose_file_stem}.up.detach ${sep} ${dim_ital} $$$${svc:-all services})
+	$$(call log.docker, ${compose.ctx.display} ${dim_ital} $$$${svc:-all services})
 	${docker.compose} -f $${compose_file} up -d $$$${svc:-}
 
 ${compose_file_stem}.clean:
@@ -5395,8 +5414,9 @@ $$(foreach \
 			$${compose_service_name}, \
 			${target_namespace}, ${import_to_root}, ${compose_file}, )))
 ${compose_file_stem}.ps:
+	@# Returns JSON for names only.
 	$$(call log.target, ${no_ansi}file=${dim}${ital}${compose_file})
-	docker compose -f ${compose_file} ps
+	docker compose -f ${compose_file} ps --format json | ${jq} .Service | ${jq} -s .
 
 else
 $(call log.import.part2,${GLYPH_CHECK} cached)
