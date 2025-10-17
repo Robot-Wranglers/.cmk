@@ -13,8 +13,7 @@ py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 pip.install=pip install \
 	-q --disable-pip-version-check $${pip_args:-} \
 	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo ) -e
-py.pkg.install/%:
-	@# Treats argument as 
+
 pip.install.build:; $(call log.target, installing build module with pip); pip install build
 pip.install/%: mk.require.tool/pip
 	@# NB: Pass `verbose=1` to avoid pip --quiet
@@ -42,7 +41,7 @@ pip.release pypi.release: mk.require.tool/twine mk.assert/PYPI_USER,PYPI_TOKEN
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 py.init: pip.install.build pip.install.many/$(strip ${py.pkg_optional_extras})
-	@# Runs pip.install.build and install dev/testing/publish for this package
+	@# Runs `pip.install.build` and installs dev/testing/publish for this package
 
 py.stat:
 	@# Show details about the python version / platform
@@ -104,13 +103,17 @@ py.autopep:
 	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
 	autopep8 --recursive --in-place ${py.src_root}
 
+py.normalize.targets=py.isort py.autopep py.shed
 py.normalize: 
+	@# py.isort py.autopep py.shed }
 	$(call log.target, Normalizing py.src_root @ ${dim_cyan}${py.src_root})
-	${make} py.isort py.autopep py.shed
+	${make} ${py.normalize.targets}
+
 
 py.static-analysis: 
 	$(call log.target, Analyzing py.src_root @ ${dim_cyan}${py.src_root})
 	${make} py.flake8
+
 ## Tox Support 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -169,6 +172,7 @@ define _tox.import.env
 ${nl}
 $(call mk.unpack.kwargs, ${1}, tox_env, ${1})
 ${kwargs_tox_env}: tox/${kwargs_tox_env}
-tox.${kwargs_tox_env}.dispatch/%:  
+tox.${kwargs_tox_env}.dispatch/%:
+	@# Runs the given target in the `${kwargs_tox_env}` environment
 	${make} tox.dispatch/${kwargs_tox_env},$${*}
 endef
