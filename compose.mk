@@ -1835,7 +1835,7 @@ mk.help.namespace/%:
 		markdown|md) ( \
 			${io.mktemp} && cat $${_filtered} | ${jq} -r '.|keys[]' \
 			| sed 's/%//g' | uniq | ${stream.fold} | ${stream.peek} \
-			| ${stream.nl.to.space}>$${tmpf}; for key in `cat $${tmpf}`; do cat $${_filtered} | (printf "\n[**\`$${key}\`**](#$${key})\n\n" && ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null |${stream.trim}; printf "\n---------\n"); done );; \
+			| ${stream.nl.to.space}>$${tmpf}; for key in `cat $${tmpf}`; do cat $${_filtered} | (printf "\n[**\`$${key}\`**](#$${key})\n\n" && ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null |${stream.trim}; printf "\n---------\n"); done )| ${stream.preview.maybe} ;; \
 		*) $(call log.target,${red} expected format would be set in environment); exit 55;; \
 	esac
 
