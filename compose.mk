@@ -972,7 +972,6 @@ docker.from.url:
 
 docker.help: mk.namespace.filter/docker.
 	@# Lists only the targets available under the 'docker' namespace.
-	@#
 
 docker.network.panic:; docker network prune -f
 	@# Runs 'docker network prune' for the entire system.
@@ -987,7 +986,7 @@ docker.panic: docker.stop.all docker.network.panic docker.volume.prune docker.sy
 	@# images, and then you will probably quickly hit rate-limiting at dockerhub.
 	@# It tears down volumes and networks also, so you do not want to run this in prod.
 	@#
-	docker rm -f $$(docker ps -qa | tr '\n' ' ') 2>/dev/null || true
+	set -x && docker rm -f $$(docker ps -qa | tr '\n' ' ') 2>/dev/null || true
 
 docker.prune docker.system.prune:
 	@# Debugging only! Runs 'docker system prune' for the entire system.
@@ -1349,8 +1348,10 @@ io.file.select=header="Choose a file: (dir=$${dir:-.})"; \
 	choices="`ls $${dir:-.}/$${pattern:-} | ${stream.nl.to.space}`" \
 	&& $(call log.io,io.file.select ${sep} $${dir:-.} ${sep} $${choices}) \
 	&& ${io.get.choice} 
-# Creates file w/ the 2nd argument as a command, iff the file given by the 1st arg is stale
-io.file.gen.maybe=test \( ! -f ${1} -o -n "%$$(find ${1} -mtime +0 -mmin +$${freshness:-2.7} 2>/dev/null)" \) && ${2} > ${1}
+# Creates file w/ the 2nd argument as a command, iff the file given by the 1st arg is older than
+io.file.gen.maybe=[ -n "$$(find "${1}" -mmin +1 2>/dev/null)" ] \
+	&& ($(call log,${dim} cached @ ${1} is old and will be recomputed fresh); eval "${2} > ${1}") \
+	|| (true)
 
 io.get.url=$(call io.mktemp) && curl -sL $${url} > $${tmpf}
 io.gum.docker=${trace_maybe} && docker run $$(if [ -t 0 ]; then echo "-it"; else echo "-i"; fi) -e TERM=$${TERM:-xterm} --entrypoint /usr/local/bin/gum --rm `docker build -q - <<< $$(printf "FROM alpine:${ALPINE_VERSION}\nCOPY --from=charmcli/gum:${IMG_GUM} /usr/local/bin/gum /usr/local/bin/gum\nRUN apk add --update --no-cache bash\n")`
@@ -1426,7 +1427,7 @@ io.gum.style/% io.draw.banner/%:; label="${*}"; ${io.draw.banner}
 	@#
 	@# USAGE: ./compose.mk io.draw.banner/<label>
 
-io.help:; ${make} mk.namespace.filter/io.
+io.help: mk.namespace.filter/io.
 	@# Lists only the targets available under the 'io' namespace.
 
 io.gum.div=label=${@} ${make} io.gum.div
@@ -1825,40 +1826,74 @@ mk.help.block/%:
 	@# USAGE: ./compose.mk mk.help.block/<pattern>
 	pattern="${*}" ${make} mk.parse.block/${MAKEFILE} | ${stream.glow} 
 
+_mk.help.o2=$(call _mk.help.o,${1}) \
+	&& ${io.mktemp} && cat $${parser_cache} | ${jq} "with_entries(select(.key | startswith(\"${2}\")))" > $${tmpf} && _filtered=$${tmpf}
+mk.help.namespace/%:
+	$(call _mk.help.o2,${MAKEFILE},${*}) \
+	&& case "$${format:-}" in \
+		""|json) cat $${_filtered};; \
+		markdown|md) ( \
+			${io.mktemp} && cat $${_filtered} | ${jq} -r '.|keys[]' \
+			| sed 's/%//g' | uniq | ${stream.fold} | ${stream.peek} \
+			| ${stream.nl.to.space}>$${tmpf}; for key in `cat $${tmpf}`; do cat $${_filtered} | (printf "\n[**\`$${key}\`**](#$${key})\n\n" && ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null |${stream.trim}; printf "\n---------\n"); done );; \
+		*) $(call log.target,${red} expected format would be set in environment); exit 55;; \
+	esac
+
+# ${make} mk.namespace.filter/${*} \zzzz |  | ${stream.space.to.nl} | ${flux.each}/mk.help.target
+_mk.help.o=parser_cache=".tmp.$(shell echo `basename ${1}`.parsed.json)" \
+	&& $(call io.file.gen.maybe,$${tmp1},${make} mk.parse/${1})
 mk.help.target/%:
-	@# Shows rendered help for the named target.
-	@#
+	@# Shows help docstring for the named target.
+	@# By default, this previews the docstring as markdown, using charmbracelet/glow.
+	@# Set `preview=0` in environment to override and get raw docstring.
 	@# USAGE: ./compose.mk mk.help.target/<target_name>
-	(tmp1=".tmp.$(shell echo `basename ${MAKEFILE}`.parsed.json)" \
-	&& $(call io.file.gen.maybe,$${tmp1},${make} mk.parse/${MAKEFILE}) \
-	&& $(call io.mktemp) && tmp2="$${tmpf}" \
+	$(call _mk.help.o,${MAKEFILE}) \
 	&& key="${*}" \
-	&& $(call log.mk, ${no_ansi_dim}mk.help.target ${sep} ${dim_cyan}${bold}$${key} ) \
-	&& cat $${tmp1} | ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null > $${tmp2} \
-	; case $$? in \
-		0) $(call log.trace, ${@} ${sep} found literal) ;; \
-		*) $(call log.trace, ${@} missed literal); cat $${tmp1} | ${jq} -r ".[\"$${key}/%\"].docs[]" 2>/dev/null >$${tmp2};; \
-	esac \
-	; case "`cat $${tmp2} | ${stream.trim}`" in \
-		"") $(call log.mk,${cyan_flow_right} ${dim_ital}No help found.);; \
-	esac \
-	; case $$? in \
-		0) cat $${tmp2} ;; \
-		*) $(call log.mk, ${cyan_flow_right} No such target was found.);; \
-	esac) | ${stream.glow}
+	&& key_alt="$${key}/%" \
+	&& $(call log.mk, ${dim_cyan}${bold}$${key} ${sep} ${no_ansi_dim}(via mk.help.target) ) \
+	&& docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null` \
+		|| docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key_alt}\"].docs[]" 2>/dev/null` \
+	&& ( \
+		printf '\n[**`${*}`**](#testing)\n\n' \
+			&& $(call io.dump_var, docstring) \
+	) | ${stream.preview.maybe} \
+	&& printf '\n'
+io.dump_var=printf '%s' "$${$(strip ${1})}"
+# log.data=$(call log.mk, $${label:-${@}}${dim}${underline}$(strip ${1})) && $(call io.var.contents,${1})|${stream.as.log}
+log.dump_var=$(call io.dump_var,${1})|${stream.as.log}
+stream.preview.maybe=(case $${preview:-1} in \
+			1) ${stream.glow};; \
+			*) cat;; \
+		  esac)
+# ; exit 99 \
+# && $(call io.mktemp) \
+# && cat $${parser_cache} | ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null > $${tmpf} \
+# ; case $$? in \
+# 	0) $(call log.trace, ${@} ${sep} found literal) ;; \
+# 	*) $(call log.trace, ${@} missed literal); cat $${parser_cache} | ${jq} -r ".[\"$${key_alt}\"].docs[]" 2>/dev/null >$${tmpf};; \
+# esac \
+# ; case "`cat $${tmpf} | ${stream.trim}`" in \
+# 	"") $(call log.mk,${cyan_flow_right} ${dim_ital}No help found.); echo cat $${parser_cache} ${jq} ".[\"$${key}/%\"]";; \
+# esac \
+# ; (case $$? in \
+# 	0) cat $${tmpf} ;; \
+# 	*) $(call log.mk, ${cyan_flow_right} No such target was found.);; \
+# esac) | (case $${preview:-1} in \
+# 	1) ${stream.glow};; \
+# 	*) printf '\n**`${*}`**\n\n'; cat;; \
+# 	esac)
 
 help.local:
 	@# Renders help for all local targets, i.e. just the ones that do NOT come from includes.
 	@# Usually used from an included makefile, not with compose.mk itself. 
 	@#
-	$(call log.mk, ${no_ansi_dim}${@} ${sep} ${dim}Rendering help for${no_ansi} ${bold}${underline}${MAKEFILE}${no_ansi} ${dim_ital}(no includes)\n)
+	$(call log.target, ${dim}Rendering help for${no_ansi} ${bold}${underline}${MAKEFILE}${no_ansi} ${dim_ital}(no includes)\n)
 	targets="`${mk.targets.local.public} | grep -v '%' | grep "$${filter:-.}"`" \
 	&& width=`echo | awk "{print int(.6*${io.term.width})}"` \
-	&& printf "$${targets}" | ${stream.fold} | ${stream.as.log} \
-	&& printf '\n' \
+	&& tdisp=`printf "$${targets}" | ${stream.fold}` && label=bonk && $(call log.dump_var,tdisp) \
+	&& (printf "## Local Targets (No includes)\n" ; printf "$${targets}" | xargs -I% printf '[%](#%) ' && printf '\n' \
 	&& printf "$${targets}" \
-	| xargs -I% echo mk.help.target/% | ${stream.nl.to.space} \
-	| ${make} mk.kernel
+	| CMK_INTERNAL=1 quiet=1 preview=0 ${flux.each}/mk.help.target) | ${stream.preview.maybe}
 
 help.local.filter/%:; filter="${*}" ${make} help.local
 	@# Like `help.local`, but filters local targets first using the given pattern.
@@ -2364,10 +2399,10 @@ mk.pkg.root:
 endif
 mk.namespace.filter/%:
 	@# Lists all targets in the given namespace, filtering them by the given pattern.
-	@# Simple, pipe-friendly output.  
+	@# Newline-delimited output.  
 	@# WARNING:  Callers must anticipate parametric targets with percent-signs, i.e. "foo.bar/%"
 	@#
-	@# USAGE: ./compose.mk mk.namespace.filter/<namespace>
+	@# USAGE: ./compose.mk mk.namespace.filter/<prefix>
 	@#
 	${trace_maybe} \
 	&& pattern="${*}" && pattern="$${pattern//./[.]}" \
@@ -5017,6 +5052,7 @@ ${namespaced_service}.pipe:; pipe=yes ${make} ${namespaced_service}
 ${target_namespace}.$(compose_service_name).exec/%:; ${make} ${compose_file_stem}.exec/$(compose_service_name)/$${*}
 ${target_namespace}.$(compose_service_name).exec:; ${make} ${compose_file_stem}.exec/$(compose_service_name)
 ${target_namespace}.$(compose_service_name).dispatch/%:
+	@# Dispatch named target in $(compose_service_name) container
 	${make} ${compose_file_stem}.dispatch/$(compose_service_name)/$${*}
 ${target_namespace}.get_config: ${compose_file_stem}/$(compose_service_name).get_config
 ${target_namespace}.ps: ${compose_file_stem}.ps
@@ -5148,8 +5184,9 @@ $(eval img_name:=$(patsubst Dockerfile.%,%,${kwargs_def}))
 $(call mk.unpack.kwargs, ${1}, namespace, $${img_name})
 ${kwargs_namespace}.img:=compose.mk:${img_name}
 ${kwargs_namespace}.clean: mk.docker.rmi/${img_name}
-${kwargs_namespace}.dispatch/%:; img=${img_name} hostname=${img_name} \
-	${make} mk.docker.dispatch/$${*}
+${kwargs_namespace}.dispatch/%:; 
+	@# Dispatch the given target in the `${kwargs_namespace}` container
+	img=${img_name} hostname=${img_name} ${make} mk.docker.dispatch/$${*}
 ${kwargs_namespace}.build: 
 	$$(call log.docker, $${@} ${sep} ${dim}(via def=${no_ansi}${kwargs_def}) ${sep} ${cyan_flow_right}) \
 	&& ${make} Dockerfile.build/${img_name} \
