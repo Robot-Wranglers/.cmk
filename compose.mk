@@ -380,7 +380,7 @@ $(shell printf "trace=$${TRACE} quiet=$${quiet} verbose=$${verbose:-} ${yellow}C
 endif 
 
 # External tool used for parsing Makefile metadata
-MKPARSE_IMG?=ghcr.io/mattvonrocketstein/mk.parse:sha-c3cc4fb
+MKPARSE_IMG?=ghcr.io/mattvonrocketstein/mk.parse:main
 mkparse=$(trace_maybe) && ${docker.run.base} ${MKPARSE_IMG} $${subcommand:-targets}
 
 # Macros for use with jq/yq/jb, using local tools if available and falling back to dockerized versions
@@ -1888,6 +1888,7 @@ mkparse:
 	prefix=`case $${prefix:-} in "") echo;; *) echo "--prefix $${prefix}";; esac` \
 	&& local=`case $${local:-} in "") echo;; *) echo "--local";; esac` \
 	&& preview=`case $${preview:-} in "") echo;; *) echo "--preview";; esac` \
+	&& echo "$${prefix} $${local} $${preview} --public "; exit 44 \
 	&& ${trace_maybe} && ${mkparse} $${path:-${MAKEFILE}} $${prefix} $${local} $${preview} --public 
 
 help.local:
@@ -2416,8 +2417,10 @@ mk.namespace.filter/%:
 	@# USAGE: ./compose.mk mk.namespace.filter/<prefix>
 	@#
 	${trace_maybe} \
-	&& pattern="${*}" && pattern="$${pattern//./[.]}" \
-	&& ${make} mk.parse.targets/${MAKEFILE} | grep -v ^all$$ | grep ^$${pattern}
+	&& pattern="${*}" \
+	&& ${mkparse} --prefix $${pattern} $${path:-${MAKEFILE}} | ${jq} -r '.|keys[]'
+
+# && ${make} mkparse ${MAKEFILE} | grep -v ^all$$ | grep ^$${pattern}
 
 mk.require.tool/%:; $(call _mk.require.tool, ${*})
 	@# Asserts that the given tool is available in the environment.
@@ -2475,7 +2478,7 @@ mk.parse.block/%:
 # 	| ${jq.run} "to_entries | map(select(.key | test(\".*$${pattern}.*\"))) | first | .value" \
 # 	| ${jq.run} -r '.[1:-1][]'
 
-mk.targets mk.parse.targets mk.targets.local mk.parse.local: mk.parse.shallow/${MAKEFILE}
+mk.targets mk.parse.targets mk.targets.local mk.parse.local:; ${make} mk.parse.shallow/$${path:-${MAKEFILE}}
 	@# Returns only local targets for the current Makefile, ignoring includes
 	@# Output of `mk.parse.shallow/` for the current val of MAKEFILE.
 
