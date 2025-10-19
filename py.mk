@@ -12,16 +12,16 @@ py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 
 pip.install=pip install \
 	-q --disable-pip-version-check $${pip_args:-} \
-	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo ) -e
+	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo )
 
 pip.install.build:; $(call log.target, installing build module with pip); pip install build
 pip.install/%: mk.require.tool/pip
 	@# NB: Pass `verbose=1` to avoid pip --quiet
 	$(call log.target, verbose=$${verbose:-0} ${sep} ${dim}pip_args=$${pip_args:-})
-	$(call log.target.pad_bottom, ${pip.install} .[${*}] ${sep} ${cyan_flow_right} ) 
-	set -x && ${pip.install} .[${*}]
-	$(call log.target.pad_top, ${dim}${pip.install} .[${*}] ${sep} ${py.done.glyph})
-py.pkg.extra.install/%:; ${make} pip.install/.[${*}]
+	$(call log.target.pad_bottom, ${pip.install} ${*} ${sep} ${cyan_flow_right} ) 
+	set -x && ${pip.install} ${*}
+	$(call log.target.pad_top, ${dim}${pip.install} ${*} ${sep} ${py.done.glyph})
+py.pkg.extra.install/%:; pip_args=$${pip_args:--e} ${make} pip.install/.[${*}]
 	@#
 pip.install.many/%:
 	@#
