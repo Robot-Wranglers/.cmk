@@ -5205,11 +5205,12 @@ ${kwargs_namespace}.img:=${kwargs_img}
 ${kwargs_namespace}.dispatch/%:; img=${kwargs_img} hostname=${kwargs_img} \
 	${make} docker.dispatch/$${*}
 ${kwargs_namespace}.build:
-	case ${kwargs_file} in \
-		undefined) $$(call log.docker, $${@} ${sep} file is undefined!) ;; \
+	${trace_maybe} \
+	&& case ${kwargs_file} in \
+		undefined) $$(call log.docker, $${@} ${sep} docker.importfile is undefined!) ;; \
 		*) ( \
 			$$(call log.docker, $${@} ${sep} ${dim}(via img=${no_ansi}${kwargs_img} ${dim}file=${no_ansi}${kwargs_file}${dim}) ${sep} ${cyan_flow_right}) \
-			&& tag=${kwargs_img} ${make} docker.build/$${kwargs_file} \
+			&& tag=${kwargs_img} ${make} docker.build/${kwargs_file} \
 			&& $$(call log.target, ${bold}${green}${GLYPH_CHECK}) \
 		);; \
 	esac
