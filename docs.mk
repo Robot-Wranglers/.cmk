@@ -7,8 +7,9 @@
 
 docs.root=$${DOCS_ROOT:-docs}
 
-# CSS Support
+# BEGIN: CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 define Dockerfile.css.min
 FROM node:18-alpine
 RUN npm install -g clean-css-cli
@@ -29,8 +30,9 @@ css.pretty/%: Dockerfile.build/css.pretty
 	@# CSS Pretty / Un-minify
 	img=css.pretty cmd="--write ${*}" ${make} mk.docker
 
-# Diagramming Support: drawio
+# BEGIN: drawio Diagramming Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 define Dockerfile.drawio
 FROM rlespinasse/drawio-export
 RUN apt-get update -qq && apt-get install -qq -y make procps
@@ -70,8 +72,9 @@ docs.drawio/%: docs.drawio.init
 	&& popd >/dev/null && mv /tmp/*.png $${outf} \
 	&& chown 1000 $${outf}
 
-# Diagramming Support: mermaid
+# BEGIN: Mermaid Diagramming Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 mmd.config=.cmk/.mmd.config
 img.imagemagick=dpokidov/imagemagick
 define Dockerfile.mermaid
@@ -194,7 +197,12 @@ FROM python:3.11-bookworm
 RUN git config --global --add safe.directory /workspace
 RUN pip3 install --break-system-packages 'pynchon @ git+https://github.com/robot-wranglers/pynchon@2025.9.8'
 RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
-RUN apt-get update && apt-get install -y tree jq make procps nano
+RUN apt-get update && apt-get install -y tree jq make procps nano wget
+RUN pip3 install --break-system-packages uv
+RUN wget https://raw.githubusercontent.com/mattvonrocketstein/mk.parse/refs/heads/main/mk.parse.py
+RUN mv mk.parse.py /usr/local/bin/mk.parse
+RUN chmod +x /usr/local/bin/mk.parse
+RUN mk.parse --help
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
 
