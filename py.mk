@@ -97,7 +97,11 @@ py.isort:
 
 py.shed:
 	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
-	pushd ${py.src_root}; shed; popd; 
+	pushd ${py.src_root} 2>/dev/null \
+	; case $$? in \
+		0) shed;; \
+		*) $(call log.target,${yellow}warning ${sep} cannot change dir to ${py.src_root});; \
+	esac
 
 py.autopep:
 	$(call log.io, ${@} ${sep} ${dim_ital}${py.src_root} ..)
