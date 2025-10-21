@@ -893,7 +893,7 @@ docker.logs.follow/:
 	$(call log.docker, docker.logs.follow ${sep} ${yellow}No container ID to get logs from.)
 docker.logs.timeout/%:
 	@# Like docker.logs.follow, but times out after the given number of seconds.
-	@# USAGE: docker.logs.timeout/<timeout_in_seconds>,<id>
+	@# USAGE: `docker.logs.timeout/<timeout_in_seconds>,<id>`
 	timeout=$(call mk.unpack.arg,1) \
 	&& id=$(call mk.unpack.arg,2,$${id:-}) \
 	quiet=1 CMK_INTERNAL=1 \
@@ -992,7 +992,6 @@ docker.prune docker.system.prune:
 
 docker.prune.old: flux.timer/.docker.prune.old
 	@# Debugging only! Runs 'docker system prune --all --force --filter "until="'
-
 .docker.prune.old:; docker system prune --all --force --filter "until=$${docker_max_age:-168h}"
 
 docker.ps:; docker ps --format json | ${jq} .
@@ -1091,8 +1090,6 @@ docker.run/% docker.start/%:; img="${*}" entrypoint=none ${make} docker.run.sh
 	@# Starts the named docker image with the default entrypoint
 	@# USAGE: 
 	@#   ./compose.mk docker.start/<img>
-# .docker.start/%:; ${make} docker.start/compose.mk:${*}
-# 	@# Like 'docker.start' but implicitly uses 'compose.mk' prefix. This is used with "local" images.
 
 docker.start.tty/%:; tty=1 ${make} docker.start/${*}
 	@# Like `docker.start/..`, but sets tty=1
@@ -1808,17 +1805,9 @@ mk.get/%:; $(info ${${*}})
 mk.help: mk.namespace.filter/mk.
 	@# Lists only the targets available under the 'mk' namespace.
 
-mk.help.module/%:;
+mk.help.module/%:; ${mkparse} $${path:-${MAKEFILE}} --prefix "${*}" --markdown --preview
 	@# Shows help for the named module.
 	@# USAGE: ./compose.mk mk.help.module/<mod_name>
-# $(call io.mktemp) && export key="${*}" \
-# && (CMK_INTERNAL=1 ${make} mk.parse.module.docs/${MAKEFILE} \
-# 	| ${jq} ".$${key}"  2>/dev/null | ${jq} -r '.[1:-1][]' 2>/dev/null  \
-# > $${tmpf}) \
-# ; [ -z "`cat $${tmpf}`" ] && exit 0 \
-# || ( \
-# 	$(call log.mk, mk.help.module ${sep} ${bold}$${key}) \
-# 	&& cat $${tmpf} | ${stream.glow} >/dev/stderr ) 
 
 mk.help.block/%:
 	@# Shows the help-block matching the given pattern.
@@ -1842,23 +1831,24 @@ mk.help.namespace/%:
 
 # ${make} mk.namespace.filter/${*} \zzzz |  | ${stream.space.to.nl} | ${flux.each}/mk.help.target
 _mk.help.o=parser_cache=".tmp.$(shell echo `basename ${1}`.parsed.json)" \
-	&& $(call io.file.gen.maybe,$${tmp1},${make} mk.parse/${1})
-mk.help.target/%:
+	&& $(call io.file.gen.maybe,$${parser_cache},${mkparse} ${1})
+mk.help.target/%:; ${mkparse} ${MAKEFILE} --prefix ${*} --markdown --preview 
 	@# Shows help docstring for the named target.
 	@# By default, this previews the docstring as markdown, using charmbracelet/glow.
 	@# Set `preview=0` in environment to override and get raw docstring.
 	@# USAGE: ./compose.mk mk.help.target/<target_name>
-	$(call _mk.help.o,${MAKEFILE}) \
-	&& key="${*}" \
-	&& key_alt="$${key}/%" \
-	&& $(call log.mk, ${dim_cyan}${bold}$${key} ${sep} ${no_ansi_dim}(via mk.help.target) ) \
-	&& docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null` \
-		|| docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key_alt}\"].docs[]" 2>/dev/null` \
-	&& ( \
-		printf '\n[**`${*}`**](#testing)\n\n' \
-			&& $(call io.dump_var, docstring) \
-	) | ${stream.preview.maybe} \
-	&& printf '\n'
+	
+# $(call _mk.help.o,${MAKEFILE}) \
+# && key="${*}" \
+# && key_alt="$${key}/%" \
+# && $(call log.mk, ${dim_cyan}${bold}$${key} ${sep} ${no_ansi_dim}(via mk.help.target) ) \
+# && docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key}\"].docs[]" 2>/dev/null` \
+# 	|| docstring=`cat $${parser_cache} | ${jq} -r ".[\"$${key_alt}\"].docs[]" 2>/dev/null` \
+# && ( \
+# 	printf '\n[**`${*}`**](#testing)\n\n' \
+# 		&& $(call io.dump_var, docstring) \
+# ) | ${stream.preview.maybe} \
+# && printf '\n'
 io.dump_var=printf '%s' "$${$(strip ${1})}"
 # log.data=$(call log.mk, $${label:-${@}}${dim}${underline}$(strip ${1})) && $(call io.var.contents,${1})|${stream.as.log}
 log.dump_var=$(call io.dump_var,${1})|${stream.as.log}
@@ -1883,36 +1873,6 @@ stream.preview.maybe=(case $${preview:-1} in \
 # 	1) ${stream.glow};; \
 # 	*) printf '\n**`${*}`**\n\n'; cat;; \
 # 	esac)
-mkparse:
-	@#
-	prefix=`case $${prefix:-} in "") echo;; *) echo "--prefix $${prefix}";; esac` \
-	&& local=`case $${local:-} in "") echo;; *) echo "--local";; esac` \
-	&& preview=`case $${preview:-} in "") echo;; *) echo "--preview";; esac` \
-	&& echo "$${prefix} $${local} $${preview} --public "; exit 44 \
-	&& ${trace_maybe} && ${mkparse} $${path:-${MAKEFILE}} $${prefix} $${local} $${preview} --public 
-
-help.local:
-	@# Renders help for all local targets, i.e. just the ones that do NOT come from includes.
-	@# Usually used from an included makefile, not with compose.mk itself. 
-	@#
-	$(call log.target, ${dim}Rendering help for${no_ansi} ${bold}${underline}${MAKEFILE}${no_ansi} ${dim_ital}(no includes)\n)
-	local=1 ${make} mkparse
-
-# targets="`${mk.targets.local.public} | grep -v '%' | grep "$${filter:-.}"`" \
-# && width=`echo | awk "{print int(.6*${io.term.width})}"` \
-# && tdisp=`printf "$${targets}" | ${stream.fold}` && label=bonk && $(call log.dump_var,tdisp) \
-# && (printf "## Local Targets (No includes)\n" ; printf "$${targets}" | xargs -I% printf '[%](#%) ' && printf '\n' \
-# && printf "$${targets}" \
-# | CMK_INTERNAL=1 quiet=1 preview=0 ${flux.each}/mk.help.target) | ${stream.preview.maybe}
-
-help.local.filter/%:; prefix="${*}" local=1 ${make} mkparse
-	@# Like `help.local`, but filters local targets first using the given pattern.
-	@# Usually used from an included makefile, not with compose.mk itself. 
-	@#
-	@# USAGE: 
-	@#   make help.local.filter/<pattern>
-
-mk.help.search/%:; prefix=${*} ${make} mkparse
 # mk.help.search/%:
 # 	@# Shows all targets matching the given prefix.
 # 	@#
@@ -1934,23 +1894,6 @@ mk.help.search/%:; prefix=${*} ${make} mkparse
 # 			); ;; \
 # 	esac
 
-mk.kernel:
-	@# Executes the input data on stdin as a kind of "script" that 
-	@# runs inside the current make-context.  This basically allows
-	@# you to treat targets as an instruction-set without any kind 
-	@# of 'make ... ' preamble.
-	@#
-	@# USAGE: ( concrete )
-	@#  echo flux.ok | ./compose.mk kernel
-	@#  echo flux.and/flux.ok,flux.ok | ./compose.mk kernel
-	@#
-	instructions="`${stream.stdin} | ${stream.nl.to.space}`" \
-	&& count=`printf "$${instructions}" | ${stream.count.words}` \
-	&& $(call log.target.part1, parsing input stream as instructions ) \
-	&& $(call log.target.part2, ${yellow}$${count}${no_ansi_dim} total) \
-	&& ${trace_maybe} && ${make} $${instructions}
-
-
 define cmk.default.sugar
 [
 	["⋘", "⋙", "$(call compose.import.string, def=__NAME__ import_to_root=TRUE)"],
@@ -1969,8 +1912,10 @@ define cmk.default.dialect
 	["this.", "${make} "]
 ]
 endef 
-# mk.aliases:
-# 	printf "alias mk.compile='${CMK_BIN} mk.compile'\n"
+
+
+mk.clean:; rm -f .tmp.*
+	@# Cleans `.tmp.*` files
 
 mk.compile/% mk.compiler/%:; ls ${*} && export __interpreting__=${*} && cat ${*} | (${mk.compile})
 	@# Like `mk.compile`, but accepts file as argument instead of using stdin.
@@ -2005,6 +1950,22 @@ esac \
 	${make} $${runner}/mk.preprocess,io.awk/.awk.main.preprocess,io.awk/.awk.dispatch
 endef
 	
+mk.kernel:
+	@# Executes the input data on stdin as a kind of "script" that 
+	@# runs inside the current make-context.  This basically allows
+	@# you to treat targets as an instruction-set without any kind 
+	@# of 'make ... ' preamble.
+	@#
+	@# USAGE: ( concrete )
+	@#  echo flux.ok | ./compose.mk kernel
+	@#  echo flux.and/flux.ok,flux.ok | ./compose.mk kernel
+	@#
+	instructions="`${stream.stdin} | ${stream.nl.to.space}`" \
+	&& count=`printf "$${instructions}" | ${stream.count.words}` \
+	&& $(call log.target.part1, parsing input stream as instructions ) \
+	&& $(call log.target.part2, ${yellow}$${count}${no_ansi_dim} total) \
+	&& ${trace_maybe} && ${make} $${instructions}
+
 mk.src: 
 	@# Returns source-code for this make-context (excluding compose.mk).
 	@# This effectively flattens includes, basically concatenating 
@@ -2751,15 +2712,13 @@ endef
 ## container dispatch is similar in spirit to things like declarative pipelines 
 ## in Jenkins, but simpler, more portable, and significantly easier to use.  
 ##
-## ----------------------------------------------------------------------------
-##
 ## What's a workflow in this context? Shell by itself is fine for what you might
 ## call "process algebra", and using operators like `&&`, `||`, `|` in the grand 
 ## unix tradition goes a long way. And adding `make` to the mix already provides 
 ## DAGs.
 ##
 ## What `flux.*` targets add is *flow-control constructs* and *higher-level 
-## join/loop/map* instructions over other make targets, taking inspiration from 
+## join/loop/map* instructions over other make-targets, taking inspiration from 
 ## functional programming and threading libraries. Alternatively, one may think of
 ## flux as a programming language where all primitives are the objects that make 
 ## understands, like targets, defines, and variables. Since every target in `make`
@@ -2773,8 +2732,6 @@ endef
 ##
 ## For parts that are more specific to shell code, see `flux.*.sh`, and for 
 ## working with scripts see `flux.*.script`.
-##
-## ----------------------------------------------------------------------------
 ##
 ## DOCS:
 ## * `[1]:` [Main API](https://robot-wranglers.github.io/compose.mk/api#api-flux)
@@ -5698,6 +5655,32 @@ endef
 define _help_gen
 (LC_ALL=C $(MAKE) -pRrq -f $(firstword $(MAKEFILE_LIST)) : ${stderr_devnull} | awk -v RS= -F: '/(^|\n)# Files(\n|$$)/,/(^|\n)# Finished Make data base/ {if ($$1 !~ "^[#.]") {print $$1}}' | sort | grep -E -v -e '^[^[:alnum:]]' -e '^$@$$' | LC_ALL=C sort| uniq || true)
 endef
+mkparse:
+	@#
+	prefix=`case $${prefix:-} in "") echo;; *) echo "--prefix $${prefix}";; esac` \
+	&& local=`case $${local:-} in "") echo;; *) echo "--local";; esac` \
+	&& preview=`case $${preview:-} in "") echo;; *) echo "--preview";; esac` \
+	&& ${trace_maybe} && ${mkparse} $${path:-${MAKEFILE}} $${prefix} $${local} $${preview} --public 
+
+help.local: 
+	@# Renders help for all local targets, i.e. just the ones that do NOT come from includes.
+	@# Usually used from an included makefile, not with compose.mk itself. 
+	$(call log.target, Listing local targets only)
+	help="`${mkparse} $${path:-${MAKEFILE}} --local --names-only | ${stream.nl.to.space}`" \
+	&& printf "$${help}" | ${stream.space.to.nl} \
+	&& count="`echo $${help}|${stream.count.words}`" \
+	&& count="${yellow}$${count}${no_ansi_dim} targets" \
+	&& $(call log.docker, help.local ${sep} ${no_ansi}${bold}$${MAKEFILE} ${sep} $${count}) \
+	&& $(call log.docker, help ${sep} ${dim}For more specific help use ${no_ansi}${red}${MAKEFILE} help/<target>)
+help.local.filter/%:; ${mkparse} $${path:-${MAKEFILE}} --prefix ${*} --local
+	@# Like `help.local`, but filters local targets first using the given pattern.
+	@# Usually used from an included makefile, not with compose.mk itself. 
+	@#
+	@# USAGE: 
+	@#   make help.local.filter/<pattern>
+
+mk.help.search/%:; prefix=${*} ${make} mkparse
+help/%:; ${mkparse} $${path:-${MAKEFILE}} --prefix ${*} --markdown --preview
 help:
 	@# Attempts to autodetect the targets defined in this Makefile context.
 	@# Older versions of make dont have '--print-targets', so this uses the 'print database' feature.
@@ -5715,8 +5698,10 @@ help:
 			&& count=`cat $${tmpf}|${stream.count.lines}` && count="${yellow}$${count}${dim} items" \
 			&& cat $${tmpf} \
 			&& $(call log.docker, help ${sep} ${dim}Answered help for: ${no_ansi}${bold}top-level ${sep} $${count}) \
-			&& $(call log.docker, help ${sep} ${dim}Use ${no_ansi}help <topic>${no_ansi_dim} for more specific target / module help.) \
-			&& $(call log.docker, help ${sep} ${dim}Use ${no_ansi}help.local${no_ansi_dim} to get help for ${dim_ital}${MAKEFILE} without any included targets.) \
+			&& $(call log.docker, help ${sep} ${dim}For more specific help use ${no_ansi}${red}${MAKEFILE} help/<target>) \
+			&& case ${MAKEFILE} in \
+				${CMK_SRC}) true;; \
+				*) $(call log.docker, help ${sep} To omit included-targets run: ${no_ansi}${red}${MAKEFILE} help.local);; esac \
 		); ;; \
 		1) ( ( ${make} mk.help.module/$${key} \
 				; ${make} mk.help.target/$${key} \
