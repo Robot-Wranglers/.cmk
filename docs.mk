@@ -199,7 +199,7 @@ RUN pip3 install --break-system-packages 'pynchon @ git+https://github.com/robot
 RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
 RUN apt-get update && apt-get install -y tree jq make procps nano wget
 RUN pip3 install --break-system-packages uv
-RUN wget https://raw.githubusercontent.com/mattvonrocketstein/mk.parse/refs/heads/main/mk.parse.py
+RUN wget https://raw.githubusercontent.com/mattvonrocketstein/mk.parse/refs/heads/main/src/mk.parse.py
 RUN mv mk.parse.py /usr/local/bin/mk.parse
 RUN chmod +x /usr/local/bin/mk.parse
 RUN mk.parse --help
