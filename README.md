@@ -2,7 +2,7 @@
 
 [compose.mk](http://robot-wranglers.github.io/compose.mk) is a standard library for `make` that supports docker, polyglots, and domain-agnostic project automation.
 
-This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.  They are perhaps *too opinionated* for you to be interested in them!, but they do demonstrate one want to integrate projects with `compose.mk` and to extend that more basic functionality.
+This is an opinionated starter kit of plugins / extensions for more specific types of projects automation tasks.  They are perhaps *too opinionated* for you to be interested in them!, but they do demonstrate a way to integrate projects with `compose.mk` and to extend that more basic functionality.
 
 See also [k8s-tools.git](https://github.com/Robot-Wranglers/k8s-tools) for kubernetes-specific automation.
 
@@ -52,7 +52,7 @@ In github actions, the correct configuration for `jobs.my_job_name.steps` looks 
 
 ## Usage
 
-Besides plugins, a stable version of the standard library for `compose.mk` is *also* tracked in the plugin folder.  You can use it, or overwrite it with a preferred version, or ignore it in favor of one you are tracking in your project root.. just make sure you adjust paths accordingly.  
+Besides plugins, a stable version of the standard library for `compose.mk` is *also* tracked here.  You can use it, or overwrite it with a preferred version, or ignore it in favor of one you are tracking in your project root.. just make sure you adjust paths accordingly.  
 
 For example, a rewrite of your project Makefile might look like this:
 
@@ -79,3 +79,4 @@ Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.
 * [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on mermaid, drawio, mkdocs, and jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
 * [pdoc.mk](blob/main/pdoc.mk): Python documentation, focusing especially on [pdoc](https://pypi.org/project/pdoc/).
 * [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
+* [json.mk](blob/main/py.mk): JSON helpers (currently just validation).  See the [compose.mk docs for structured IO](https://robot-wranglers.github.io/compose.mk/standard-lib/#structured-io) for details about using `jq` and `jb`.
