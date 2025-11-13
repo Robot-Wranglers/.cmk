@@ -188,6 +188,24 @@ mkdocs.serve:
 	$(call log.target, serving)
 	mkdocs serve --dev-addr $${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}
 
+# Grip Support (Renders github-style README.md's)
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+export GRIP_PORT?=6419
+define Dockerfile.grip
+FROM python:3.11-bookworm
+RUN pip3 install --break-system-packages grip==4.6.2
+ENTRYPOINT grip
+endef
+$(call docker.import.def, def=grip namespace=docs._grip)
+
+docs.grip.serve/%: docs._grip.build 
+	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" ${make} docs._grip
+docs.grip docs.grip.serve:
+	ls README.md >/dev/null 2>/dev/null \
+	&& ${make} docs.grip.serve/README.md \
+	|| $(call log.target, ${red}README.md is missing!) 
+
 # Jinja Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -205,7 +223,6 @@ RUN chmod +x /usr/local/bin/mk.parse
 RUN mk.parse --help
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
-
 docs.pynchon.render/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# Render a single file, fuzzy matching input and automatically determining output
 
