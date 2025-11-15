@@ -1023,7 +1023,7 @@ docker.run.def:
 			img=$${img} ${make} docker.run.sh) \
 	${stderr_stdout_indent}
 
-docker.run.sh:; ${docker.run.sh}
+docker.run.sh:
 	@# Runs the given command inside the named container.  Also available as a macro.
 	@#
 	@# This automatically detects whether it is used as a pipe & proxies stdin as appropriate.
@@ -1034,7 +1034,6 @@ docker.run.sh:; ${docker.run.sh}
 	@# USAGE:
 	@#   img=... entrypoint=... cmd=... env=var1,var2 docker_args=.. ./compose.mk docker.run.sh
 	@#
-docker.run.sh= \
 	${trace_maybe} \
 	&& image_tag="$${img}" \
 	&& entry=`[ "$${entrypoint:-}" == "none" ] && echo ||  echo "--entrypoint $${entrypoint:-bash}"` \
@@ -3607,24 +3606,44 @@ stream.jb:; ${stream.jb}
 	@# REFS:
 	@#   `[1]:` https://github.com/h4l/json.bash
 
-# Pass stream to nushell with given command.  (Internal use)
-# See also: https://www.nushell.sh/cookbook/jq_v_nushell.html#handling-null-values
-# https://www.nushell.sh/cookbook/parsing.html
- _stream.parse.nushell=img=${IMG_NUSHELL} entrypoint=nu cmd="-c 'cat /dev/stdin | ${1}'" CMK_INTERNAL=1 quiet=1 ${make} docker.run.sh
 
-stream.parse:
-	@# Use nushell to parse arbitrary input to JSON given a pattern
+# Pass stream to nushell with given command.  (Internal use)
+ _stream.parse.nushell=img=${IMG_NUSHELL} entrypoint=nu cmd="-c '${stream.stdin} | ${1}'" CMK_INTERNAL=1 quiet=1 ${make} docker.run.sh
+stream.nushell:;  $(call  _stream.parse.nushell, $${cmd})
+	@# Runs the input stream through the given nushell pipeline.
+	@# See also: nushell [official docs](https://www.nushell.sh/cookbook/parsing.html)
+	@#
+	@# EXAMPLE: 
+	@#   echo '{}' | cmd='from json | to yaml' ${make} stream.nushell
+
+stream.nushell/%:
+	@# Runs the input stream through the given nushell pipeline.
+	@# Pipeline is given as argument, converting underscores to space and commas to pipes.  
+	@# See also: nushell [official docs](https://www.nushell.sh/cookbook/parsing.html)
+	@#
+	@# USAGE:
+	@#    echo '{"foo":"bar"}'|./compose.mk stream.nushell/from_json,to_yaml
+	@#
+	cmd="`echo ${*} | sed 's/,/|/g' | sed 's/_/ /g'`" && $(call  _stream.parse.nushell, $${cmd})
+
+stream.nushell.parse stream.parse stream.parse.patterns:
+	@# Use nushell to parse arbitrary input to JSON given a pattern.
+	@# See also: nushell [official docs](https://www.nushell.sh/cookbook/parsing.html)
+	@#
 	@# EXAMPLE: 
 	@#   cargo search shells --limit 10 
 	@#     | pattern='{crate_name} = {version} #{description}' ./compose.mk stream.parse
 	$(call  _stream.parse.nushell, parse \"$${pattern}\" | to json)
 
-stream.parse.columns:
+stream.nushell.parse_cols stream.parse.cols stream.parse.columns:
 	@# Use nushell to try to parse column-oriented input to JSON
+	@# See also: nushell [official docs](https://www.nushell.sh/cookbook/parsing.html)
+	@#
 	@# USAGE: 
 	@#   df -h | ./compose.mk stream.parse.json
 	$(call  _stream.parse.nushell, detect columns | to json)
 	
+
 stream.glow:=${glow.run}
 stream.markdown:=${glow.run} 
 stream.glow stream.markdown:; ${stream.glow} 
