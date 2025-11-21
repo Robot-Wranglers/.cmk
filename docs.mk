@@ -202,6 +202,7 @@ $(call docker.import.def, def=grip namespace=docs._grip)
 docs.grip.serve/%: docs._grip.build 
 	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" ${make} docs._grip
 docs.grip docs.grip.serve:
+	@# Serve rendered version of README.md (defaults to port 6419)
 	ls README.md >/dev/null 2>/dev/null \
 	&& ${make} docs.grip.serve/README.md \
 	|| $(call log.target, ${red}README.md is missing!) 

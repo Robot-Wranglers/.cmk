@@ -76,7 +76,7 @@ Note that `mk.import.plugin` respects `CMK_PLUGIN_DIR` to avoid hardcoded paths.
 ## Contents
 
 * [actions.mk](blob/main/actions.mk): Github actions helpers, mostly assuming that `gh` CLI is already available.
-* [doc.mk](blob/main/pdoc.mk): Documentation helpers, focusing especially on mermaid, drawio, mkdocs, and jinja2 by way of [pynchon](https://github.com/robot-wranglers/pynchon).
+* [doc.mk](blob/main/docs.mk): Documentation helpers, focusing especially on tools like mermaid, drawio, mkdocs, grip, and jinja2.
 * [pdoc.mk](blob/main/pdoc.mk): Python documentation, focusing especially on [pdoc](https://pypi.org/project/pdoc/).
 * [py.mk](blob/main/py.mk): Python related functionality, including stuff like pip and tox.
-* [json.mk](blob/main/py.mk): JSON helpers (currently just validation).  See the [compose.mk docs for structured IO](https://robot-wranglers.github.io/compose.mk/standard-lib/#structured-io) for details about using `jq` and `jb`.
+* [json.mk](blob/main/json.mk): JSON helpers (currently just validation).  See the [compose.mk docs for structured IO](https://robot-wranglers.github.io/compose.mk/standard-lib/#structured-io) for details about using `jq` and `jb`.
