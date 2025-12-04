@@ -163,14 +163,13 @@ docs.serve:
 
 # Mkdocs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
 mkdocs.site_name=`cat mkdocs.yml|${yq} -r .site_name`
 
 mkdocs: mkdocs.build mkdocs.serve
 
 mkdocs.get/%:
 	@# Gets a single value from a mkdocs.yml file with `yq`
-	cat mkdocs.yml|${yq} -r .${*}
+	cat mkdocs.yml | ${yq} -r .${*}
 
 mkdocs.build:
 	@# Runs mkdocs build
@@ -201,6 +200,7 @@ $(call docker.import.def, def=grip namespace=docs._grip)
 
 docs.grip.serve/%: docs._grip.build 
 	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" ${make} docs._grip
+
 docs.grip docs.grip.serve:
 	@# Serve rendered version of README.md (defaults to port 6419)
 	ls README.md >/dev/null 2>/dev/null \
@@ -224,8 +224,9 @@ RUN chmod +x /usr/local/bin/mk.parse
 RUN mk.parse --help
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
-docs.pynchon.render/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
+docs.pynchon.render/%:
 	@# Render a single file, fuzzy matching input and automatically determining output
+	${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 
 docs.pynchon.render.io/%:
 	@# Render a single file, with explicit comma-delimited input/output
