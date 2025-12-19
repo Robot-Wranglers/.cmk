@@ -4686,8 +4686,9 @@ services:
         RUN mkdir -p /home/${DOCKER_UGNAME:-root}
         RUN curl -sL https://raw.githubusercontent.com/sunaku/home/master/bin/tmux-layout-dwindle > /usr/bin/tmux-layout-dwindle
         RUN chmod ugo+x /usr/bin/tmux-layout-dwindle
-        RUN cd /usr/share/figlet; https://raw.githubusercontent.com/xero/figlet-fonts/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/3d.flf
-        RUN cd /usr/share/figlet; wget https://raw.githubusercontent.com/xero/figlet-fonts/refs/heads/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/Roman.flf
+        RUN cd /usr/share/figlet \
+            && wget https://raw.githubusercontent.com/xero/figlet-fonts/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/3d.flf \
+            && wget https://raw.githubusercontent.com/xero/figlet-fonts/refs/heads/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/Roman.flf
         RUN wget https://github.com/jesseduffield/lazydocker/releases/download/v${LAZY_DOCKER_VERSION:-0.23.1}/lazydocker_${LAZY_DOCKER_VERSION:-0.23.1}_Linux_x86_64.tar.gz
         RUN tar -zxvf lazydocker*
         RUN mv lazydocker /usr/bin && rm lazydocker*
