@@ -315,6 +315,12 @@ export CMK_AT_EXIT_TARGETS?=flux.noop
 export CMK_COMPOSE_FILE?=.tmp.compose.mk.yml
 export CMK_DIND?=0
 export verbose:=$(shell [ "$${quiet:-0}" == "1" ] && echo 0 || echo $${verbose:-1})
+
+_docker_quiet_flag=-q
+ifeq ($(shell echo $${quiet:-}), 0)
+_docker_quiet_flag=
+endif
+
 export CMK_INTERNAL?=0
 #export CMK_SRC:=$(filter %compose.mk,${MAKEFILE_LIST})
 export CMK_SRC:=$(or $(filter %compose.mk,${MAKEFILE_LIST}),${MAKEFILE})
@@ -1196,15 +1202,17 @@ docker.volume.prune:; set -x && docker volume prune -f
 # You should chain commands with ' && ' to avoid early deletes
 ifeq (${OS_NAME},Darwin)
 col_b=LC_ALL=C col -b
-io.mktemp=export tmpf=$$(mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
-# Similar to io.mktemp, but returns a directory.
+_io.mktemp=export tmpf=$$(mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
 io.mktempd=export tmpd=$$(mktemp -u ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -r $${tmpd}" EXIT
 else
 col_b=col
-io.mktemp=export tmpf=$$(TMPDIR=`pwd` mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
-# Similar to io.mktemp, but returns a directory.
+_io.mktemp=export tmpf=$$(TMPDIR=`pwd` mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
 io.mktempd=export tmpd=$$(TMPDIR=`pwd` mktemp -d ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -r $${tmpd}" EXIT
 endif
+define io.mktemp
+$(call mk.unpack.kwargs, $(strip $(if $(filter undefined,$(origin 1)),,$(1))), var, tmpf) 
+${_io.mktemp} && ${kwargs_var}=$${tmpf}
+endef
 
 # Helpers for asserting environment variables are present and non-empty 
 mk.assert.env_var=[[ -z "$${$(strip ${1})}" ]] && { $(call log.io, ${red}Error:${no_ansi_dim} required variable ${no_ansi}${underline}$(strip ${1})${no_ansi_dim} is unset or empty!); exit 39; } || true
@@ -5258,8 +5266,8 @@ ${compose_file_stem}.build $(target_namespace).build:
 	@# compose handles run-ordering for defined services, but not build-ordering.
 	@#
 	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}all services) \
-	&&  $(trace_maybe) \
-	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build -q 
+	&& $(trace_maybe) \
+	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build $${_docker_quiet_flag}
 
 ${compose_file_stem}.build.quiet $(target_namespace).build.quiet:
 	@# Quiet build for all services in the given file.
