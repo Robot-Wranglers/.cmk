@@ -397,6 +397,7 @@ jb.array=docker_extra="$${docker_extra:-} --entrypoint jb-array"; ${jb.docker}
 jb=${jb.docker}
 json.from=${jb}
 jq=${jq.run}
+jq.slurp.nonempty=${jq} -s '[.[] | select(length > 0)]'
 yq=${yq.run}
 
 IMG_GUM?=v0.16.0
@@ -1281,6 +1282,8 @@ io.browser/%:; url="`CMK_INTERNAL=1 ${make} mk.get/${*}`" ${make} io.browser
 	@# NB: This requires python on the host and can not run from docker.
 
 IMG_CURL=curlimages/curl:8.13.0
+IO_ENV_LOG?=DOCKER,MK,MAKE
+
 io.curl=$(shell which curl 2>/dev/null || echo docker run --rm ${IMG_CURL}) $(if $(filter undefined,$(origin 1)),,$(1))
 _io.curl=${io.curl} ${1}
 io.curl.stat=bash ${dash_x_maybe} -c '${io.curl} -s -o /dev/null $(if $(filter undefined,$(origin 1)),$${1},$(1)) > /dev/null' -- 
@@ -1307,10 +1310,24 @@ _io.env=sed 's/,/\n/g' | xargs -I% sh -c "env | ${stream.grep.safe} | grep \"^%.
 io.env=bash -c 'echo $${1\#/} | ${_io.env}' -- 
 io.env.filter.prefix=${io.env}
 
+io.env.log: io.env.log/${IO_ENV_LOG}
+	@# Filters environment variables starting with DOCKER, MAKE, MK, etc.
+	@# Human-readable output sent to stderr.  Also available as a macro
+io.env.log=${make} io.env.log
+
+io.env.log/%:; $(call io.env.log,${*})
+	@# Human-readable description of the given subset of env-vars.
+	@# Multiple inputs should be comma-separated.  Also available as a macro
+define io.env.log
+	$(call log.target, prefixes ${sep} ${1}); 
+	echo '${1}' | ${stream.comma.to.space} | ${stream.space.to.nl} | ${flux.each}/io.env.json | ${jq.slurp.nonempty} | ${stream.as.log}
+endef
+
 io.env.json/%:
 	@# Like `io.env/<prefix>` but returns JSON data.
-	env="`${make} io.env/${*} | ${stream.nl.to.space}`" \
-	&& ${jb} $${env}
+	${make} io.env/${*} | awk -F= 'BEGIN {print "{"} {if (NR>1) print ","; printf "  \"%s\": \"%s\"", $$1, $$2} END {print "\n}"}'
+
+#env="`${make} io.env/${*} | ${stream.nl.to.space}`" #&& ${jb} $${env}
 
 io.envp=CMK_INTERNAL=1 ${make} io.envp
 io.envp io.env.pretty: flux.pipeline/io.env,stream.ini.pygmentize
@@ -1346,6 +1363,9 @@ io.file.select=header="Choose a file: (dir=$${dir:-.})"; \
 io.file.gen.maybe=[ -n "$$(find "${1}" -mmin +1 2>/dev/null)" ] \
 	&& ($(call log,${dim} cached @ ${1} is old and will be recomputed fresh); eval "${2} > ${1}") \
 	|| (true)
+
+io.force/%:; force=1 ${make} ${*}
+	@# Context-manager.  Sets `force=1` and then runs the given target.
 
 io.get.url=$(call io.mktemp) && curl -sL $${url} > $${tmpf}
 
@@ -1415,7 +1435,6 @@ define io.draw.banner
 	esac
 endef
 
-
 io.gum.div=label=${@} ${make} io.gum.div
 io.gum.div:; label=$${label:-${io.timestamp}} ${io.draw.banner}
 	@# Draw a horizontal divider with gum.
@@ -1452,9 +1471,13 @@ io.inotify/%:; path="${*}" ${make} io.inotify
 	@#
 	@# USAGE: cmd='..' ${make} io.inotify/<path>
 
-io.mkdir/%:; mkdir -p ${*}
-	@# Runs `mkdir -p` for the named directory
-
+io.mkdir/% mk.require.dir/%:
+	@# Runs `mkdir -p` for the named directory.
+	@# Set `force=1` to use sudo.
+	([ -z "$${force:-}" ] && sudo="" || sudo=sudo ) \
+	&& $(call log.target.part1, ${*} ) \
+	&& $${sudo} mkdir -p ${*} \
+	&& $(call log.target.part2,${green}${GLYPH_CHECK})
 io.preview.img/%:; cat ${*} | ${stream.img} 
 	@# Console-friendly image preview for the given file. See also: `stream.img`
 	@#
@@ -5259,7 +5282,7 @@ ${compose_file_stem}.build.quiet/% ${compose_file_stem}.require/%:
 	@#
 	$(trace_maybe) && ${make} io.quiet.stderr/${compose_file_stem}.build/$${*}
 
-${compose_file_stem}.build/%:
+${compose_file_stem}.build/% $(target_namespace).build/%:
 	@# Builds the given service(s) for the ${compose_file} file.
 	@#
 	@# Note that explicit ordering is the only way to guarantee proper 
