@@ -113,7 +113,7 @@ self.mmd.render/%:
 	&& mmd_config=`ls ${mmd.config} >/dev/null 2>/dev/null \
 		&& echo '--configFile ${mmd.config}' \
 		|| echo ''` \
-	&& cmd="-i ${*} $${mmd_config} -o $${output} $${mmd_args:--b transparent }" \
+	&& cmd="-i ${*} $${mmd_extra:-} $${mmd_config} -o $${output} $${mmd_args:--b transparent }" \
 		img=mermaid ${make} mk.docker \
 	&& ${io.mktemp} \
 	&& cmd='-flatten -fuzz 1% -trim +repage' \
@@ -215,7 +215,7 @@ FROM python:3.11-bookworm
 # allow for ambiguous permissions
 RUN git config --global --add safe.directory /workspace
 RUN pip3 install --break-system-packages 'pynchon @ git+https://github.com/robot-wranglers/pynchon@2025.9.8'
-RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4
+RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 tox==4.6.4 mkdocs-toggle-sidebar-plugin mkdocs-terminal
 RUN apt-get update && apt-get install -y tree jq make procps nano wget
 RUN pip3 install --break-system-packages uv
 RUN wget https://raw.githubusercontent.com/mattvonrocketstein/mk.parse/refs/heads/main/src/mk.parse.py
