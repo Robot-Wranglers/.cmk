@@ -432,7 +432,7 @@ compose.build/%:
 	@#   svc=<svc_name> ./compose.mk compose.build/<compose_file>
 	@#
 	$(call log.docker, \
-		${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}$${svc:-all services})
+		${compose.ctx.display_profile} ${bold_cyan}build ${sep} ${dim_ital}$${svc:-all services})
 	label='build finished.' ${make} flux.timer/.compose.build/${*}
 .compose.build/%:
 	case $${force:-0} in \
@@ -4686,9 +4686,8 @@ services:
         RUN mkdir -p /home/${DOCKER_UGNAME:-root}
         RUN curl -sL https://raw.githubusercontent.com/sunaku/home/master/bin/tmux-layout-dwindle > /usr/bin/tmux-layout-dwindle
         RUN chmod ugo+x /usr/bin/tmux-layout-dwindle
-        RUN cd /usr/share/figlet \
-            && wget https://raw.githubusercontent.com/xero/figlet-fonts/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/3d.flf \
-            && wget https://raw.githubusercontent.com/xero/figlet-fonts/refs/heads/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/Roman.flf
+        RUN wget -q --show-progress --progress=bar:force:noscroll -O /usr/share/figlet/Roman.flf https://raw.githubusercontent.com/xero/figlet-fonts/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/Roman.flf
+        RUN wget -q --show-progress --progress=bar:force:noscroll -O /usr/share/figlet/3d.flf https://raw.githubusercontent.com/xero/figlet-fonts/fbf3b68dd0fcd1e63c0f04d3c79eea2743bb377c/3d.flf
         RUN wget https://github.com/jesseduffield/lazydocker/releases/download/v${LAZY_DOCKER_VERSION:-0.23.1}/lazydocker_${LAZY_DOCKER_VERSION:-0.23.1}_Linux_x86_64.tar.gz
         RUN tar -zxvf lazydocker*
         RUN mv lazydocker /usr/bin && rm lazydocker*
@@ -4764,7 +4763,8 @@ windows:
 EOF
 endef
 export COMPOSE_PROFILES?=
-compose.ctx.display=${bold_green}$(or ${target_namespace},${compose_file_stem}) ${sep} $(shell [ "$(COMPOSE_PROFILES)" = "" ] && echo "" || echo "${dim}${bold_cyan}▐░${no_ansi}${ital}$(COMPOSE_PROFILES)${no_ansi_dim}${bold_cyan}░▌") ${sep} 
+compose.ctx.display_profile=$(shell [ "$(COMPOSE_PROFILES)" = "" ] && echo "" || echo "${dim}${bold_cyan}▐░${no_ansi}${ital}$(COMPOSE_PROFILES)${no_ansi_dim}${bold_cyan}░▌") 
+compose.ctx.display=${bold_green}$(or ${target_namespace},${compose_file_stem}) ${sep} ${compose.ctx.display_profile} ${sep} 
 compose.with_profile/%:
 	@# Runs the given targets with the given COMPOSE_PROFILE.  
 	@# Comma-separated profile-names is "and", not "intersection"!
