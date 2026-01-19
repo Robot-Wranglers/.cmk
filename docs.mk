@@ -7,6 +7,12 @@
 
 docs.root=$${DOCS_ROOT:-docs}
 
+docs.list_markdown=set -x; find ${docs.root} | grep -E '.md$$|.md.j2$$'
+
+docs.spellcheck:
+	@# Spell check the entire document root
+	${docs.list_markdown} | ${flux.each}/markdown.spellcheck 
+
 # BEGIN: CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -161,6 +167,29 @@ docs.serve:
 	docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" \
 		${make} docs.pynchon.dispatch/mkdocs.serve
 
+# Markdown Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+markdown.spellcheck/%:
+	@# Spellcheck one file
+	$(call log.target,${*}); cat ${*} | ${markdown.spellcheck}
+markdown.spellcheck:
+	@# Spellcheck pipe
+	cat /dev/stdin \
+	| ${_markdown.spellcheck}
+markdown.spellcheck=aspell list --mode markdown --add-filter=html \
+		--add-wordlists ./.aspell.ignore  \
+	| grep -v '^[A-Z]' \
+	| sort -u
+ markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json . 
+markdown.frontmatter/%:
+	@# Extracts frontmatter / metadata from a single file, as JSON
+	$(call log.target,${*})
+	cat ${*} | ${markdown.frontmatter}
+markdown.frontmatter:
+	@# Extracts all frontmatter from all markdown under docs-root
+	set -x && ${docs.list_markdown} | ${make} flux.each/markdown.frontmatter | ${jq}  -s 'map(select(. != null))'
+	
 # Mkdocs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -198,6 +227,7 @@ RUN pip3 install --break-system-packages grip==4.6.2
 ENTRYPOINT grip
 endef
 $(call docker.import.def, def=grip namespace=docs._grip)
+
 
 docs.grip.serve/%: docs._grip.build 
 	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" ${make} docs._grip
@@ -252,9 +282,9 @@ docs.jinja/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# (Runs inside the pynchon container)
 self.docs.jinja/%:
 	@# Render the named docs twice (once to use includes, then to get the ToC)
-	ls ${*}/*.j2 2>/dev/null >/dev/null \
+	ls ${*}*.j2 2>/dev/null >/dev/null \
 	&& ( \
-		$(call log.mk, ${*} is a directory!); ls ${*}/*.j2 \
+		$(call log.mk, ${*} is a directory!); ls ${*}*.j2 \
 			| xargs -I% sh -x -c "${make} self.docs.jinja/%") \
 	|| case ${*} in \
 		*.md.j2) ${make} .self.docs.jinja/${*};; \
