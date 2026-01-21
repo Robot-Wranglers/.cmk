@@ -7,12 +7,6 @@
 
 docs.root=$${DOCS_ROOT:-docs}
 
-docs.list_markdown=set -x; find ${docs.root} | grep -E '.md$$|.md.j2$$'
-
-docs.spellcheck:
-	@# Spell check the entire document root
-	${docs.list_markdown} | ${flux.each}/markdown.spellcheck 
-
 # BEGIN: CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
@@ -134,6 +128,8 @@ self.mmd.render/%:
 # Top-level Docs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+docs.render.mirror=${make} docs.render.mirror/${@}
+docs.markdown.list=set -x; find ${docs.root} | grep -E '.md$$|.md.j2$$'
 docs.render.mirror/%:
 	@# USAGE:
 	@#  .PHONY: README.md
@@ -144,7 +140,6 @@ docs.render.mirror/%:
 	&& $(call log.io, docs.render.mirror ${sep} ${no_ansi}${bold}$${dest} ${cyan_flow_left} ${dim}$${src}) \
 	&& ${make} docs.pynchon.render.io/$${src},$${dest} \
 	&& cat $${dest} | ${stream.glow}
-docs.render.mirror=${make} docs.render.mirror/${@}
 
 docs.init: docs.pynchon.build
 
@@ -167,29 +162,36 @@ docs.serve:
 	docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" \
 		${make} docs.pynchon.dispatch/mkdocs.serve
 
+docs.spellcheck:
+	@# Spell check the entire document root
+	${docs.markdown.list} | ${flux.each}/markdown.spellcheck 
+
+docs.metadata:; ${docs.markdown.list} | ${flux.each}/markdown.frontmatter | ${jq}  -s 'map(select(. != null))'
+	@# Extracts all frontmatter from all markdown under docs-root
+
 # Markdown Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
 
 markdown.spellcheck/%:
 	@# Spellcheck one file
 	$(call log.target,${*}); cat ${*} | ${markdown.spellcheck}
-markdown.spellcheck:
+
+markdown.spellcheck: markdown.spellcheck//dev/stdin
 	@# Spellcheck pipe
-	cat /dev/stdin \
-	| ${_markdown.spellcheck}
+
 markdown.spellcheck=aspell list --mode markdown --add-filter=html \
 		--add-wordlists ./.aspell.ignore  \
-	| grep -v '^[A-Z]' \
-	| sort -u
- markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json . 
+	| grep -v '^[A-Z]' | sort -u
+
+markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json . 
 markdown.frontmatter/%:
 	@# Extracts frontmatter / metadata from a single file, as JSON
 	$(call log.target,${*})
 	cat ${*} | ${markdown.frontmatter}
-markdown.frontmatter:
-	@# Extracts all frontmatter from all markdown under docs-root
-	set -x && ${docs.list_markdown} | ${make} flux.each/markdown.frontmatter | ${jq}  -s 'map(select(. != null))'
+markdown.frontmatter: markdown.frontmatter//dev/stdin
 	
+
 # Mkdocs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
