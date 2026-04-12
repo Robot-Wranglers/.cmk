@@ -2824,9 +2824,18 @@ flux.each/%:
 	@#
 	@#  printf 'one\ntwo' | ./compose.mk flux.each/flux.echo
 	@#
-	${stream.stdin} | ${stream.space.to.nl} \
+	 ${stream.space.to.nl} | ${stream.peek.summary} \
 	| xargs -I% sh ${dash_x_maybe} -c "${make} ${*}/% || exit 255"
 flux.each=${make} flux.each
+
+flux.each.json/%:
+	@# Given a target, treats each part of the nl-delimited input stream as arguments,
+	@# returning JSON-ouput of `{key: target(key), .. }`
+	@# USAGE:
+	@#   ls *.md | make flux.each.json/flux.echo
+	$(call log.target, mapping key -> ${dim_cyan}${*}${no_ansi_dim}(key))
+	${stream.peek.summary} \
+	| xargs -I {} bash ${dash_x_maybe} -c 'echo "{\"{}\": $$(${make} ${*}/{})}"'
 
 flux.fail:
 	@# Alias for 'exit 1', which is POSIX failure.
@@ -2998,6 +3007,31 @@ flux.loop.watch/%:
 	@# Loops the given target forever, using `watch` instead of the while-loop default.
 	@# This requires `watch` is actually available.
 	watch --interval $${interval:-2} --color ${make} ${*}
+
+io.find=tee >(wc -l >&2) | cat
+# io.map.dir/%:; target=$(call mk.unpack.arg,2) \
+# 	&& dir=$(call mk.unpack.arg,1) \
+# 	&& filter=$(call mk.unpack.arg,3) \
+# 	${make} flux.map.dir/$${target},$${dir},$${filter}
+# flux.map.dir/%:
+# 	@# Example Usage:
+# 	@#   make flux.map.dir/flux.echo,src,.py
+# 	target=$(call mk.unpack.arg,1) \
+# 	&& dir=$(call mk.unpack.arg,2) \
+# 	&& filter=$(call mk.unpack.arg,3) \
+# 	&& $(call log.target.part1, checking for $${dir}) \
+# 	&& ls $${dir} >/dev/null 2>/dev/null \
+# 	&& $(call log.target.part2, ok) \
+# 	&& case "$${filter}" in \
+# 		"") find_args="";; \
+# 		*) find_args="-name "*$${filter}"";; \
+# 	esac \
+# 	&& $(call log.target,mapping target=${dim_cyan}$${target} ${sep} dir=$${dim_ital_cyan}$${dir} ${no_ansi_dim} find_args=$${find_args}) \
+# 	&& find $${dir} $${find_args} \
+# 	| ${stream.peek} | ${make} flux.each/$${target}
+
+# like stream.peek, but prefaced with a line-count
+stream.peek.summary=tee >($(call log.target, $${msg:-streaming} ${sep} ${yellow}`${stream.stdin}|wc -l` lines)) 
 
 flux.map/% flux.for.each/%:
 	@# Like `flux.each`, but accepts input as an argument.

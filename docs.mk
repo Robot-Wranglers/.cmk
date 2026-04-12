@@ -129,8 +129,11 @@ self.mmd.render/%:
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 docs.render.mirror=${make} docs.render.mirror/${@}
-docs.markdown.list=set -x; find ${docs.root} | grep -E '.md$$|.md.j2$$'
+docs.pages=set -x; find ${docs.root} | grep -v meta | grep -E '.md$$|.md.j2$$'
+docs.init: docs.pynchon.build
+
 docs.render.mirror/%:
+	@# Renders a docs-page to somewhere else in the repository.
 	@# USAGE:
 	@#  .PHONY: README.md
 	@#   README.md:; ${make} docs.render.mirror/${@}
@@ -141,13 +144,14 @@ docs.render.mirror/%:
 	&& ${make} docs.pynchon.render.io/$${src},$${dest} \
 	&& cat $${dest} | ${stream.glow}
 
-docs.init: docs.pynchon.build
 
-docs.footnotes:; python -c '\
+docs.footnotes:
+	@# Returns all footnotes from all pages as JSON like `{path: [footnote1,..]}`
+	python -c '\
 import json,pathlib;\
-skip_list = ["README"]; tmp = { p.stem.split(".")[0]:p \
-      for p in pathlib.Path("docs/").iterdir() if str(p).endswith(".md.j2") }; \
-tmp={ p:open(f"docs/{p}.md.j2","r").readlines() for p in tmp }; \
+jinja_files=[ p for p in pathlib.Path("docs/").iterdir() if str(p).endswith(".md.j2") ]; \
+skip_list = ["README"]; tmp = { p:p for p in jinja_files }; \
+tmp={ str(p):open(p,"r").readlines() for p in tmp }; \
 tmp={ \
   p:[":".join(l.split(":")[1:]).strip() for l in lines if l.startswith("[^")] \
   for p,lines in tmp.items() }; \
@@ -164,14 +168,29 @@ docs.serve:
 
 docs.spellcheck:
 	@# Spell check the entire document root
-	${docs.markdown.list} | ${flux.each}/markdown.spellcheck 
+	${docs.pages} | ${flux.each}/markdown.spellcheck 
 
-docs.metadata:; ${docs.markdown.list} | ${flux.each}/markdown.frontmatter | ${jq}  -s 'map(select(. != null))'
-	@# Extracts all frontmatter from all markdown under docs-root
+jq.slurp.nontrivial=map(to_entries) | flatten | group_by(.key) | map({key: .[0].key, value: (map(.value) | map(select(. != null)) | .[0])}) | map(select(.value != null)) | from_entries
+jq.timestamp_file_metadata=($$mtimes | split("\n") | map(select(length > 0) | split("|")) | map({(.[1]): (.[0] | tonumber)}) | add // {}) as $$times | to_entries | map(.value.modified = (($$times[.key] // now) | strftime("%Y-%m-%d"))) | sort_by($$times[.key] // 0) |reverse | from_entries
+
+docs.pages.tags:
+	@# Keys from `docs.pages.metadata` re-grouped by tag
+	@# JSON output:
+	@#   { tag : [ page_path, .. ] }
+	${docs.pages.metadata} | ${jq} 'reduce to_entries[] as $$item ({}; reduce ($$item.value.tags // [])[] as $$tag (.; .[$$tag] += [$$item.key]))'
+
+docs.pages.metadata:
+	@# JSON output:
+	@#   { page_path : { tags: [ .. ], title: "", .. } .. }
+	find ${docs.root} -name '*j2' \
+	| ${make} flux.each.json/markdown.frontmatter | ${jq} --slurp '${jq.slurp.nontrivial}' \
+	| ${jq} --arg mtimes "$$(stat -c "%Y|%n" docs/**/*.j2 2>/dev/null)" '($$mtimes | split("\n") | map(select(length > 0) | split("|")) | map({(.[1]): (.[0] | tonumber)}) | add // {}) as $$times | to_entries | map(.value.modified = (($$times[.key] // now) | strftime("%Y-%m-%d"))) | sort_by($$times[.key] // 0) | reverse | from_entries'
+docs.pages.metadata=${make} docs.pages.metadata
+
+
 
 # Markdown Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
 
 markdown.spellcheck/%:
 	@# Spellcheck one file
@@ -184,7 +203,8 @@ markdown.spellcheck=aspell list --mode markdown --add-filter=html \
 		--add-wordlists ./.aspell.ignore  \
 	| grep -v '^[A-Z]' | sort -u
 
-markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json . 
+markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json .
+
 markdown.frontmatter/%:
 	@# Extracts frontmatter / metadata from a single file, as JSON
 	$(call log.target,${*})
@@ -195,13 +215,13 @@ markdown.frontmatter: markdown.frontmatter//dev/stdin
 # Mkdocs Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+mkdocs.config=mkdocs.yml
 mkdocs.site_name=`cat mkdocs.yml|${yq} -r .site_name`
-
 mkdocs: mkdocs.build mkdocs.serve
 
 mkdocs.get/%:
 	@# Gets a single value from a mkdocs.yml file with `yq`
-	cat mkdocs.yml|${yq} -r .${*}
+	cat mkdocs.yml | ${yq} -r .${*}
 
 mkdocs.build:
 	@# Runs mkdocs build
@@ -254,6 +274,9 @@ RUN wget https://raw.githubusercontent.com/mattvonrocketstein/mk.parse/refs/head
 RUN mv mk.parse.py /usr/local/bin/mk.parse
 RUN chmod +x /usr/local/bin/mk.parse
 RUN mk.parse --help
+RUN apt-get update && apt-get install -y jq
+RUN wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq &&\
+    chmod +x /usr/local/bin/yq
 endef
 $(call docker.import.def, def=pynchon namespace=docs.pynchon)
 docs.pynchon.render/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
@@ -265,9 +288,9 @@ docs.pynchon.render.io/%:
 	cmd='-x -c "pynchon jinja render $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)"' \
 	${make} docs.pynchon
 
-docs.jinja_templates:; find ${docs.root} | grep .j2 | sort  | grep -v ${docs.root}/macros/
-	@# Find all templates under docs root.
-
+docs.jinja.templates:; ${docs.jinja.templates}
+	@# Lists all templates under docs root.
+docs.jinja.templates=find ${docs.root} | grep .j2 | sort  | grep -v '/includes/' | grep -v '/macros/'
 docs.jinja: docs.pynchon.dispatch/self.docs.jinja
 	@# Render all templates under docs-root
 	$(call log.mk, Normalizing permissions)
@@ -276,9 +299,11 @@ docs.jinja: docs.pynchon.dispatch/self.docs.jinja
 self.docs.jinja:
 	@# Render all templates under docs-root
 	@# (Runs inside the pynchon container)
-	pynchon --version
-	${make} docs.jinja_templates \
-	| xargs -I% sh -x -c "make self.docs.jinja/% || exit 255"
+	$(call log.target, using ${yellow}`pynchon --version 2>/dev/null`)
+	$(call log.target, rendering all pages..)
+	msg="Templates found" \
+	&& ${docs.jinja.templates} \
+	| ${stream.peek} | ${flux.each}/self.docs.jinja
 
 docs.jinja/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# (Runs inside the pynchon container)
