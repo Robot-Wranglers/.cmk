@@ -18,7 +18,14 @@ ENTRYPOINT ["cleancss"]
 endef
 css.min/%: Dockerfile.build/css.min
 	@# CSS Minify
-	img=css.min cmd="--output ${*} ${*}" ${make} mk.docker
+	${trace_maybe} \
+	&& if [ -d "${*}" ]; then ( \
+		$(call log.target,input is directory) \
+		&& find ${*} -name *.css \
+		| ${stream.peek} | ${flux.each}/css.min \
+	); else ( \
+		img=css.min cmd="--output ${*} ${*}" ${make} mk.docker \
+	); fi
 
 define Dockerfile.css.pretty
 FROM node:18-alpine

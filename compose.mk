@@ -315,7 +315,6 @@ export CMK_AT_EXIT_TARGETS?=flux.noop
 export CMK_COMPOSE_FILE?=.tmp.compose.mk.yml
 export CMK_DIND?=0
 export verbose:=$(shell [ "$${quiet:-0}" == "1" ] && echo 0 || echo $${verbose:-1})
-
 _docker_quiet_flag=-q
 ifeq ($(shell echo $${quiet:-}), 0)
 _docker_quiet_flag=
@@ -1202,17 +1201,15 @@ docker.volume.prune:; set -x && docker volume prune -f
 # You should chain commands with ' && ' to avoid early deletes
 ifeq (${OS_NAME},Darwin)
 col_b=LC_ALL=C col -b
-_io.mktemp=export tmpf=$$(mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
+io.mktemp=export tmpf=$$(mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
+# Similar to io.mktemp, but returns a directory.
 io.mktempd=export tmpd=$$(mktemp -u ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -r $${tmpd}" EXIT
 else
 col_b=col
-_io.mktemp=export tmpf=$$(TMPDIR=`pwd` mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
+io.mktemp=export tmpf=$$(TMPDIR=`pwd` mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -f $${tmpf}" EXIT
+# Similar to io.mktemp, but returns a directory.
 io.mktempd=export tmpd=$$(TMPDIR=`pwd` mktemp -d ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -r $${tmpd}" EXIT
 endif
-define io.mktemp
-$(call mk.unpack.kwargs, $(strip $(if $(filter undefined,$(origin 1)),,$(1))), var, tmpf) 
-${_io.mktemp} && ${kwargs_var}=$${tmpf}
-endef
 
 # Helpers for asserting environment variables are present and non-empty 
 mk.assert.env_var=[[ -z "$${$(strip ${1})}" ]] && { $(call log.io, ${red}Error:${no_ansi_dim} required variable ${no_ansi}${underline}$(strip ${1})${no_ansi_dim} is unset or empty!); exit 39; } || true
@@ -1291,7 +1288,6 @@ io.browser/%:; url="`CMK_INTERNAL=1 ${make} mk.get/${*}`" ${make} io.browser
 
 IMG_CURL=curlimages/curl:8.13.0
 IO_ENV_LOG?=DOCKER,MK,MAKE
-
 io.curl=$(shell which curl 2>/dev/null || echo docker run --rm ${IMG_CURL}) $(if $(filter undefined,$(origin 1)),,$(1))
 _io.curl=${io.curl} ${1}
 io.curl.stat=bash ${dash_x_maybe} -c '${io.curl} -s -o /dev/null $(if $(filter undefined,$(origin 1)),$${1},$(1)) > /dev/null' -- 
@@ -1317,7 +1313,6 @@ io.env/% io.env.filter.prefix/%:
 _io.env=sed 's/,/\n/g' | xargs -I% sh -c "env | ${stream.grep.safe} | grep \"^%.*=\" || true" 
 io.env=bash -c 'echo $${1\#/} | ${_io.env}' -- 
 io.env.filter.prefix=${io.env}
-
 io.env.log: io.env.log/${IO_ENV_LOG}
 	@# Filters environment variables starting with DOCKER, MAKE, MK, etc.
 	@# Human-readable output sent to stderr.  Also available as a macro
@@ -1333,9 +1328,8 @@ endef
 
 io.env.json/%:
 	@# Like `io.env/<prefix>` but returns JSON data.
-	${make} io.env/${*} | awk -F= 'BEGIN {print "{"} {if (NR>1) print ","; printf "  \"%s\": \"%s\"", $$1, $$2} END {print "\n}"}'
-
-#env="`${make} io.env/${*} | ${stream.nl.to.space}`" #&& ${jb} $${env}
+	env="`${make} io.env/${*} | ${stream.nl.to.space}`" \
+	&& ${jb} $${env}
 
 io.envp=CMK_INTERNAL=1 ${make} io.envp
 io.envp io.env.pretty: flux.pipeline/io.env,stream.ini.pygmentize
@@ -1442,6 +1436,7 @@ define io.draw.banner
 		*) (${io.print.banner});; \
 	esac
 endef
+
 
 io.gum.div=label=${@} ${make} io.gum.div
 io.gum.div:; label=$${label:-${io.timestamp}} ${io.draw.banner}
@@ -3038,28 +3033,6 @@ flux.loop.watch/%:
 	@# Loops the given target forever, using `watch` instead of the while-loop default.
 	@# This requires `watch` is actually available.
 	watch --interval $${interval:-2} --color ${make} ${*}
-
-io.find=tee >(wc -l >&2) | cat
-# io.map.dir/%:; target=$(call mk.unpack.arg,2) \
-# 	&& dir=$(call mk.unpack.arg,1) \
-# 	&& filter=$(call mk.unpack.arg,3) \
-# 	${make} flux.map.dir/$${target},$${dir},$${filter}
-# flux.map.dir/%:
-# 	@# Example Usage:
-# 	@#   make flux.map.dir/flux.echo,src,.py
-# 	target=$(call mk.unpack.arg,1) \
-# 	&& dir=$(call mk.unpack.arg,2) \
-# 	&& filter=$(call mk.unpack.arg,3) \
-# 	&& $(call log.target.part1, checking for $${dir}) \
-# 	&& ls $${dir} >/dev/null 2>/dev/null \
-# 	&& $(call log.target.part2, ok) \
-# 	&& case "$${filter}" in \
-# 		"") find_args="";; \
-# 		*) find_args="-name "*$${filter}"";; \
-# 	esac \
-# 	&& $(call log.target,mapping target=${dim_cyan}$${target} ${sep} dir=$${dim_ital_cyan}$${dir} ${no_ansi_dim} find_args=$${find_args}) \
-# 	&& find $${dir} $${find_args} \
-# 	| ${stream.peek} | ${make} flux.each/$${target}
 
 # like stream.peek, but prefaced with a line-count
 stream.peek.summary=tee >($(call log.target, $${msg:-streaming} ${sep} ${yellow}`${stream.stdin}|wc -l` lines)) 
@@ -5300,7 +5273,7 @@ ${compose_file_stem}.build $(target_namespace).build:
 	@# compose handles run-ordering for defined services, but not build-ordering.
 	@#
 	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}all services) \
-	&& $(trace_maybe) \
+	&&  $(trace_maybe) \
 	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build $${_docker_quiet_flag}
 
 ${compose_file_stem}.build.quiet $(target_namespace).build.quiet:
