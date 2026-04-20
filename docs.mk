@@ -10,22 +10,17 @@ docs.root=$${DOCS_ROOT:-docs}
 # BEGIN: CSS Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
+
 define Dockerfile.css.min
 FROM node:18-alpine
 RUN npm install -g clean-css-cli
 WORKDIR /workspace
 ENTRYPOINT ["cleancss"]
 endef
-css.min/%: Dockerfile.build/css.min
-	@# CSS Minify
-	${trace_maybe} \
-	&& if [ -d "${*}" ]; then ( \
-		$(call log.target,input is directory) \
-		&& find ${*} -name *.css \
-		| ${stream.peek} | ${flux.each}/css.min \
-	); else ( \
-		img=css.min cmd="--output ${*} ${*}" ${make} mk.docker \
-	); fi
+css.minifier/%:
+	@# CSS minifier
+	quiet=1 img=css.min cmd="--output ${*} ${*}" ${make} mk.docker
+$(call io.factory.file_handler, ns=css.min handler=css.minifier prereqs='Dockerfile.build/css.min' root=$${docs.root} name='*.css')
 
 define Dockerfile.css.pretty
 FROM node:18-alpine
@@ -33,9 +28,11 @@ RUN npm install -g prettier
 WORKDIR /workspace
 ENTRYPOINT ["prettier", "--write"]
 endef
-css.pretty/%: Dockerfile.build/css.pretty
+css.prettify/%:
 	@# CSS Pretty / Un-minify
-	img=css.pretty cmd="--write ${*}" ${make} mk.docker
+	quiet=1 img=css.pretty cmd="--write ${*}" ${make} mk.docker
+$(call io.factory.file_handler, ns=css.pretty handler=css.prettify prereqs='Dockerfile.build/css.pretty' root=$${docs.root} name='*.css')
+
 
 # BEGIN: drawio Diagramming Support
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░

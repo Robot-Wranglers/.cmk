@@ -199,7 +199,7 @@ log.fmt=( ${log} && (printf "${2}" | fmt -w 55 | ${stream.indent} | ${stream.ind
 log.json=$(call log, ${dim}${bold_green}${@} ${no_ansi_dim} ${cyan_flow_right}); ${jb.docker} ${1} | ${jq.run} . | ${stream.as.log}
 log.json.trace=( [ "${TRACE}" == "0" ] && true || $(call log.json, ${1}) )
 log.json.min=$(call log, ${dim}${bold_green}${@} ${no_ansi_dim} ${cyan_flow_right}); ${jb.docker} ${1} | ${jq.run} -c . | ${stream.as.log}
-log.target=$(call log.io, ${dim_green}$(strip $(shell printf "${@}" | cut -d/ -f1)) ${sep}${dim_ital} $(strip $(or $(1),$(shell printf "${@}" | cut -d/ -f2-))))
+log.target=$(call log.io, ${dim_green}$(strip $(shell printf "${@}" | cut -d/ -f1)) ${sep}${dim_ital} $(strip $(or $(strip $(if $(filter undefined,$(origin 1)),,$(1))),$(shell printf "${@}" | cut -d/ -f2-))))
 log.target.pad_top=printf '\n' >> /dev/stderr; ${log.target}
 log.target.pad_bottom=${log.target}; printf '\n'>>/dev/stderr
 log.target.pad=printf '\n' >> /dev/stderr; ${log.target}; printf '\n'>>/dev/stderr
@@ -962,14 +962,12 @@ docker.from.url:
 	@#
 	$(call log.target.part1, ${dim_ital_cyan}$${tag})
 	${docker.images} | grep -w "$${tag}" ${stream.obliviate} \
-	&& ($(call log.target.part2, ${dim_green}already cached);  exit 0 )\
+	&& ( $(call log.target.part2, already cached) &&  exit 0 )\
 	|| ( $(call log.target.part2, ${yellow}not cached) \
 		&& $(call log.target.part1, building) \
 		&& $(call log.target.part2,\n${cyan_flow_right} ${dim_ital}$${url}) \
-		&& quiet=$${quiet:-1} \
-		&& quiet=`[ -z "$${quiet:-}" ] && true || echo "-q"` \
 		&& ${trace_maybe} \
-		&& docker build $${quiet} -t compose.mk:$${tag} $${url})
+		&& docker build ${_docker_quiet_flag} -t compose.mk:$${tag} $${url})
 
 docker.help: mk.namespace.filter/docker.
 	@# Lists only the targets available under the 'docker' namespace.
@@ -1210,6 +1208,10 @@ io.mktemp=export tmpf=$$(TMPDIR=`pwd` mktemp ./.tmp.XXXXXXXXX$${suffix:-}) && tr
 # Similar to io.mktemp, but returns a directory.
 io.mktempd=export tmpd=$$(TMPDIR=`pwd` mktemp -d ./.tmp.XXXXXXXXX$${suffix:-}) && trap "rm -r $${tmpd}" EXIT
 endif
+define _io.mktemp
+$(call mk.unpack.kwargs, $(strip $(if $(filter undefined,$(origin 1)),,$(1))), var, tmpf) 
+${io.mktemp} && ${kwargs_var}=$${tmpf}
+endef
 
 # Helpers for asserting environment variables are present and non-empty 
 mk.assert.env_var=[[ -z "$${$(strip ${1})}" ]] && { $(call log.io, ${red}Error:${no_ansi_dim} required variable ${no_ansi}${underline}$(strip ${1})${no_ansi_dim} is unset or empty!); exit 39; } || true
@@ -1323,7 +1325,7 @@ io.env.log/%:; $(call io.env.log,${*})
 	@# Multiple inputs should be comma-separated.  Also available as a macro
 define io.env.log
 	$(call log.target, prefixes ${sep} ${1}); 
-	echo '${1}' | ${stream.comma.to.space} | ${stream.space.to.nl} | ${flux.each}/io.env.json | ${jq.slurp.nonempty} | ${stream.as.log}
+	echo '${1}' | ${stream.comma.to.space} | ${stream.space.to.nl} | ${flux.each}/io.env | ${stream.as.log}
 endef
 
 io.env.json/%:
@@ -1372,6 +1374,32 @@ io.force/%:; force=1 ${make} ${*}
 io.get.url=$(call io.mktemp) && curl -sL $${url} > $${tmpf}
 
 io.gum.docker=${trace_maybe} && docker run $$(if [ -t 0 ]; then echo "-it"; else echo "-i"; fi) -e TERM=$${TERM:-xterm} --entrypoint /usr/local/bin/gum --rm `docker build -q - <<< $$(printf "FROM alpine:${ALPINE_VERSION}\nCOPY --from=charmcli/gum:${IMG_GUM} /usr/local/bin/gum /usr/local/bin/gum\nRUN apk add --update --no-cache bash\n")`
+
+# USAGE: see docs.mk :// css.min 
+#   $(call io.factory.file_handler, ns=css.pretty handler=css.prettify prereqs='Dockerfile.build/css.pretty' root=$${docs.root} name='*.css')
+io.factory.file_handler=$(eval $(call io.factory.file_handler.src, ${1}))
+define io.factory.file_handler.src
+$(call mk.unpack.kwargs, ${1}, ns)
+$(call mk.unpack.kwargs, ${1}, handler, $${kwargs_ns}.handler)
+$(call mk.unpack.kwargs, ${1}, root, .)
+$(call mk.unpack.kwargs, ${1}, prereqs,${space})
+$(call mk.unpack.kwargs, ${1}, name, default)
+${kwargs_ns}/%:
+	@# Generic handler for dirs or files
+	$${trace_maybe} \
+	&& if [ -d "$${*}" ]; then ( \
+		$$(call log.target, dispatching ${dim_cyan}${kwargs_handler} ${sep} path=${dim_ital}$${*}) \
+		&& find $${*} -name $${kwargs_name} \
+		| $${stream.peek} | $${flux.each}/${kwargs_handler} \
+	); else ( \
+		$$(call log.target,$${*}) && ${make} ${kwargs_handler}/$${*} \
+	); fi
+${kwargs_ns}: ${kwargs_prereqs}
+	@# Runs on given root or working directory
+	$$(call log.target, handler=${bold_green}${kwargs_handler} ${sep} name=${dim_cyan}${kwargs_name}  ${sep} root=${dim_cyan}${kwargs_root})
+	$${trace_maybe} && ${make} ${kwargs_ns}/${kwargs_root}
+endef
+
 
 ifeq ($(shell which gum >/dev/null 2> /dev/null && echo 1 || echo 0),1) 
 io.gum.run:=`which gum`
