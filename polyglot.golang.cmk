@@ -1,0 +1,125 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# polyglot.golang.cmk: 
+#   cross-build inline Go (block-refs) in the dockerized toolchain, 
+#   cache it per host, exec it.  Cross-compiles for the host: GOOS/GOARCH are 
+#   auto-detected, env-overridable); cached at ${CMK_XDG_CACHE}/<hash>/<name>, 
+#   keyed by a src+mod hash (edit -> rebuild).  `_`-prefixed = private.
+#
+# This is a library, hence no __main__.  Shebang compiles it as a parse check.
+#
+# USAGE: ( if installed to CMK_PLUGINS_DIR )
+#     $(call include.plugins, polyglot.golang.cmk)
+#     $(call declare.polyglot.golang, namespace=golang <see kwargs below>)
+#     __main__: golang golang/arg1
+#
+# PUBLIC:
+#     * polyglot.golang.lambda(src= mod= [name=] [base=] [args=]) :: build-if-needed exec
+#     * declare.polyglot.golang(namespace=<those kwargs>) :: targets for <ns>, <ns>/% and <ns>.gofmt
+#     * polyglot.golang.ensure(<src>,<mod>,<name>,<base>) :: ...
+#     * polyglot.golang.gofmt :: stdin->gofmt stream filter via the toolchain container
+#     * polyglot.golang.base :: toolchain image (overridable)
+#
+# NB: there is NO official `golang:*-bookworm-slim` tag.  `-alpine` is the small one (~300MB vs ~800MB for
+# bookworm) -- safe here because we cross-build STATIC binaries (CGO_ENABLED=0), so musl never matters.
+polyglot.golang.base?=golang:1.24-alpine
+
+# polyglot.golang.gofmt: format Go read on STDIN through the toolchain container's `gofmt` -- no local
+# Go install needed, the SAME image the builder uses.  An idiomatic stream filter over the module's
+# code-generation: pipe any inline Go (e.g. a materialized `define` block-ref) through it to format or
+# syntax-check it.  Usable as a target (pipe stdin to it) or as the macro on a recipe line.
+#   USAGE:  cat foo.go | ${make} polyglot.golang.gofmt
+#           ${mk.def.read}/<src-blockref> | ${polyglot.golang.gofmt}
+#           # or, per-namespace, the generated `<ns>.gofmt` target (see declare.polyglot.golang)
+polyglot.golang.gofmt=img=${polyglot.golang.base} entrypoint=gofmt quiet=1 ${make} docker.run.sh
+polyglot.golang.gofmt:; ${polyglot.golang.gofmt}
+
+# ── cache management ───────────────────────────────────────────────────────────────────────────────
+# The build cache is `${CMK_XDG_CACHE}/<cksum>/` -- ONE dir per (src+mod) content, so EDITING a source makes
+# a NEW dir and old ones accumulate.  Strategy: keep only the newest CMK_POLYGLOT_KEEP (default 10) cksum
+# dirs; GC runs automatically after each cache-MISS build (set CMK_POLYGLOT_KEEP=0 to disable auto-GC).  GC
+# matches ALL-NUMERIC dir names only, so NON-cksum entries (e.g. the json.bash `bin/`) are never touched.
+# Portable POSIX sh (`ls -dt`) -- this runs on the HOST, which may be Linux/OSX/busybox.
+CMK_POLYGLOT_KEEP?=10
+# _polyglot.golang.gc: prune all but the newest $keep cksum dirs (a subshell -> never changes the caller's cwd).
+define _polyglot.golang.gc
+( keep=$${CMK_POLYGLOT_KEEP:-10} ; case "$$keep" in ''|*[!0-9]*) keep=10 ;; esac ; \
+  cd "${CMK_XDG_CACHE}" 2>/dev/null || exit 0 ; \
+  old=$$(ls -1dt */ 2>/dev/null | sed 's:/$$::' | while IFS= read -r d; do case "$$d" in ''|*[!0-9]*) continue ;; *) echo "$$d" ;; esac ; done | awk -v k="$$keep" 'NR>k') ; \
+  [ -n "$$old" ] || exit 0 ; \
+  printf '%s\n' "$$old" | while IFS= read -r d; do [ -n "$$d" ] && rm -rf "./$$d" ; done ; \
+  $(call log.io, ${dim}polyglot.golang ${sep} cache gc ${sep} pruned ${no_ansi}$$(printf '%s\n' "$$old" | grep -c .)${dim} old ${sep} kept newest ${no_ansi}$$keep${no_ansi}) )
+endef
+# polyglot.golang.cache.gc   : manually prune to the newest CMK_POLYGLOT_KEEP entries
+# polyglot.golang.cache.list : show cache entries (newest first) with size + the built binary
+# polyglot.golang.cache.clean: remove ALL cksum dirs (a full reset; leaves bin/ + non-cksum dirs)
+polyglot.golang.cache.gc:; @$(call _polyglot.golang.gc)
+polyglot.golang.cache.list:; @cd "${CMK_XDG_CACHE}" 2>/dev/null && { tot=0 ; for d in $$(ls -1dt */ 2>/dev/null | sed 's:/$$::'); do case "$$d" in ''|*[!0-9]*) continue ;; esac ; sz=$$(du -sh "$$d" 2>/dev/null | cut -f1) ; b=$$(ls -1 "$$d" 2>/dev/null | grep -v '[.]' | head -1) ; printf '  %-12s %7s  %s\n' "$$d" "$$sz" "$$b" ; tot=$$((tot+1)) ; done ; printf '  (%s cksum entries in %s)\n' "$$tot" "${CMK_XDG_CACHE}" ; } || $(call log.io, no cache at ${CMK_XDG_CACHE})
+polyglot.golang.cache.clean:; @cd "${CMK_XDG_CACHE}" 2>/dev/null && { for d in $$(ls -1d */ 2>/dev/null | sed 's:/$$::'); do case "$$d" in ''|*[!0-9]*) continue ;; *) rm -rf "./$$d" ;; esac ; done ; $(call log.io, ${green}polyglot.golang cache cleared${no_ansi} ${sep} kept ${dim}bin/ + non-cksum dirs${no_ansi}) ; } || true
+
+# _bin(src,mod,name): the cache path, keyed by a cksum of src+mod content (a plain `=` -> stages clean).
+_polyglot.golang.bin=${CMK_XDG_CACHE}/$(firstword $(shell printf '%s' '$(subst ','\'',$(value $(strip ${1}))$(value $(strip ${2})))' | cksum))/$(strip ${3})
+
+# _build(src,mod,name,base): cross-build into the cache.  POSITIONAL args (not kwargs) so a caller's
+# kwargs_* survive mid-expand.  build.sh is materialized VERBATIM (single $ stays $) and chowns the
+# outputs back to the host UID (the container runs as root).
+define _polyglot.golang.build
+bin="$(call _polyglot.golang.bin,${1},${2},${3})" ; dir=`dirname "$$bin"` ; _t0=`date +%s 2>/dev/null || echo 0` \
+  && $(call log.io, ${yellow}polyglot.golang ${sep} cache ${red}${bold}MISS${no_ansi} ${sep} ${bold}building $(strip ${3})${no_ansi_dim} (source changed) ${sep} ${yellow}this is NOT a hang${no_ansi_dim} -- a dockerized cross-build follows; progress is logged below${no_ansi}) \
+  && $(call log.io, ${dim}polyglot.golang ${sep} image ${no_ansi}$(strip ${4})${dim} ${sep} out ${no_ansi}$$bin${no_ansi}) \
+  && mkdir -p "$$dir" \
+  && ${mk.def.to.file}/$(strip ${1}),$$dir/main.go \
+  && ${mk.def.to.file}/$(strip ${2}),$$dir/go.mod \
+  && ${mk.def.to.file}/_polyglot.golang.build.sh,$$dir/build.sh \
+  && goos="$${GOOS:-`uname -s | tr A-Z a-z`}" \
+  && goarch="$${GOARCH:-`uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/`}" \
+  && { docker image inspect $(strip ${4}) >/dev/null 2>&1 \
+       || { $(call log.io, ${yellow}polyglot.golang ${sep} ${bold}pulling toolchain image${no_ansi_dim} $(strip ${4}) ${sep} one-time, hundreds of MB ${sep} ${dim}plain docker pull progress follows (THIS is the slow first-run step)${no_ansi}) ; docker pull $(strip ${4}) 2>&1 | cat ; } } \
+  && $(call log.io, ${dim}polyglot.golang ${sep} ${no_ansi}cross-building in container${dim} now ${sep} watch for ${no_ansi}go mod tidy${dim} then ${no_ansi}go build -v${dim} below${no_ansi}) \
+  && img=$(strip ${4}) entrypoint=sh cmd=/build/build.sh docker_args="-w /build -e GOOS=$$goos -e GOARCH=$$goarch -e HOST_UID=`id -u` -e HOST_GID=`id -g` -e OUT=$(strip ${3}) -v $$dir:/build -v $$HOME/go/pkg/mod:/go/pkg/mod -v $$HOME/.cache/go-build:/root/.cache/go-build" ${make} docker.run.sh \
+  && $(call log.io, ${dim}polyglot.golang ${sep} ${green}${bold}built${no_ansi_dim} $$bin for $$goos/$$goarch ${sep} ${dim}in $$(( `date +%s 2>/dev/null || echo 0` - $${_t0:-0} ))s${no_ansi})
+endef
+define _polyglot.golang.build.sh
+set -e
+echo "polyglot.golang [1/3]: container started; resolving modules (go mod tidy -- downloads deps on first run, can be slow + quiet)..." >&2
+go mod tidy
+echo "polyglot.golang [2/3]: compiling (go build -v -> $OUT); per-package progress follows..." >&2
+CGO_ENABLED=0 go build -v -trimpath -buildvcs=false -o "$OUT" .
+echo "polyglot.golang [3/3]: built $OUT; fixing ownership..." >&2
+[ -n "$HOST_UID" ] && chown -R "$HOST_UID:$HOST_GID" . || true
+endef
+
+# ensure(src,mod,name,base): set `bin`, build-if-absent (HIT just logs).  A `\`-continued fragment.
+define polyglot.golang.ensure
+bin="$(call _polyglot.golang.bin,${1},${2},${3})" ; \
+if [ -x "$${bin}" ]; then $(call log.io, ${dim}polyglot.golang ${sep} cache ${green}HIT${no_ansi_dim} ${sep} ${dim}$$bin${no_ansi}) ; \
+else $(call _polyglot.golang.build, ${1}, ${2}, ${3}, ${4}) && $(call _polyglot.golang.gc) ; fi
+endef
+
+# lambda(kwargs): build-if-needed, then exec.  Ends in `exec` (NO trailing `#` -- that eats the next
+# endef during minified module staging).  ARGS PASS-THROUGH: `args=` is a COMMA-separated argv (commas ->
+# separate arguments), because a kwarg value cannot contain spaces and the `<ns>/%` stem cannot either.
+# So `args=-upper,team` or `<ns>/-count,3,team` reaches the binary as the argv `-upper team` / `-count 3 team`
+# -- which a Go `flag` parser reads as options + positionals.  (Use the `-flag value` form, not `-flag=value`:
+# a goal containing `=` would be misread by make as a command-line variable assignment.)
+define polyglot.golang.lambda
+$(call mk.unpack.kwargs, ${1}, src)
+$(call mk.unpack.kwargs, ${1}, mod)
+$(call mk.unpack.kwargs, ${1}, name, polyglot)
+$(call mk.unpack.kwargs, ${1}, base, ${polyglot.golang.base})
+$(call mk.unpack.kwargs, ${1}, args, ${space})
+$(call polyglot.golang.ensure, ${kwargs_src}, ${kwargs_mod}, ${kwargs_name}, ${kwargs_base}) \
+&& exec "$${bin}" $(subst ${comma},${space},${kwargs_args})
+endef
+
+# declare.polyglot.golang(namespace= <kwargs>): generate a deferred <ns>.lambda var + the <ns> (run)
+# and <ns>/% (run with stem as argv) targets.  ${1} passes through; lambda ignores `namespace`.  The
+# public macro $(eval)s the generator (cf. declare.stack) so the call site stays one line.
+define _declare.polyglot.golang
+$(call mk.unpack.kwargs, ${1}, namespace)
+$(call mk.unpack.kwargs, ${1}, src)
+${kwargs_namespace}.lambda = $$(call polyglot.golang.lambda, ${1})
+${kwargs_namespace}:; $${${kwargs_namespace}.lambda}
+${kwargs_namespace}/%:; $$(call polyglot.golang.lambda, ${1} args=$$*)
+${kwargs_namespace}.gofmt:; $${mk.def.read}/${kwargs_src} | $${polyglot.golang.gofmt}
+endef
+declare.polyglot.golang=$(eval $(call _declare.polyglot.golang,${1}))

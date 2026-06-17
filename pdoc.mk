@@ -5,11 +5,15 @@
 #
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
-pdocs.args=--no-search -d markdown 
+pdocs.args=--no-search -d markdown
 pdocs.theme_dir=docs/theme/pdoc/
 pdocs.output_dir=docs/api
 
-pdoc/%: mk.require.tool/pdoc
+# Local fallback so `pdoc/%` works standalone (docs.mk defines this too; `?=` yields to it
+# when both plugins are loaded, regardless of include order).
+mkdocs.site_name ?= `cat mkdocs.yml | ${yq} -r .site_name`
+
+pdoc/%: assert.tool.required/pdoc
 	@# Runs `pdoc` for the given python module.
 	set -x \
 	&& ls ${pdocs.theme_dir} \

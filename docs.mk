@@ -46,7 +46,6 @@ drawio.args=-f png -t
 docs.drawio.init: Dockerfile.build/drawio
 	@# Builds the container for drawio if necessary
 
-
 docs.drawio:; ${make} docs.drawio/${docs.root}
 	@# Find and render all drawio files under documentation root.
 
@@ -252,7 +251,7 @@ FROM python:3.11-bookworm
 RUN pip3 install --break-system-packages grip==4.6.2
 ENTRYPOINT grip
 endef
-$(call docker.import.def, def=grip namespace=docs._grip)
+$(call docker.import, def=grip namespace=docs._grip)
 
 
 docs.grip.serve/%: docs._grip.build 
@@ -282,7 +281,7 @@ RUN apt-get update && apt-get install -y jq
 RUN wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq &&\
     chmod +x /usr/local/bin/yq
 endef
-$(call docker.import.def, def=pynchon namespace=docs.pynchon)
+$(call docker.import, def=pynchon namespace=docs.pynchon)
 docs.pynchon.render/%:; ${make} docs.pynchon.dispatch/self.docs.jinja/${*}
 	@# Render a single file, fuzzy matching input and automatically determining output
 

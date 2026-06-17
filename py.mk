@@ -15,7 +15,7 @@ pip.install=pip install \
 	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo )
 
 pip.install.build:; $(call log.target, installing build module with pip); pip install build
-pip.install/%: mk.require.tool/pip
+pip.install/%: assert.tool.required/pip
 	@# NB: Pass `verbose=1` to avoid pip --quiet
 	$(call log.target, verbose=$${verbose:-0} ${sep} ${dim}pip_args=$${pip_args:-})
 	$(call log.target.pad_bottom, ${pip.install} ${*} ${sep} ${cyan_flow_right} ) 
@@ -29,7 +29,7 @@ pip.install.many/%:
 py.pkg.extra.install.many/%:
 	@#
 	echo ${*} | ${stream.comma.to.nl} | ${make} flux.each/py.pkg.extra.install
-pip.release pypi.release: mk.require.tool/twine mk.assert/PYPI_USER,PYPI_TOKEN
+pip.release pypi.release: assert.tool.required/twine assert.env/PYPI_USER,PYPI_TOKEN
 	@#
 	PYPI_RELEASE=1 ${make} py.build \
 	&& twine upload \
@@ -63,14 +63,14 @@ py.clean: tox.clean
 	@# Clean working directory
 	$(call log.target.part1, cleaning eggs/build/dist)
 	$(call log.target.part2, ${GLYPH_CHECK})
-	rm -rf tmp.pypi* dist/* build/* 
-	rm -rf src/*.egg-info/
-	rm -rf .ruff_cache
+	rm -rf -- tmp.pypi* dist/* build/*
+	rm -rf -- src/*.egg-info/
+	rm -rf -- .ruff_cache
 	$(call log.target.part1, cleaning pycs/cache)
 	$(call log.target.part2, ${GLYPH_CHECK})
 	find . -name '*.tmp.*' -delete
 	find . -name '*.pyc' -delete
-	rm -rf .mypy_cache
+	rm -rf -- .mypy_cache
 	find . -name  __pycache__ -delete
 	rmdir build 2>/dev/null || true
 	$(call log.target, done cleaning python tmp files)
@@ -78,6 +78,25 @@ py.clean: tox.clean
 py.version py.pkg.version:; python setup.py --version
 	@# Answer version info for the current project.
 	@# Relies on (python setup.py --version)
+
+# Where the python project to release lives (the dir holding pyproject.toml/setup.py).
+# Override from the client project, e.g. `py.release.root := via/pip`.
+py.release.root ?= .
+
+gitops.release.py: assert.env/VERSION
+	@# Release step for the python package: a layout-agnostic, BUILD-ONLY step that defers to
+	@# python conventions (PEP 517 `python -m build`) and respects `VERSION` (the project's
+	@# packaging must read it -- see via/pip).  Auto-discovered + run by `gitops.release` (see
+	@# gitops.cmk).  No upload: publishing to PyPI is intentionally out of scope here; a project
+	@# that wants it can add its own `gitops.release.pip` alias onto `pypi.release`.
+	@#
+	@# Builds `${py.release.root}` (default: the working dir); skips cleanly if no python
+	@# project is found there.  USAGE:  VERSION=<x.y.z> make gitops.release.py
+	root="${py.release.root}" \
+	&& if [ ! -e "$${root}/pyproject.toml" ] && [ ! -e "$${root}/setup.py" ]; then $(call log.target, ${dim}skip ${sep} no python project at ${no_ansi}$${root}); exit 0; fi \
+	&& $(call log.target, ${dim}build ${sep} ${no_ansi}$${root}${dim} @ VERSION=${no_ansi}$${VERSION}) \
+	&& ( cd "$${root}" && export VERSION="$${VERSION}" && pip install -q build && python -m build ) \
+	&& $(call log.target, ${green}built ${sep} ${no_ansi}`ls -1 $${root}/dist/*$${VERSION}* 2>/dev/null | ${stream.nl.to.comma} || echo "$${root}/dist"`)
 
 ## Linters, formatters, checkers. (Typically combined with tox)
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -129,10 +148,10 @@ _tox.force=case $${force:-0} in \
 tox.clean:
 	@# Clean working directory
 	$(call log.target.part1,cleaning)
-	rm -rf .tox
+	rm -rf -- .tox
 	# find . -type d -name .tox | xargs -I% bash -x -c "rm -rf %"
 	$(call log.target.part2,${GLYPH_CHECK})
-tox/%: mk.require.tool/tox 
+tox/%: assert.tool.required/tox 
 	@# Runs the named tox environment.
 	@#
 	@# USAGE: tox/<tox_env_name>

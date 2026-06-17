@@ -1,0 +1,116 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# gitops.cmk: git-flavored project automation (a pure-CMK plugin / module).
+#
+#   Provides `gitops.release`, a generic, project-agnostic release ORCHESTRATOR.  It runs a
+#   preflight, then every `gitops.release.*` HELPER (defined here or in any other included
+#   file/plugin) in lexical order, then creates + pushes the release tag, then watches any
+#   configured GitHub-Actions workflows to completion.  There is no registry to maintain: the
+#   live make target-table IS the registry, so adding a release step from anywhere is just
+#   defining a `gitops.release.<name>:` target (see `.cmk/py.mk`'s `gitops.release.py`).
+#
+#   Discovery/sort/run of the helpers is delegated to the stdlib's `flux.star`, which already
+#   enumerates matching targets (across includes), emits them lexically sorted, and runs each.
+#   The orchestrator's own phases are PRIVATE (`_gitops.release.*`) so they are NOT discovered
+#   as helpers.
+#
+#   FULLY LIVE: `gitops.release` creates and PUSHES a real annotated tag and triggers CI.
+#   `gitops.rerelease` OVERWRITES an existing tag (force) -- intentionally a separate, explicit
+#   verb because tags should be immutable; reach for it only to recover a botched release.
+#
+#   A LIBRARY (no __main__): the shebang COMPILES it as a parse check; import it to use it:
+#       $(call include.plugins, gitops.cmk)
+#
+# CONFIG (override from the client project):
+#   gitops.remote          remote to push to                            (default: origin)
+#   gitops.tag_prefix      tag = <prefix><VERSION>                      (default: v)
+#   gitops.watch           space-separated CI workflow files to poll    (default: none)
+#   gitops.watch.attempts  poll attempts for a run to register          (default: 12)
+#   gitops.version_check   0 disables the semver sanity check           (default: 1)
+#   gitops.force           1 overwrites an existing tag (set by rerelease)
+#
+# USAGE (VERSION= and version= are both accepted):
+#   version=1.2.3 make gitops.release                  # cut a release (LIVE: tags + pushes)
+#   version=1.2.3 make gitops.rerelease                # re-tag + force-push an existing version
+#   make mk.namespace.filter/gitops.release.           # list the discovered helper steps
+#   version=1.2.3 make _gitops.release.preflight       # just the checks (non-destructive)
+
+# Accept either `VERSION=` or `version=`; export so the prereq assertion, the recipe shells,
+# and the dispatched `gitops.release.*` helpers all see one normalized value.
+version ?=
+export VERSION ?= ${version}
+
+gitops.remote ?= origin
+gitops.tag_prefix ?= v
+gitops.tag = ${gitops.tag_prefix}${VERSION}
+gitops.watch ?=
+gitops.watch.attempts ?= 12
+gitops.version_check ?= 1
+gitops.force ?= 0
+
+gitops.release: assert.env/VERSION
+	@# Cut a release: preflight, run every `gitops.release.*` helper (lexical order), tag +
+	@# push, then watch the configured CI.  FULLY LIVE -- pushes `${gitops.tag}`.
+	@#
+	@# USAGE: version=<x.y.z> make gitops.release
+	$(call log.target, ${dim}release ${sep} ${no_ansi}${gitops.tag})
+	${make} \
+		_gitops.release.preflight \
+			flux.star/gitops.release. \
+		_gitops.release.tag _gitops.release.watch
+
+gitops.rerelease: assert.env/VERSION
+	@# RE-RELEASE (discouraged): re-tag + force-push an EXISTING version, then re-run CI.
+	@# Tags should be immutable -- use this only to recover a botched release.
+	@#
+	@# USAGE: version=<x.y.z> make gitops.rerelease
+	$(call log.target, ${red}RE-RELEASE (forced)${no_ansi} ${sep} ${no_ansi}${gitops.tag})
+	${make} gitops.release gitops.force=1
+
+_gitops.release.preflight: assert.tool.required/git assert.env/VERSION
+	@# Release preflight (clean-tree policy, no branch pin): VERSION sanity, clean working tree,
+	@# not diverged from the current branch's remote, and -- unless re-releasing (gitops.force=1)
+	@# -- the tag is not already taken.
+	if [ "${gitops.version_check}" != 0 ] && ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+([.-].+)?$$'; then $(call log.io, ${red}Error:${no_ansi_dim} VERSION should look like X.Y.Z (got ${no_ansi}${VERSION}${no_ansi_dim})); exit 1; fi \
+	&& if [ -n "`git status --porcelain`" ]; then $(call log.io, ${red}Error:${no_ansi_dim} working tree is not clean); exit 1; fi \
+	&& b ⇐ git branch --show-current \
+	&& if git rev-parse --abbrev-ref "$${b}@{upstream}" >/dev/null 2>&1; then git fetch -q ${gitops.remote} "$${b}" && { git merge-base --is-ancestor ${gitops.remote}/"$${b}" HEAD || { $(call log.io, ${red}Error:${no_ansi_dim} local ${no_ansi}$${b}${no_ansi_dim} has diverged from ${gitops.remote} (pull/rebase first)); exit 1; }; }; else $(call log.io, ${yellow}note:${no_ansi_dim} no upstream for ${no_ansi}$${b}${no_ansi_dim}, skipping divergence check); fi \
+	&& if [ "${gitops.force}" != 1 ]; then \
+		if git rev-parse "${gitops.tag}" >/dev/null 2>&1; then $(call log.io, ${red}Error:${no_ansi_dim} tag ${no_ansi}${gitops.tag}${no_ansi_dim} already exists locally (use ${no_ansi}gitops.rerelease${no_ansi_dim} to overwrite)); exit 1; fi; \
+		if git ls-remote --exit-code --tags ${gitops.remote} "${gitops.tag}" >/dev/null 2>&1; then $(call log.io, ${red}Error:${no_ansi_dim} tag ${no_ansi}${gitops.tag}${no_ansi_dim} already exists on ${gitops.remote} (use ${no_ansi}gitops.rerelease${no_ansi_dim} to overwrite)); exit 1; fi; \
+	fi \
+	&& $(call log.target, ${green}preflight ok ${sep} ${no_ansi}${gitops.tag})
+
+_gitops.release.tag:
+	@# Create the annotated release tag and push the current branch + tag.  DESTRUCTIVE.
+	@# With gitops.force=1 (gitops.rerelease) the tag is MOVED (`-f`) and force-pushed.
+	b ⇐ git branch --show-current \
+	&& $(call log.target, ${dim}tagging ${sep} ${no_ansi}${gitops.tag} ${dim}on ${no_ansi}$${b}) \
+	&& git tag $(if $(filter 1,${gitops.force}),-f) -a "${gitops.tag}" -m "Release ${gitops.tag}" \
+	&& git push ${gitops.remote} "$${b}" \
+	&& git push $(if $(filter 1,${gitops.force}),--force) ${gitops.remote} "${gitops.tag}" \
+	&& $(call log.target, ${green}pushed ${sep} ${no_ansi}${gitops.tag})
+
+_gitops.release.watch:
+	@# Watch every CI workflow named in `gitops.watch` until it completes.  No-op when unset.
+	@# Re-attachable: version=<x> gitops.watch=<file.yml> make _gitops.release.watch
+	case "$(strip ${gitops.watch})" in \
+		"") $(call log.target, ${dim}no gitops.watch workflows configured ${sep} skipping CI watch);; \
+		*) printf '%s\n' $(gitops.watch) | ${make} flux.each/_gitops.release.watch;; \
+	esac
+
+_gitops.release.watch/%: assert.tool.required/gh
+	@# Poll for the CI run of workflow `${*}` on tag `${gitops.tag}`, then stream it to
+	@# completion (non-zero if the run fails).
+	wf="${*}" \
+	&& $(call log.target, ${dim}watch ${sep} ${no_ansi}$${wf} ${dim}@ ${no_ansi}${gitops.tag}) \
+	&& rid="" && i=0 && n=${gitops.watch.attempts} \
+	&& while [ $${i} -lt $${n} ]; do \
+		rid="`gh run list --workflow=$${wf} --branch=${gitops.tag} --limit=1 --json databaseId -q '.[0].databaseId' 2>/dev/null`"; \
+		[ -n "$${rid}" ] && break; \
+		i=$$((i+1)); \
+		$(call log.io, ${dim}waiting for ${no_ansi}$${wf}${dim} run to register (${no_ansi}$${i}/$${n}${dim}, ${FLUX_POLL_DELTA}s)); \
+		sleep ${FLUX_POLL_DELTA}; \
+	done \
+	&& if [ -z "$${rid}" ]; then $(call log.io, ${red}Error:${no_ansi_dim} no ${no_ansi}$${wf}${no_ansi_dim} run found for ${gitops.tag}); exit 1; fi \
+	&& $(call log.target, ${dim}streaming run ${no_ansi}$${rid}) \
+	&& gh run watch "$${rid}" --exit-status
