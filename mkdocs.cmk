@@ -1,0 +1,33 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# mkdocs.cmk: build/serve/open helpers over the working-dir mkdocs.yml.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+#   Thin wrappers around the host mkdocs CLI: mkdocs (build+serve), mkdocs.build,
+#   mkdocs.serve, mkdocs.open, mkdocs.get/<key> (read mkdocs.yml via yq).  Honors
+#   MKDOCS_LISTEN_HOST / MKDOCS_LISTEN_PORT.  A library (no __main__), loaded via
+#   the root Makefile plugin list.
+
+mkdocs.config=mkdocs.yml
+mkdocs.site_name=`cat mkdocs.yml|${yq} -r .site_name`
+mkdocs: mkdocs.build mkdocs.serve
+
+mkdocs.get/%:
+	@# Gets a single value from a mkdocs.yml file with `yq`
+	cat mkdocs.yml | ${yq} -r .${*}
+
+mkdocs.build:
+	@# Runs mkdocs build
+	$(call log, building..)
+	mkdocs build
+
+mkdocs.open:
+	@# Opens (local) mkdocs webpage in browser.  (Assumes mkdocs.serve)
+	$(call log, opening page in browser)
+	set -x && $${BROWSER:-firefox} http://$${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}
+
+mkdocs.serve:
+	@# Runs `mkdocs serve` in the working directory, 
+	@# respecting MKDOCS_LISTEN_HOST and MKDOCS_LISTEN_PORT
+	$(call log, serving)
+	mkdocs serve --dev-addr $${MKDOCS_LISTEN_HOST:-0.0.0.0}:$${MKDOCS_LISTEN_PORT:-8000}

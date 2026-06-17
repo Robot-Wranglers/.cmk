@@ -1,0 +1,55 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# html.cmk: CSS/HTML tooling, split out of docs.mk.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+#   Containerized node helpers to minify and pretty-print CSS -- each as a
+#   single-file form and a "walk a root, process every *.css" form:
+#     * css.minifier/<file>  -- minify one CSS file in place (clean-css)
+#     * css.min[/<path>]     -- minify <path>, or every *.css under css.root
+#     * css.prettify/<file>  -- pretty-print one CSS file (prettier)
+#     * css.pretty[/<path>]  -- prettify <path>, or every *.css under css.root
+#
+#   Each image is declared with the `container` abstraction: an inline
+#   `define Dockerfile.*` wired to a container instance via `src=`.  That gives
+#   the instance a `.build` target plus `.img`/`.entrypoint` accessors the
+#   recipes reuse -- so the Dockerfile, image tag, and entrypoint all live in
+#   one declaration instead of scattered `mk.docker` kwargs.
+#
+#   A library (no __main__); import it:  cmk.include.plugins(html.cmk)
+
+# `container` (+ its `machine` base) is a `cmk.*` KIND, bound bare by `open cmk`.
+open cmk
+
+# Root walked by the no-arg `css.min`/`css.pretty` targets (honors DOCS_ROOT).
+css.root ?= $(call m5|,DOCS_ROOT,docs)
+
+# ░░ clean-css: minify ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+define Dockerfile.css.min
+FROM node:18-alpine
+RUN npm install -g clean-css-cli
+WORKDIR /workspace
+endef
+container css.cleancss(img=compose.mk:css.min entrypoint=cleancss src=css.min)(| |)
+
+css.minifier/%: css.cleancss.build
+  @# Minify one CSS file, in place (clean-css).
+  cmk.log(${dim}minify ${sep} ${no_ansi}${*})
+  img=${css.cleancss.img} entrypoint=${css.cleancss.entrypoint} cmd="--output ${*} ${*}" quiet=1 this.docker.run.sh
+
+$(call io.factory.file_handler, ns=css.min handler=css.minifier root=$${css.root} name='*.css')
+
+# ░░ prettier: pretty-print ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+define Dockerfile.css.pretty
+FROM node:18-alpine
+RUN npm install -g prettier
+WORKDIR /workspace
+endef
+container css.prettier(img=compose.mk:css.pretty entrypoint=prettier src=css.pretty)(| |)
+
+css.prettify/%: css.prettier.build
+  @# Pretty-print (un-minify) one CSS file, in place (prettier).
+  cmk.log(${dim}prettify ${sep} ${no_ansi}${*})
+  img=${css.prettier.img} entrypoint=${css.prettier.entrypoint} cmd="--write ${*}" quiet=1 this.docker.run.sh
+
+$(call io.factory.file_handler, ns=css.pretty handler=css.prettify root=$${css.root} name='*.css')

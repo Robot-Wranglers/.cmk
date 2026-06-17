@@ -1,0 +1,118 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+GraalVM shared-heap polyglot as cmk kinds.
+graal py / graal js mint language fragments that carry their own language;
+p1 + p2 composes them into one Context so values cross the shared heap.
+'''
+
+from cmk import dsl
+import dsl.python
+
+# graal.group: a ns grouping graal fragments (compose them with +).
+cmk.class graal.group(bases=dsl.cmklang,cmk.namespace)(||)
+
+# graal machine: an embedded compose file backing the graal dsl.
+compose.service graal_polyglot(|
+  entrypoint: graal-polyglot
+  environment:
+    LANG: C.UTF-8
+    LC_ALL: C.UTF-8
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM ${IMG_GRAAL:-maven:3.9-eclipse-temurin-21} AS build
+      WORKDIR /build
+      COPY <<'POM' /build/pom.xml
+      <project xmlns="http://maven.apache.org/POM/4.0.0">
+        <modelVersion>4.0.0</modelVersion>
+        <groupId>mk</groupId><artifactId>graalpoly</artifactId><version>1.0</version>
+        <properties><maven.compiler.release>21</maven.compiler.release></properties>
+        <dependencies>
+          <dependency><groupId>org.graalvm.polyglot</groupId><artifactId>polyglot</artifactId><version>23.1.2</version></dependency>
+          <dependency><groupId>org.graalvm.polyglot</groupId><artifactId>js-community</artifactId><version>23.1.2</version><type>pom</type></dependency>
+          <dependency><groupId>org.graalvm.polyglot</groupId><artifactId>python-community</artifactId><version>23.1.2</version><type>pom</type></dependency>
+          <dependency><groupId>org.graalvm.polyglot</groupId><artifactId>ruby-community</artifactId><version>23.1.2</version><type>pom</type></dependency>
+        </dependencies>
+      </project>
+      POM
+      RUN mvn -q dependency:copy-dependencies -DoutputDirectory=/build/libs
+      COPY <<'JAVA' /build/App.java
+      import org.graalvm.polyglot.*;
+      import java.nio.file.*;
+      import java.util.*;
+      public class App {
+        public static void main(String[] a) throws Exception {
+          byte[] bytes = a.length >= 1 ? Files.readAllBytes(Paths.get(a[0])) : System.in.readAllBytes();
+          try (Context ctx = Context.newBuilder().allowAllAccess(true).build()) {
+            String lang = System.getenv().getOrDefault("GRAAL_HOST_LANG", "python");
+            StringBuilder buf = new StringBuilder();
+            for (String line : new String(bytes).split("\n", -1)) {
+              if (line.trim().startsWith("//! lang=")) { eval(ctx, lang, buf); lang = line.trim().substring(9).trim(); }
+              else { buf.append(line).append("\n"); }
+            }
+            eval(ctx, lang, buf);
+          }
+        }
+        static void eval(Context ctx, String lang, StringBuilder buf) {
+          String src = dedent(buf.toString());
+          buf.setLength(0);
+          if (src.trim().isEmpty()) return;
+          boolean mirror = System.getenv().containsKey("GRAAL_MIRROR");
+          Value g = ctx.getBindings(lang);
+          Set<String> before = null;
+          if (mirror) {
+            Value pb = ctx.getPolyglotBindings();
+            String pre = lang.equals("ruby") ? "$$" : "";
+            for (String k : pb.getMemberKeys()) g.putMember(pre + k, pb.getMember(k));
+            before = new HashSet<>(g.getMemberKeys());
+          }
+          ctx.eval(Source.create(lang, src));
+          if (mirror) {
+            Value pb = ctx.getPolyglotBindings();
+            for (String k : g.getMemberKeys())
+              if (!before.contains(k) && g.getMember(k).canExecute()) pb.putMember(k, g.getMember(k));
+          }
+        }
+        static String dedent(String s) {
+          int min = Integer.MAX_VALUE;
+          for (String ln : s.split("\n", -1)) {
+            if (ln.trim().isEmpty()) continue;
+            int i = 0; while (i < ln.length() && ln.charAt(i) == ' ') i++;
+            min = Math.min(min, i);
+          }
+          if (min == Integer.MAX_VALUE || min == 0) return s;
+          StringBuilder out = new StringBuilder();
+          for (String ln : s.split("\n", -1)) out.append(ln.length() >= min ? ln.substring(min) : ln).append("\n");
+          return out.toString();
+        }
+      }
+      JAVA
+      RUN mkdir -p /build/classes && javac -cp "/build/libs/*" -d /build/classes /build/App.java
+      FROM ghcr.io/graalvm/jdk-community:21
+      COPY --from=build /build/classes /opt/graalpoly/classes
+      COPY --from=build /build/libs /opt/graalpoly/libs
+      RUN printf '#!/bin/sh\nexec java -cp "/opt/graalpoly/classes:/opt/graalpoly/libs/*" App "$$@"\n' > /usr/local/bin/graal-polyglot && chmod +x /usr/local/bin/graal-polyglot
+|)
+
+# graal base dsl; .shape carries a lang marker so + composes sections.
+dsl graal(machine=graal_polyglot classvars='__lang__=')(|
+  self.shape := $(if $(filter //!,$(firstword $(value ${self}))),,$(if self.__lang__,//! lang=$(${self}.__lang__)$(nl)))$(value ${self})
+  self.__add__ = $(call ${self}.__concat__,${__args__})
+  self.mirror = GRAAL_MIRROR=1 env=GRAAL_MIRROR self.__call__
+|)
+
+# language subkinds: language tag + graal machine (a leaf runs alone).
+dsl graal.py(bases=graal classvars='__lang__=python')(|
+  self.__machine__ = graal_polyglot
+|)
+dsl graal.js(bases=graal classvars='__lang__=js')(|
+  self.__machine__ = graal_polyglot
+|)
+dsl graal.rb(bases=graal classvars='__lang__=ruby')(|
+  self.__machine__ = graal_polyglot
+|)
+
+# friendly alias onto the scaffolded service build target.
+graal.build: graal_polyglot.build

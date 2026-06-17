@@ -1,0 +1,26 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# grip.cmk: serve a github-styled render of README.md via grip, in a container.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+#   docs.grip / docs.grip.serve serves README.md (or docs.grip.serve/<file>) on
+#   GRIP_PORT (default 6419).  A library (no __main__), loaded via the root
+#   Makefile plugin list.
+
+# `Dockerfile` is a cmk KIND (inline image + build/dispatch scaffolding).
+from cmk import Dockerfile
+
+export GRIP_PORT?=6419
+Dockerfile grip(|
+  FROM python:3.11-bookworm
+  RUN pip3 install --break-system-packages grip==4.6.2
+  ENTRYPOINT grip
+|)
+
+docs.grip.serve/%: grip.build
+	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" img=${grip.img} ${make} docker.run.sh
+docs.grip docs.grip.serve:
+	@# Serve rendered version of README.md (defaults to port 6419)
+	ls README.md >/dev/null 2>/dev/null \
+	&& ${make} docs.grip.serve/README.md \
+	|| $(call log, ${red}README.md is missing!) 

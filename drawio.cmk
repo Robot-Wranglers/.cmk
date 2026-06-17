@@ -1,0 +1,57 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# drawio.cmk: render draw.io diagrams (*.drawio / *.dio) to PNG.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+#   Wraps rlespinasse/drawio-export (headless drawio-desktop + Xvfb).  The
+#   exporter globs a folder and names output <file>-<page>.png, so a small
+#   render wrapper (isolate one file in a scratch dir, move the single PNG
+#   to the wanted path) is baked into the image -- that keeps the cmk side
+#   to a one-line drawio.exporter(<in> <out> <uid>) call.
+#
+#   Surface:
+#     drawio.render/<file>:
+#       render one diagram to a sibling <name>.png
+#     drawio[/<path>]:
+#       render <path>, or every *.drawio under a root
+#
+#   The image is declared with the container KIND: an inline define
+#   Dockerfile.drawio wired to the instance via src=, which yields a .build
+#   target plus .img / .entrypoint accessors and a callable .__call__.
+#
+#   A library (no __main__); import it:  cmk.include.plugins(drawio.cmk)
+
+# container (+ its machine base) is a cmk.* KIND, bound bare by open cmk.
+open cmk
+
+# Root walked by the no-arg drawio target (honors DOCS_ROOT).
+drawio.root ?= $(call m5|,DOCS_ROOT,docs)
+
+# the drawio-export image: ( with a baked cmk.render wrapper )
+#   cmk.render <in> <out> [uid] isolates one diagram in a scratch dir (the
+#   exporter processes a whole folder), then moves the single PNG to <out>
+#   and hands ownership back to the host uid.  A quoted heredoc keeps $1 /
+#   $(mktemp) literal in the image.
+define Dockerfile.drawio
+FROM rlespinasse/drawio-export
+RUN cat <<'RENDER' > /usr/local/bin/cmk.render && chmod +x /usr/local/bin/cmk.render
+#!/usr/bin/env bash
+set -euo pipefail
+d="$(mktemp -d)"
+/opt/drawio-desktop/entrypoint.sh -f png -t -o "$d" "$1" >/dev/null
+mv "$d"/*.png "$2"
+chown "${3:-1000}" "$2" 2>/dev/null || true
+RENDER
+endef
+container drawio.exporter(img=compose.mk:drawio entrypoint=/usr/local/bin/cmk.render src=drawio)(| |)
+
+drawio.render/%: drawio.exporter.build
+  @# Render one *.drawio / *.dio file to a sibling PNG.
+  outf=$$(echo ${*} | sed -E 's/[.](drawio|dio)$$/.png/') \
+  && cmk.log(${no_ansi_dim}${*} ${cyan_flow_right} ${no_ansi}$${outf}) \
+  && drawio.exporter(${*} $${outf} ${DOCKER_UID}) \
+  && cmk.log(preview ${sep} $${outf}) \
+  && cat $${outf} | ${stream.img}
+
+# drawio[/<path>] -- dispatch one file or walk a whole directory tree.
+$(call io.factory.file_handler, ns=drawio handler=drawio.render root=$${drawio.root} name='*.drawio')

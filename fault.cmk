@@ -1,0 +1,85 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+#
+# fault.cmk: typed faults (typed exceptions) as a reusable module.
+#
+# cmk_pragma ::: { "kind": "module" } :::
+#
+# USAGE:
+#   include compose.mk
+#   cmk.include.plugins(fault.cmk)
+
+'''
+Typed exceptions for compose.mk, promoted from demos/cmk/exceptions.cmk.
+Authored in cmk-lang and JIT-compiled at include-time, so the resulting
+macros and targets are callable from plain Makefiles too.  The plugin owns
+the fault.  vocabulary and the fault/ route verbatim -- a fixed convention,
+not an aliasable namespace.
+
+Surface:
+  fault.throw(<Type>[, k=v meta]):
+    raise a typed fault (emit, then fail)
+  fault.guarded / @fault.guarded:
+    inline catch -> re-throw a SubprocessFault
+  fault/<Type>:
+    register a handler (beats the plugin's fault/%:)
+
+Two changes vs the demo it was promoted from.  First, fault.throw is
+bootstrap-safe: the structured emit (jb runs as a docker coprocess) is
+best-effort, so a missing toolchain never masks the real fault; it still
+logs and exits.  That is what lets the core stdlib adopt the idiom without
+gaining a hard docker / json.bash dependency on its error paths.  Second,
+the exit routes through mk.exit.code, for supervisor exit-code fidelity.
+'''
+
+# Defer dispatch to at-exit: at_exit=dispatch.by_type registers the drain
+# before the auto fault.purge, so the stack is dispatched and routed before
+# it is removed.  (An ordinary channel is synchronous; faults are the
+# deferred-dispatch case.)
+channel fault(at_exit=dispatch.by_type)(| |)
+
+# fault.log: red structured logger (a red replacement-character glyph).
+fault.log=$(call log, ${yellow}${bold}¿${no_ansi}${red} $(1))
+
+# fault.throw(<Type>[, k=v meta]): raise -- emit a typed event (always
+# recording the calling target and source file), then fail.
+# Bootstrap-safe: the emit is wrapped so its own failure can never replace
+# the real fault; we always log and exit.
+fault.throw=$(call fault.log,${bold}$(strip $(1))) \
+	; { $(call fault.emit, type=$(strip $(1)) target=$(@) file=${__file__} $(if $(filter-out undefined,$(origin 2)),$(strip $(2)))) ; } 2>${devnull} || true \
+	; $(call mk.exit.code,1)
+
+# fault.guarded: the inline catch (synchronous, runs at the failure site).
+# Exposed as a plain macro so vanilla Makefiles can append it after a
+# command: risky-cmd || { $(fault.guarded) } ...and usable directly as the
+# @fault.guarded decorator (any macro decorates as-is now). Keep the body a
+# single brace group -- && / || are equal-precedence, else the catch would
+# leak onto the success path.
+fault.guarded={ rc=$$? ; $(call log,${dim}${yellow}caught abnormal exit ${sep} ${dim}code=$${rc} ${sep} ${dim}throw=SubprocessFault) ; $(call fault.throw,SubprocessFault,kind=external code=$${rc}) ; }
+fault.guarded.postfix_mode := ||
+
+# errno -> fault Type: the module half of the join.
+$(call m5.table, fault.type, ENVVAR_UNSET=EnvVarUnset MODULE_MISSING=ModuleNotFound REGISTRY_ASSERT=RegistryFault NOT_IMPLEMENTED=NotImplementedError, SubprocessFault)
+# override mk.die to dispatch a typed fault, keyed on errno.
+mk.die = $(call fault.throw,$(call fault.type.resolve,$(patsubst errno=%,%,$(strip $(m5[2]?)))),$(strip $(m5[3]?) $(m5[4]?) $(m5[5]?)))
+# classify override: map a carried errno symbol to its fault Type.
+fault.type.sed.emit = s/$(strip $(m5[1]))/$(strip $(m5[2]))/;
+fault.type.sed = $(call m5.table/*, fault.type, fault.type.sed.emit)
+lang.runtime.classify_fault = awk "$${_awklang_classify_fault}" | sed '${fault.type.sed}'
+
+# fault.show: per-event presentation shared by every handler (each opens
+# with cmk.fault.show()) -- trace the handler, then the fault header from
+# $CMK_EVENT.
+fault.show=$(call log.trace, ${@}) ; $(call fault.log,Exception ${sep} ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .type`)
+
+# default routes: ( this module owns fault/%; add specific types )
+
+fault/SubprocessFault:
+	cmk.fault.show()
+	cmk.log(${yellow}SubprocessFault ${sep} unexpected tool exit)
+
+fault/%:
+	@# fallback: no handler for this type.  NB: no exit -- a handler running
+	@# at supervisor-exit can't change the process code (the throw already set
+	@# it).
+	cmk.fault.show()
+	cmk.fault.log(${bold}UNHANDLED ${sep} ${*} ${sep} no handler registered)

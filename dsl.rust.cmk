@@ -1,0 +1,43 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+dsl.rust: inline Rust as a first-class dsl -- code.compiled (build/cache/run)
+mixed with the Language protocol (structural reflection).  Sibling of dsl.golang.
+'''
+
+from cmk import dsl
+
+# Cargo.toml + build script (block bodies cannot nest in a body).
+dsl.rust.default.cargo(|
+    [package]
+    name = "poly"
+    version = "0.1.0"
+    edition = "2021"
+|)
+_dsl.rust.build.sh(|
+    set -e
+    echo "dsl.rust [1/2]: preparing toolchain + compiling (cargo build --release -> $OUT)..." >&2
+    command -v cc >/dev/null 2>&1 || apk add --no-cache musl-dev gcc >/dev/null 2>&1 || true
+    cargo build --release
+    cp "$(find target/release -maxdepth 1 -type f -perm -0100 | head -1)" "$OUT"
+    echo "dsl.rust [2/2]: built $OUT; fixing ownership..." >&2
+    [ -n "$HOST_UID" ] && chown -R "$HOST_UID:$HOST_GID" . || true
+|)
+
+# scalar spec on the instance; __args__ redirects lookups (lang=self).
+dsl rust(bases=code.compiled ifaces=Language entrypoint=true classvars='__lang__=.rs')[|
+  self.base = rust:1-alpine
+  self.fmtentry = rustfmt
+  self.srcmap = cargo:Cargo.toml src:src/main.rs
+  self.mounts = -v $$HOME/.cargo/registry:/usr/local/cargo/registry
+  self.env =
+  self.buildsh = _dsl.rust.build.sh
+  self.__args__ = src=self lang=self cargo=$(or $(call mk.kwargs.get,${1},cargo),dsl.rust.default.cargo) $(filter-out def=% src=% cargo=% namespace=% bases=%,${1})
+  self.fmt:
+    cat ⬥self \
+      | quiet=1 img=$(self.base) entrypoint=$(self.fmtentry) ${make} docker.run.sh
+|]
+
+# publish the build spec at class level, so a class-qualified lang= reference resolves.
+$(call dsl.export!, dsl.rust, base srcmap buildsh mounts env fmtentry)

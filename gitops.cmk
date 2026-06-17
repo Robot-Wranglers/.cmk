@@ -1,0 +1,515 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+#
+# gitops.cmk: git-flavored project automation (a pure-CMK module).
+#
+# cmk_pragma ::: { "kind": "module", "target_locals": true, "compiler_verbose": 0 } :::
+#
+# USAGE: cmk.include.plugins(gitops.cmk)
+
+'''
+Registry-free tools for git-flavored project automation:
+
+  * gitops.release -- a generic release orchestrator: preflight, run every discovered
+    gitops.release.* helper (lexical order), tag + push, watch CI, then fire a
+    reflection-gated lifecycle hook (gitops.hooks.release/OK on success,
+    gitops.hooks.release/FAIL on failure -- declare to opt in).  gitops.rerelease
+    force-overwrites an existing tag (recovery only).
+  * gitops.hooks.* -- a reflection-based git-hook manager: declaring a target named
+    gitops.hooks.<type>/<name>: (e.g. gitops.hooks.precommit/lint) registers it -- the
+    live target-table is the registry, no files to author.  gitops.hooks.init reflects over
+    those declarations and wires each active git hook to a managed script that runs them
+    (idempotent); gitops.hooks.uninstall / .list honor the same reflection.  A gitops.hooks.src
+    dir of hand-authored io.fs.drop_in parts is installed alongside when present
+    (see ./docs/io.fs.drop_in.md).
+  * flux.gitops.hook/<name> -- run a registered hook by bare name: the first
+    gitops.hooks.<type>/<name> found (precommit preferred), for firing a hook by hand
+    (a flux verb contributed via open flux).
+  * gitops.gitleaks -- a reusable pre-commit body: scan staged changes for secrets via
+    gitleaks-in-docker (delegates to docker.run.sh; requires docker).
+
+It defines a __main__ (the gitops subcommand CLI) that on import is demoted to the gitops
+target, so a bare make gitops opens the menu.  A direct ./gitops.cmk only parse-checks (the
+cmk compile shebang).
+
+Config (override from the client project; see docs/gitops.md for the full table):
+  gitops.remote          remote to push to                            (default: origin)
+  gitops.tag_prefix      tag = <prefix><VERSION>                      (default: v)
+  gitops.watch           space-separated CI workflow files to poll    (default: none)
+  gitops.ci.workflows    workflows to dispatch+watch on the current branch (gitops.ci) (default: none)
+  gitops.watch.attempts  poll attempts for a run to register          (default: 12)
+  gitops.version_check   0 disables the semver sanity check           (default: 1)
+  gitops.clean_check     0 disables the clean-working-tree check       (default: 1)
+  gitops.force           1 overwrites an existing tag (set by rerelease)
+  gitops.hooks.types     hook-namespace:git-hook map reflection scans (default: precommit:pre-commit ..)
+  gitops.hooks.make      make entrypoint the managed git-hook script re-enters      (default: make)
+  gitops.hooks.src       optional dir of hand-authored io.fs.drop_in parts to also install (default: hooks)
+  gitops.hooks.dispatch  run-parts runner for <name>.d/ hooks (alias for io.fs.drop_in.runner) (default: .cmk/drop_in)
+  gitops.gitleaks.image  gitleaks docker image gitops.gitleaks runs   (default: zricethezav/gitleaks:v8.30.1)
+
+Full docs (design notes, dispatcher semantics, config table, usage examples): ./docs/gitops.md
+'''
+
+# The optional file-based hook layer (`${gitops.hooks.src}`) is a thin instantiation of the generic
+# `io.fs.drop_in` (`<prefix>.d`) engine; load it so `io.fs.drop_in.install` / `.uninstall` / `.list` are
+# available to delegate to.  gitops calls them qualified (`${make} io.fs.drop_in.install VAR=val` --
+# recursive make with var overrides), never unqualified, so a namespace directive (`import`/`open`)
+# would only trip the `dead` lint; a plain dependency load is the right tool.  (The module itself
+# `open`s `io.fs` to contribute the members -- that is the open-to-contribute side.)
+cmk.include.plugins(io.fs.drop_in.cmk)
+
+# Release preflight raises typed faults (WorkingTreeDirty, TagExists, ..) rather than logging
+# and calling `exit 1` directly, so a client project can register its own `fault/<Type>:` handler
+# and the failure routes through the shared fault machinery (structured emit, exit-code fidelity).
+# An unconditional include (not `__plugins__.require`) is deliberate: preflight runs in a
+# recursively-dispatched sub-make, and only the exported `__plugins__` list is inherited there,
+# not fault.cmk's macros -- so `require` would see fault.cmk "already loaded" and skip it, leaving
+# `fault.throw` undefined in the child.  include.plugins re-parses it on every module load and is
+# double-load safe (same pattern as the io.fs.drop_in dependency above).
+cmk.include.plugins(fault.cmk)
+
+# Besides its own `gitops.*` members, this module contributes one higher-order verb to the core
+# `flux` control-flow api -- `flux.gitops.hook/<name>`, which runs a registered hook by bare name --
+# so it declares intent to modify that namespace with `open` (contribute), not `import` (use).
+# `flux` lives in core and has no file of its own, so this is a register-only forward-decl.
+open flux
+# the git-status JSON shapes below are `dsl.jqlang` kinds, used qualified; `dsl` itself comes
+# from the `cmk` prelude (it is not an openable module).
+from cmk import dsl
+
+# Accept `VERSION=` or `version=` interchangeably (a case-insensitive alias for the release
+# version), and export the normalized value so the prereq assertion, the recipe shells, and the
+# dispatched `gitops.release.*` helpers all see one value. Prefer a non-empty VERSION, else fall
+# back to version. The `:=` fallback (not `?=`) is deliberate: `?=` is a no-op when a consuming
+# Makefile has already declared `VERSION ?=` (empty), which would silently drop a lowercase
+# `version=`; `:=` re-derives it. A command-line `VERSION=` still wins (command-line origin
+# overrides makefile assignment). Both names are pre-declared so the `$(or ...)` reference stays
+# clean under `--warn-undefined-variables`.
+version ?=
+VERSION ?=
+export VERSION := $(or $(strip ${VERSION}),$(strip ${version}))
+
+gitops.remote ?= origin
+gitops.tag_prefix ?= v
+gitops.tag = ${gitops.tag_prefix}${VERSION}
+gitops.watch ?=
+gitops.ci.workflows ?=
+gitops.watch.attempts ?= 12
+gitops.version_check ?= 1
+gitops.clean_check ?= 1
+gitops.force ?= 0
+
+# The hook-type namespaces reflection scans, each mapped to the real git hook it installs as
+# (`<segment>:<git-hook>`).  Declaring any `gitops.hooks.<segment>/<name>:` target registers a hook.
+# `precommit` leads, so `flux.gitops.hook/<name>` prefers it when resolving a bare name.  Extend or
+# trim from the client project to add/limit hook kinds.
+gitops.hooks.types ?= precommit:pre-commit prepush:pre-push commitmsg:commit-msg postcommit:post-commit postcheckout:post-checkout postmerge:post-merge prerebase:pre-rebase postrewrite:post-rewrite
+# The `make` entrypoint the managed git-hook script re-enters when git fires it.  A compose.mk
+# client's root Makefile is the entrypoint, so plain `make` resolves any target it (or an included
+# plugin) defines; override for a non-standard driver (e.g. `./compose.mk`).
+gitops.hooks.make ?= make
+# The per-type runner the managed git-hook script re-enters (`<runner>/<segment>`).  Held in a var
+# so the on-disk script's literal is assembled at expand time, not lowered as a smart-send at compile.
+gitops.hooks.fire_target = gitops.hooks.fire
+
+# Optional layer: a dir of hand-authored `io.fs.drop_in` hook parts, installed alongside the reflected
+# ones.  `gitops.hooks.dispatch` is the `<name>.d/` run-parts runner (the `drop_in` script) symlinked
+# as `.git/hooks/<name>` -- just an alias onto `io.fs.drop_in.runner`; override either.
+gitops.hooks.src ?= hooks
+gitops.hooks.dispatch ?= ${io.fs.drop_in.runner}
+
+# The gitleaks docker image `gitops.gitleaks` runs (a `GITLEAKS_IMAGE` env var still wins at runtime).
+gitops.gitleaks.image ?= zricethezav/gitleaks:v8.30.1
+
+# Optional dotenv sourced by recipes that shell out to `gh` (whose auth the plugin does not
+# manage). A project pointing at a private repo typically keeps a scoped `GH_TOKEN` in a
+# gitignored .env; without it `gh` falls back to the host keyring account, which may lack repo
+# access and make a live CI run look absent ("no run found"). Unset by default (a `:` no-op);
+# a project opts in with `gitops.env_file := .env`. Sourced inside the recipe shell (`set -a`
+# exports each assignment) so the token never enters make's variable space (no `make -p` leak).
+gitops.env_file ?=
+gitops.load_env = $(if $(strip ${gitops.env_file}),if [ -f ${gitops.env_file} ]; then set -a; . ${gitops.env_file}; set +a; fi;,:;)
+
+# One logger for the whole release chain.  Its steps run as private `_gitops.release.*` sub-makes,
+# so the stock `log` (which reads the current target name) would surface those internal names
+# in the output.  Route every step through one stable public label instead, so a release reads as a
+# single coherent operation.  Format mirrors `log` (a `<label> <sep> <msg>` line).
+gitops.log = $(call log.io, ${dim_green}gitops.release ${sep}${dim_ital} $(1))
+
+gitops.release: assert.env/VERSION
+	@# Cut a release: preflight, run every `gitops.release.*` helper (lexical order), tag +
+	@# push, then watch the configured CI.  Fully live -- pushes `${gitops.tag}`.  Finally fires a
+	@# reflection-gated lifecycle hook: `gitops.hooks.release/OK` on success, `gitops.hooks.release/FAIL`
+	@# on any failure (the original failure code is preserved).  Declare either to opt in.
+	@#
+	@# USAGE: version=<x.y.z> make gitops.release
+	$(call gitops.log, ${dim}starting ${sep} ${no_ansi}${gitops.tag})
+	if ${make} _gitops.release.run; then ${make} gitops.hooks.try/release/OK; else rc=$$?; ${make} gitops.hooks.try/release/FAIL; exit $${rc}; fi
+
+_gitops.release.helpers:
+	@# Discover + run any project-defined `gitops.release.*` helper (optional steps a project adds
+	@# to hook the release chain between preflight and tag -- e.g. `gitops.release.assert.version:`).
+	@# Zero is the common case, so frame the scan as informational ("none defined, here's how to add
+	@# one") rather than leaking flux.star's bare "0 matches" line, which reads like a failure.
+	helpers=`${make} mk.namespace.filter/gitops.release. | ${stream.nl.to.space}` \
+	&& if [ -z "$$(printf '%s' "$${helpers}" | tr -d '[:space:]')" ]; then \
+		$(call gitops.log, ${dim}no optional helpers ${sep} ${dim}declare a ${no_ansi}gitops.release.<name>:${no_ansi_dim} target to hook the release) ; \
+	else \
+		$(call gitops.log, ${dim}running helpers ${sep} ${no_ansi}$${helpers}) \
+		&& printf '%s' "$${helpers}" | ${make} flux.each/flux.apply ; \
+	fi
+
+_gitops.release.run:
+	@# The release chain (preflight -> `gitops.release.*` helpers -> tag -> watch), split out so
+	@# `gitops.release` can wrap it with lifecycle-hook dispatch.  Not called directly.
+	${make} \
+		_gitops.release.preflight \
+			_gitops.release.helpers \
+		_gitops.release.tag _gitops.release.watch
+
+gitops.rerelease: assert.env/VERSION
+	@# Re-release (discouraged): re-tag + force-push an existing version, then re-run CI.
+	@# Tags should be immutable -- use this only to recover a botched release.
+	@#
+	@# USAGE: version=<x.y.z> make gitops.rerelease
+	$(call log, ${red}RE-RELEASE (forced)${no_ansi} ${sep} ${no_ansi}${gitops.tag})
+	${make} gitops.release gitops.force=1
+
+_gitops.release.preflight: assert.tool.required/git assert.env/VERSION
+	@# Release preflight (clean-tree policy, no branch pin): VERSION sanity, clean working tree
+	@# (both individually gate-able via gitops.version_check / gitops.clean_check), not diverged
+	@# from the current branch's remote, and -- unless re-releasing (gitops.force=1) -- the tag
+	@# is not already taken.
+	if [ "${gitops.version_check}" != 0 ] && ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+([.-].+)?$$'; then $(call fault.throw, VersionMalformed, got=$${VERSION}); fi \
+	&& if [ "${gitops.clean_check}" != 0 ]; then if [ -n "`git status --porcelain`" ]; then $(call fault.throw, WorkingTreeDirty); fi; else $(call gitops.log, ${dim}clean-tree check disabled ${no_ansi_dim}(gitops.clean_check=0)); fi \
+	&& b <- git branch --show-current \
+	&& if git rev-parse --abbrev-ref "$${b}@{upstream}" >/dev/null 2>&1; then git fetch -q ${gitops.remote} "$${b}" && { git merge-base --is-ancestor ${gitops.remote}/"$${b}" HEAD || { $(call fault.throw, BranchDiverged, branch=$${b} remote=${gitops.remote}); }; }; else $(call gitops.log, ${dim}no upstream for ${no_ansi}$${b}${no_ansi_dim}${comma} skipping divergence check); fi \
+	&& if [ "${gitops.force}" != 1 ]; then \
+		if git rev-parse "${gitops.tag}" >/dev/null 2>&1; then $(call fault.throw, TagExists, tag=${gitops.tag} where=local); fi; \
+		if git ls-remote --exit-code --tags ${gitops.remote} "${gitops.tag}" >/dev/null 2>&1; then $(call fault.throw, TagExists, tag=${gitops.tag} where=${gitops.remote}); fi; \
+	fi \
+	&& $(call gitops.log, ${green}preflight ok ${sep} ${no_ansi}${gitops.tag})
+
+# ░░ preflight fault handlers: render the actionable guidance for each typed fault the ░░
+# ░░ preflight can raise.  A client project can override any of these by declaring its own ░░
+# ░░ `fault/<Type>:` (a more specific target beats the plugin's).  Each opens with the shared ░░
+# ░░ header (cmk.fault.show), then pulls the salient meta off the structured event to advise. ░░
+fault/VersionMalformed:
+	cmk.fault.show()
+	cmk.fault.log(VERSION should look like ${bold}X.Y.Z${no_ansi}${red} ${sep} got ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .got`)
+
+fault/WorkingTreeDirty:
+	cmk.fault.show()
+	cmk.fault.log(working tree is not clean ${sep} set ${bold}gitops.clean_check=0${no_ansi}${red} to allow)
+
+fault/BranchDiverged:
+	cmk.fault.show()
+	cmk.fault.log(local ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .branch`${no_ansi}${red} has diverged from ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .remote`${no_ansi}${red} ${sep} pull/rebase first)
+
+fault/TagExists:
+	cmk.fault.show()
+	cmk.fault.log(tag ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .tag`${no_ansi}${red} already exists on ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .where`${no_ansi}${red} ${sep} use ${bold}gitops.rerelease${no_ansi}${red} to overwrite)
+
+fault/CIRunNotFound:
+	cmk.fault.show()
+	cmk.fault.log(no CI run found for ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .workflow`${no_ansi}${red} on ${bold}`echo "$${CMK_EVENT}" | ${jq.run} -r .tag`)
+
+_gitops.release.tag:
+	@# Create the annotated release tag and push the current branch + tag.  Destructive.
+	@# With gitops.force=1 (gitops.rerelease) the tag is moved (`-f`) and force-pushed.
+	b <- git branch --show-current \
+	&& $(call gitops.log, ${dim}tagging ${sep} ${no_ansi}${gitops.tag} ${dim}on ${no_ansi}$${b}) \
+	&& git tag $(if $(filter 1,${gitops.force}),-f) -a "${gitops.tag}" -m "Release ${gitops.tag}" \
+	&& git push ${gitops.remote} "$${b}" \
+	&& git push $(if $(filter 1,${gitops.force}),--force) ${gitops.remote} "${gitops.tag}" \
+	&& $(call gitops.log, ${green}pushed ${sep} ${no_ansi}${gitops.tag})
+
+_gitops.release.watch:
+	@# Watch every CI workflow named in `gitops.watch` until it completes.  No-op when unset.
+	@# Re-attachable: version=<x> gitops.watch=<file.yml> make _gitops.release.watch
+	case "$(strip ${gitops.watch})" in \
+		"") $(call gitops.log, ${dim}no gitops.watch workflows configured ${sep} skipping CI watch);; \
+		*) printf '%s\n' $(gitops.watch) | ${make} flux.each/_gitops.release.watch;; \
+	esac
+
+_gitops.release.watch/%: assert.tool.required/gh
+	@# Poll for the CI run of workflow `${*}` on tag `${gitops.tag}`, then stream it to
+	@# completion (non-zero if the run fails).
+	$(gitops.load_env) \
+	wf="${*}" \
+	&& $(call gitops.log, ${dim}watch ${sep} ${no_ansi}$${wf} ${dim}@ ${no_ansi}${gitops.tag}) \
+	&& rid="" && i=0 && n=${gitops.watch.attempts} \
+	&& while [ $${i} -lt $${n} ]; do \
+		rid="`${make} gitops.actions.latest gitops.actions.workflow=$${wf} gitops.actions.branch=${gitops.tag} gitops.actions.limit=1`"; \
+		[ -n "$${rid}" ] && break; \
+		i=$$((i+1)); \
+		$(call gitops.log, ${dim}waiting for ${no_ansi}$${wf}${dim} run to register (${no_ansi}$${i}/$${n}${dim}, ${FLUX_POLL_DELTA}s)); \
+		sleep ${FLUX_POLL_DELTA}; \
+	done \
+	&& if [ -z "$${rid}" ]; then $(call fault.throw, CIRunNotFound, workflow=$${wf} tag=${gitops.tag}); fi \
+	&& $(call gitops.log, ${dim}streaming run ${no_ansi}$${rid}) \
+	&& gh run watch "$${rid}" --exit-status
+
+gitops.ci: assert.tool.required/git
+	@# Opt-in CI on the current branch: dispatch every `gitops.ci.workflows` workflow
+	@# (workflow_dispatch) on the current branch, then watch each to completion.  Unlike
+	@# `gitops.release` this cuts no tag and pushes nothing -- it just triggers + streams the
+	@# tests for the branch you are on (branch pushes don't run them by default).
+	@#
+	@# USAGE: make gitops.ci   (or gitops.ci.workflows=<a.yml b.yml> make gitops.ci)
+	case "$(strip ${gitops.ci.workflows})" in "") cmk.log(${yellow}no gitops.ci.workflows configured ${sep} nothing to run); exit 0;; esac
+	b <- git branch --show-current
+	cmk.log(${dim}ci ${sep} ${no_ansi}$${b} ${dim}-> ${no_ansi}$(gitops.ci.workflows))
+	printf '%s\n' $(gitops.ci.workflows) | this.flux.each/_gitops.ci.run
+
+_gitops.ci.run/%: assert.tool.required/gh assert.tool.required/git
+	@# Dispatch workflow `${*}` on the current branch (workflow_dispatch), wait for the new run
+	@# to register (distinct from any prior run on this branch -- race-safe), then stream it to
+	@# completion (non-zero if it fails).  Re-attachable: gitops.watch.attempts tunes the poll.
+	$(gitops.load_env) wf="${*}"
+	b <- git branch --show-current
+	cmk.log(${dim}dispatch ${sep} ${no_ansi}$${wf} ${dim}@ ${no_ansi}$${b})
+	prev <- ${make} gitops.actions.latest gitops.actions.workflow=$${wf} gitops.actions.branch=$${b} gitops.actions.limit=1
+	gh workflow run "$${wf}" --ref "$${b}"
+	i=0
+	n=${gitops.watch.attempts}
+	rid=""
+	while [ $${i} -lt $${n} ]; do \
+		rid="`${make} gitops.actions.latest gitops.actions.workflow=$${wf} gitops.actions.branch=$${b} gitops.actions.limit=1`"; \
+		[ -n "$${rid}" ] && [ "$${rid}" != "$${prev}" ] && break; \
+		rid=""; i=$$((i+1)); \
+		cmk.log.io(${dim}waiting for new ${no_ansi}$${wf}${dim} run to register (${no_ansi}$${i}/$${n}${dim}, ${FLUX_POLL_DELTA}s)); \
+		sleep ${FLUX_POLL_DELTA}; \
+	done
+	if [ -z "$${rid}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} no new ${no_ansi}$${wf}${no_ansi_dim} run registered on ${no_ansi}$${b}); exit 1; fi
+	cmk.log(${dim}streaming run ${no_ansi}$${rid})
+	gh run watch "$${rid}" --exit-status
+
+# The GitHub Actions run-listing api (`gitops.actions.*`) -- one place owns the `gh run list` json
+# field set and the optional filters the list/latest helpers honor (empty = unfiltered).  Reused by
+# `gitops.actions.watch` and by the CI / release poll loops.
+gitops.actions.json ?= databaseId,status,conclusion,name,workflowName,createdAt
+gitops.actions.status ?=
+gitops.actions.workflow ?=
+gitops.actions.branch ?=
+gitops.actions.limit ?=
+# The `gh run list` flag list assembled from the filters above (expand-time text, no shell vars) --
+# `gitops.actions.list` / `.latest` share it so a caller only sets the `gitops.actions.*` it needs.
+gitops.actions.flags = --json ${gitops.actions.json} $(if $(strip ${gitops.actions.limit}),--limit ${gitops.actions.limit}) $(if $(strip ${gitops.actions.status}),--status ${gitops.actions.status}) $(if $(strip ${gitops.actions.workflow}),--workflow ${gitops.actions.workflow}) $(if $(strip ${gitops.actions.branch}),--branch ${gitops.actions.branch})
+
+gitops.actions.list: assert.tool.required/gh
+	@# GitHub Actions runs as pretty-printed JSON: a filterable wrapper over `gh run list`.  Filter
+	@# via env: gitops.actions.status=<in_progress|queued|failure|success|..>,
+	@# gitops.actions.workflow=<file.yml>, gitops.actions.branch=<b>, gitops.actions.limit=<n>.
+	@# USAGE:  make gitops.actions.list   (or gitops.actions.status=in_progress make gitops.actions.list)
+	$(gitops.load_env) gh run list ${gitops.actions.flags} | ${jq} .
+
+# Phony so a stray file of the same name can't shadow this recipe-less target into a silent no-op
+# (its siblings force execution via an `assert.tool.required/gh` prereq; this poll primitive stays
+# prereq-free to avoid re-probing `gh` on every loop iteration, so it declares phony explicitly).
+.PHONY: gitops.actions.latest
+gitops.actions.latest:
+	@# Print the databaseId of the most recent run matching the current `gitops.actions.*` filters
+	@# (empty when none) -- the poll primitive the watch / CI / release loops build on.  No tool
+	@# assertion (callers assert `gh`); stdout is just the id.  USAGE:
+	@#   gitops.actions.status=in_progress gitops.actions.limit=1 make gitops.actions.latest
+	$(gitops.load_env) gh run list ${gitops.actions.flags} -q '.[0].databaseId' 2>${devnull}
+
+gitops.actions.watch: assert.tool.required/gh
+	@# Babysit the GitHub Actions runs that are in progress, one at a time.  First shows the
+	@# in-progress runs as JSON (`gitops.actions.list`), then loops: poll for the latest in-progress
+	@# run (`gitops.actions.latest`), stream it to completion, poll again, watch again -- until
+	@# nothing is in progress (handled gracefully with a clean exit).  If a watched run fails, pause
+	@# for a keypress acknowledgement before polling again so the failure isn't scrolled past.  A
+	@# user Ctrl-C stops the watch cleanly (it is not mistaken for a run failure, and does not loop):
+	@# `gh` catches SIGINT and exits non-zero, so a recipe-local INT trap flags the interrupt to tell
+	@# the two apart.  USAGE:  make gitops.actions.watch
+	$(gitops.load_env) cmk.log(${dim}actions ${sep} ${no_ansi_dim}in-progress runs ${dim_ital}(json))
+	${make} gitops.actions.list gitops.actions.status=in_progress
+	interrupted=0
+	trap 'interrupted=1' INT
+	while [ "$${interrupted}" != 1 ]; do \
+		rid="`${make} gitops.actions.latest gitops.actions.status=in_progress gitops.actions.limit=1`"; \
+		if [ -z "$${rid}" ]; then cmk.log(${green}${GLYPH_CHECK} nothing in progress ${sep} ${no_ansi_dim}done); break; fi; \
+		cmk.log(${dim}watching run ${sep} ${no_ansi}$${rid}); \
+		rc=0; gh run watch "$${rid}" --exit-status || rc=$$?; \
+		if [ "$${interrupted}" = 1 ] || [ $${rc} -ge 128 ]; then interrupted=1; break; fi; \
+		if [ $${rc} = 0 ]; then cmk.log(${green}${GLYPH_CHECK} run ${no_ansi}$${rid}${green} finished); \
+		else cmk.log.io(${red}run ${no_ansi}$${rid}${red} failed ${sep} ${yellow}press any key to acknowledge..); read -rsn1 _ack; fi; \
+		[ "$${interrupted}" = 1 ] || sleep ${FLUX_POLL_DELTA}; \
+	done; \
+	trap - INT; \
+	[ "$${interrupted}" != 1 ] || cmk.log(${yellow}interrupted ${sep} ${no_ansi_dim}stopped watching)
+gitops.init: gitops.hooks.init
+gitops.hooks.init: assert.tool.required/git
+	@# Reflect over every declared `gitops.hooks.<type>/*` target and wire each active git hook to a
+	@# managed script that runs them (fail-fast).  Idempotent -- re-run any time; a hook type with no
+	@# registrations has its stale managed script removed, and a hand-written hook of the same name is
+	@# never touched.  A `${gitops.hooks.src}` dir of hand-authored io.fs.drop_in parts is also installed.
+	@#
+	@# USAGE:  make gitops.hooks.init
+	hd <- git rev-parse --git-path hooks
+	mkdir -p "$${hd}"
+	cmk.log(${dim}reflecting ${no_ansi}gitops.hooks.<type>/*${dim} registrations into managed hooks ${sep} ${no_ansi}$${hd})
+	all="`${make} mk.namespace.filter/gitops.hooks. 2>/dev/null`"
+	n_wired=0 \
+	&& for pair in ${gitops.hooks.types}; do \
+		seg="$${pair%%:*}"; ghook="$${pair#*:}"; dest="$${hd}/$${ghook}"; pat="gitops.hooks.$${seg}/"; \
+		names="`printf '%s\n' "$${all}" | grep "^$${pat}" | ${stream.nl.to.space}`"; \
+		leaves=""; for n in $${names}; do leaves="$${leaves:+$${leaves}${dim},${no_ansi} }$${n##*/}"; done; \
+		if [ -n "$${names}" ]; then \
+			cmk.log.loop.part1(${bold}$${ghook}${no_ansi}); \
+			if [ -e "$${dest}" ] && ! grep -q gitops-managed-hook "$${dest}" 2>/dev/null; then \
+				cmk.log.loop.part2(${yellow}skipped${no_ansi_dim} - hand-written hook left in place${no_ansi}); continue; fi; \
+			printf '#!/usr/bin/env bash\n# gitops-managed-hook: %s -> reflected gitops.hooks.%s/* targets\n# add/remove registrations in the Makefile; re-run gitops.hooks.init only to add a new hook TYPE.\n# bypass all hooks with: git commit --no-verify\nset -euo pipefail\ncd "$$(git rev-parse --show-toplevel)"\nexec ${gitops.hooks.make} $(gitops.hooks.fire_target)/%s\n' "$${ghook}" "$${seg}" "$${seg}" > "$${dest}"; \
+			chmod +x "$${dest}"; \
+			n_wired=$$((n_wired+1)); \
+			cmk.log.loop.part2(${green}install ok${no_ansi} ${dim}<- ${no_ansi}$${leaves}); \
+		elif [ -e "$${dest}" ] && grep -q gitops-managed-hook "$${dest}" 2>/dev/null; then \
+			cmk.log.loop.part1(${bold}$${ghook}${no_ansi}); \
+			rm -f "$${dest}"; cmk.log.loop.part2(${no_ansi_dim}${ital}unwired${no_ansi_dim} - no registrations left${no_ansi}); \
+		fi; \
+	done \
+	&& cmk.log(${dim}done ${sep} ${no_ansi}$${n_wired}${dim} hook(s) wired${no_ansi})
+	if [ -d "${gitops.hooks.src}" ]; then ${make} io.fs.drop_in.install io.fs.drop_in.src=${gitops.hooks.src} io.fs.drop_in.linkdir=$${hd} io.fs.drop_in.runner=${gitops.hooks.dispatch}; fi
+
+gitops.hooks.fire/%:
+	@# Run every registered `gitops.hooks.<seg>/*` target in order, fail-fast (the managed git-hook
+	@# script re-enters here; `${*}` is the hook-type segment).  Also handy to dry-fire a whole hook.
+	names="`${make} mk.namespace.filter/gitops.hooks.${*}/ 2>/dev/null`"
+	for t in $${names}; do ${make} $${t} || exit $$?; done
+
+gitops.hooks.try/%:
+	@# Reflection-gated dispatch of the hook `gitops.hooks.${*}` (a `<type>/<name>` spec, e.g.
+	@# `release/OK`): if that target is registered, log a green check and run it; otherwise log a
+	@# yellow `no hook found` and succeed.  Lets a lifecycle event fire a hook that may not exist --
+	@# the release flow uses it for `release/OK` / `release/FAIL`.  USAGE:  make gitops.hooks.try/release/OK
+	seg="`printf '%s' "${*}" | cut -d/ -f1`"
+	target="gitops.hooks.${*}"
+	if ${make} mk.namespace.filter/gitops.hooks.$${seg}/ 2>/dev/null | grep -qx "$${target}"; then cmk.log(${green}${GLYPH_CHECK} registered ${sep} ${no_ansi}$${target}); ${make} $${target}; else cmk.log(${yellow}no hook found ${sep} ${no_ansi_dim}$${target}); fi
+
+gitops.hooks.uninstall: assert.tool.required/git
+	@# Remove the managed git-hook scripts this plugin installed for every hook type (only our marked
+	@# scripts; a hand-written hook of the same name is left in place).  Also runs the io.fs.drop_in
+	@# file-based uninstall when a `${gitops.hooks.src}` dir exists.  USAGE:  make gitops.hooks.uninstall
+	hd <- git rev-parse --git-path hooks
+	for pair in ${gitops.hooks.types}; do \
+		ghook="$${pair#*:}"; dest="$${hd}/$${ghook}"; \
+		if [ -f "$${dest}" ] && grep -q gitops-managed-hook "$${dest}" 2>/dev/null; then rm -f "$${dest}"; cmk.log(${green}removed ${sep} ${bold}$${ghook}${no_ansi} ${dim_ital}(managed git hook)${no_ansi}); fi; \
+	done
+	if [ -d "${gitops.hooks.src}" ]; then ${make} io.fs.drop_in.uninstall io.fs.drop_in.src=${gitops.hooks.src} io.fs.drop_in.linkdir=$${hd} io.fs.drop_in.runner=${gitops.hooks.dispatch}; fi
+
+gitops.hooks.list: assert.tool.required/git
+	@# For every hook type with registrations, show the reflected `gitops.hooks.<type>/*` targets and
+	@# whether the git hook is wired / unmanaged / not wired.  Then the io.fs.drop_in file-based state
+	@# (linked / stale / unmanaged / ...) when a `${gitops.hooks.src}` dir exists.  USAGE:  make gitops.hooks.list
+	hd <- git rev-parse --git-path hooks
+	cmk.log(${dim}reflected hooks ${sep} ${no_ansi}$${hd})
+	all="`${make} mk.namespace.filter/gitops.hooks. 2>/dev/null`" \
+	&& for pair in ${gitops.hooks.types}; do \
+		seg="$${pair%%:*}"; ghook="$${pair#*:}"; dest="$${hd}/$${ghook}"; pat="gitops.hooks.$${seg}/"; \
+		names="`printf '%s\n' "$${all}" | grep "^$${pat}" | ${stream.nl.to.space}`"; \
+		if [ -z "$${names}" ]; then continue; fi; \
+		leaves=""; for n in $${names}; do leaves="$${leaves:+$${leaves}${dim},${no_ansi} }$${n##*/}"; done; \
+		if [ -f "$${dest}" ] && grep -q gitops-managed-hook "$${dest}" 2>/dev/null; then st="${green}wired${no_ansi}"; \
+		elif [ -e "$${dest}" ]; then st="${yellow}unmanaged${no_ansi} ${dim}(hand-written)${no_ansi}"; \
+		else st="${red}not wired${no_ansi} ${dim}(run gitops.hooks.init)${no_ansi}"; fi; \
+		cmk.log(${bold}$${ghook}${no_ansi} ${sep} $${st} ${dim}<- ${no_ansi}$${leaves}); \
+	done
+	if [ -d "${gitops.hooks.src}" ]; then ${make} io.fs.drop_in.list io.fs.drop_in.src=${gitops.hooks.src} io.fs.drop_in.linkdir=$${hd} io.fs.drop_in.runner=${gitops.hooks.dispatch}; fi
+
+flux.gitops.hook/%: assert.tool.required/git
+	@# Run the registered hook named `${*}`: the first `gitops.hooks.<type>/<name>` target found,
+	@# scanning `gitops.hooks.types` in order (precommit first).  For firing one hook by hand.
+	@#
+	@# USAGE:  make flux.gitops.hook/gitleaks
+	name="${*}"
+	for pair in ${gitops.hooks.types}; do \
+		seg="$${pair%%:*}"; cand="gitops.hooks.$${seg}/$${name}"; \
+		if ${make} mk.namespace.filter/gitops.hooks.$${seg}/ 2>/dev/null | grep -qx "$${cand}"; then cmk.log(${dim}run ${sep} ${no_ansi}$${cand}); exec ${make} $${cand}; fi; \
+	done
+	cmk.log.io(${red}Error:${no_ansi_dim} no registered hook named ${no_ansi}$${name}); exit 1
+
+gitops.gitleaks: assert.tool.required/git
+	@# Scan staged changes for secrets via gitleaks-in-docker (delegates to `docker.run.sh`) -- a
+	@# reusable pre-commit body.  Requires docker; if it is missing the failure hint points at the
+	@# `git commit --no-verify` bypass.  Override the image via `gitops.gitleaks.image` (or the
+	@# `GITLEAKS_IMAGE` env).  USAGE:  make gitops.gitleaks
+	cmk.assert.tool.required(docker,${no_ansi}git commit --no-verify${no_ansi_dim} bypasses this pre-commit hook)
+	root <- git rev-parse --show-toplevel
+	cmk.log(${dim}gitleaks ${sep} ${no_ansi}protect --staged ${dim}(${no_ansi}$${GITLEAKS_IMAGE:-${gitops.gitleaks.image}}${dim}))
+	img="$${GITLEAKS_IMAGE:-${gitops.gitleaks.image}}" entrypoint=none workspace="$${root}" cmd="protect --staged --no-banner --redact --verbose" this.docker.run.sh
+
+# The git-status JSON shape (a `jqlang` kind instance, from compose.mk core).
+# It renders from `gitops.stat.branch`'s target-locals: strings pass through,
+# counts coerce via `tonumber`, and `dirty`/`upstream` are derived in jq -- so
+# the recipe just gathers raw git facts and calls `.locals()`.  Compare the old
+# `jq -n --arg branch "$branch" --argjson staged "$staged" ..` flag list.
+dsl.jqlang gitops.stat.branch.shape(|
+  { branch:   .branch,
+    head:     .head,
+    describe: .describe,
+    remote:   .remote,
+    dirty:    ((.porcelain | tonumber) > 0),
+    changes:  { staged:    (.staged    | tonumber),
+                unstaged:  (.unstaged  | tonumber),
+                untracked: (.untracked | tonumber) },
+    upstream: { ahead:  ((.ab | split("\t")[1] | tonumber?) // 0),
+                behind: ((.ab | split("\t")[0] | tonumber?) // 0) } }
+|)
+
+gitops.stat.branch: assert.tool.required/git
+	@# The git-status half of `gitops.stat`: branch / head / describe / remote / dirty plus
+	@# working-tree change counts and upstream ahead/behind, as pretty-printed JSON on stdout
+	@# (the `log` banner goes to stderr).  USAGE:  make gitops.stat.branch
+	cmk.log(${dim}git status ${sep} ${no_ansi_dim}branch / dirty / upstream ${dim_ital}(json))
+	branch <- git rev-parse --abbrev-ref HEAD ${stderr_devnull}
+	head <- git rev-parse --short HEAD ${stderr_devnull}
+	describe <- git describe --tags --always --dirty ${stderr_devnull}
+	remote=${gitops.remote}
+	staged <- git diff --cached --name-only ${stderr_devnull} | ${stream.count.lines}
+	unstaged <- git diff --name-only ${stderr_devnull} | ${stream.count.lines}
+	untracked <- git ls-files --others --exclude-standard ${stderr_devnull} | ${stream.count.lines}
+	porcelain <- git status --porcelain ${stderr_devnull} | ${stream.count.lines}
+	ab <- git rev-list --count --left-right @{upstream}...HEAD ${stderr_devnull}
+	gitops.stat.branch.shape.locals()
+
+# The managed-hook shape reads raw lines from stdin (`inputs`, hence the `-R -n`
+# jq flags on the call) and folds them into an object -- so it uses the stream
+# base call `NAME(<jq flags>)` rather than `.locals`.
+dsl.jqlang gitops.stat.hooks.shape(|
+  [inputs | select(length > 0) | split(" ") | { key: .[0], value: .[1] }] | from_entries
+|)
+
+gitops.stat.hooks: assert.tool.required/git
+	@# The managed-hook half of `gitops.stat`: per git-hook state -- `managed` (a script we wrote
+	@# and marked), `unmanaged` (a hand-written hook), or `absent` -- as a pretty-printed JSON object
+	@# keyed by git-hook name on stdout (the `log` banner goes to stderr).  USAGE:  make gitops.stat.hooks
+	cmk.log(${dim}managed hooks ${sep} ${no_ansi_dim}per-type state ${dim_ital}(json))
+	hd <- git rev-parse --git-path hooks
+	for pair in ${gitops.hooks.types}; do ghook="$${pair#*:}"; dest="$${hd}/$${ghook}"; if [ -f "$${dest}" ] && grep -q gitops-managed-hook "$${dest}" ${stderr_devnull}; then st=managed; elif [ -e "$${dest}" ]; then st=unmanaged; else st=absent; fi; printf '%s %s\n' "$${ghook}" "$${st}"; done \
+	| gitops.stat.hooks.shape(-R -n)
+
+# The composed shape merges two sub-object strings captured from the halves
+# above -- `fromjson` parses each back, same as the old `--argjson`.
+dsl.jqlang gitops.stat.shape(|
+  (.branch | fromjson) + { hooks: (.hooks | fromjson) }
+|)
+
+gitops.stat: assert.tool.required/git
+	@# Current git status + managed-hook state as pretty-printed JSON on stdout, composed from the
+	@# output of `gitops.stat.branch` and `gitops.stat.hooks` (each independently runnable).  The
+	@# `log` banners go to stderr; everything on stdout is machine-readable JSON.
+	@# USAGE:  make gitops.stat
+	cmk.log(${dim}git status ${sep}${no_ansi} managed-hook state ${dim_ital}(composed json))
+	branch <- ${make} gitops.stat.branch
+	hooks <- ${make} gitops.stat.hooks
+	gitops.stat.shape.locals()
+
+__main__:
+	@# gitops subcommand CLI: reflects the `gitops.<sub>` verbs (stat, ci, gitleaks, release,
+	@# rerelease) into a menu and routes a chosen `<sub>` to its handler.  On import this entrypoint
+	@# is demoted to the `gitops` target, so `make gitops` prints the menu.  Subcommand dispatch
+	@# (`gitops <sub>`) needs a supervised entry -- like any `cli.subcommands` client, a `cmk run`
+	@# or `mk.interpret` program, not plain `make` -- while the verbs also run directly (`make
+	@# gitops.stat`).  USAGE:  make gitops
+	cmk.cli.subcommands.enter(namespace=gitops)

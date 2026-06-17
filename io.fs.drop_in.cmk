@@ -1,0 +1,225 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# io.fs.drop_in.cmk: 
+#   a reusable "drop-in" dir (`<prefix>.d`) convention (a pure-CMK module).
+#
+# cmk_pragma ::: { "kind": "module" } :::
+#
+# Manages a drop-in dir of "parts" as symlinks installed into a target dir.
+# Registry-free: the contents of the source dir are the registry.  
+# Two entry shapes:
+#   * a regular file `<src>/<name>`   -> symlinked 1:1 at `<linkdir>/<name>`.
+#   * a directory   `<src>/<name>.d/` -> `<linkdir>/<name>` is symlinked at the shared runner
+#
+# A module (no __main__): the shebang compiles it as a parse check.  
+# Use it with the `import` directive then calls the `io.fs.drop_in.*` verbs:
+#
+# EXAMPLE:
+#   import io.fs.drop_in
+#
+# SEE ALSO: 
+#   * ./docs/io.fs.drop_in.md
+#   * `gitops.cmk` which requires/uses this.
+#
+# CONFIG: (a consumer sets these, then delegates to the targets below):
+#  * io.fs.drop_in.src       source dir holding files and `<name>.d/` dirs   (required)
+#  * io.fs.drop_in.linkdir   dir the managed symlinks are installed into      (required)
+#  * io.fs.drop_in.runner    where the drop-in runner is materialized       (default: .cmk/drop_in)
+
+# CONTRIBUTES:
+#  * `io.fs.drop_in.*` members to the core `io.fs` api
+#  * io.fs.drop_in.src ?=
+# * io.fs.drop_in.linkdir ?=
+
+# `src` and `linkdir` are required (a consumer sets them); the runner path defaults into the
+# writable modules dir so a bare reference (e.g. gitops.cmk's `gitops.hooks.dispatch ?=
+# ${io.fs.drop_in.runner}`) stays defined under `--warn-undefined-variables`.
+io.fs.drop_in.runner ?= ${CMK_MODULES_DIR}/drop_in
+
+# Portable link resolver (macOS `readlink` has no `-f`): print the absolute target of symlink $1,
+# resolving a relative target against the link's own directory.  One hop is enough because `drop_in`
+# only ever installs single-level absolute symlinks; a hand-authored relative link still resolves
+# correctly here so it is not mis-reported as `stale`.  Emitted into recipes that need it.
+io.fs.drop_in.resolve_link = _drop_in_rl() { d="$$(readlink "$$1")"; case "$$d" in /*) printf '%s\n' "$$d";; *) printf '%s/%s\n' "$$(cd "$$(dirname "$$1")" && cd "$$(dirname "$$d")" && pwd -P)" "$$(basename "$$d")";; esac; };
+
+_io.fs.drop_in.assert.config:
+	@# Fail unless `io.fs.drop_in.src` and `io.fs.drop_in.linkdir` are both set.  A shared prereq for the verbs below.
+	if [ -z "${io.fs.drop_in.src}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} ${no_ansi}io.fs.drop_in.src${no_ansi_dim} is unset); exit 1; fi
+	if [ -z "${io.fs.drop_in.linkdir}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} ${no_ansi}io.fs.drop_in.linkdir${no_ansi_dim} is unset); exit 1; fi
+
+io.fs.drop_in.runner.ensure:; @mkdir -p $(dir ${io.fs.drop_in.runner}) && verbose=0 ${mk.def.to.file}/io.fs.drop_in.runner.script,${io.fs.drop_in.runner} && chmod +x ${io.fs.drop_in.runner}
+	@# Materialize the drop-in runner (the `io.fs.drop_in.runner.script` define at the foot of this plugin)
+	@# to `${io.fs.drop_in.runner}` and mark it executable.  Idempotent; a prereq of install/run so the on-disk
+	@# script a `<name>.d/` symlink points at always exists.
+
+io.fs.drop_in.install: _io.fs.drop_in.assert.config io.fs.drop_in.runner.ensure
+	@# Install every entry in `${io.fs.drop_in.src}` into `${io.fs.drop_in.linkdir}`: a regular file as a 1:1 symlink,
+	@# a `<name>.d/` dir as a symlink to the shared runner.  Re-runnable.  No-op when src is absent.
+	cmk.log(${no_ansi}${io.fs.drop_in.src} ${dim}-> ${no_ansi}${io.fs.drop_in.linkdir})
+	if [ ! -d "${io.fs.drop_in.src}" ]; then cmk.log.io(${yellow}note:${no_ansi_dim} no source dir at ${no_ansi}${io.fs.drop_in.src}${no_ansi_dim}${comma} nothing to install); exit 0; fi
+	for entry in `ls -1 "${io.fs.drop_in.src}"`; do ${make} _io.fs.drop_in.install/$${entry} || exit 1; done
+
+io.fs.drop_in.uninstall: _io.fs.drop_in.assert.config
+	@# Remove the symlinks this plugin installed from `${io.fs.drop_in.linkdir}`.  Only symlinks are removed;
+	@# a foreign/hand-written file of the same name is left in place.  No-op when src is absent.
+	cmk.log(${no_ansi}${io.fs.drop_in.src} ${dim}-> ${no_ansi}${io.fs.drop_in.linkdir})
+	if [ ! -d "${io.fs.drop_in.src}" ]; then cmk.log.io(${yellow}note:${no_ansi_dim} no source dir at ${no_ansi}${io.fs.drop_in.src}${no_ansi_dim}${comma} nothing to uninstall); exit 0; fi
+	for entry in `ls -1 "${io.fs.drop_in.src}"`; do ${make} _io.fs.drop_in.uninstall/$${entry} || exit 1; done
+
+io.fs.drop_in.list: _io.fs.drop_in.assert.config
+	@# List every entry in `${io.fs.drop_in.src}` with its verified install state, resolving each symlink (no
+	@# `-L` guessing) so a link pointing at the wrong place reads as `stale`:
+	@#   linked     -- a symlink we own, resolving to the expected target (source, or runner)
+	@#   stale      -- a symlink resolving somewhere else (shows the actual target)
+	@#   unmanaged  -- a real file we did not create and will not touch
+	@#   absent     -- nothing installed for this name yet
+	@# A `<name>.d` entry is shown as a `(drop_in)` header + its ordered parts (each `run`/`skipped`); a
+	@# plain entry flags its executable bit.  Then a scan for orphans (our symlinks whose source is
+	@# gone) and a one-line tally.
+	${io.fs.drop_in.resolve_link} \
+	linkdir="${io.fs.drop_in.linkdir}"; \
+	cmk.log(${no_ansi}${io.fs.drop_in.src} ${dim}-> ${no_ansi}$${linkdir}) \
+	&& if [ ! -d "${io.fs.drop_in.src}" ]; then cmk.log.io(${yellow}note:${no_ansi_dim} no source dir at ${no_ansi}${io.fs.drop_in.src}); exit 0; fi \
+	&& srcdir="`cd "${io.fs.drop_in.src}" && pwd`" \
+	&& runner="`cd "$(dir ${io.fs.drop_in.runner})" && pwd`/$(notdir ${io.fs.drop_in.runner})" \
+	&& n_linked=0 && n_stale=0 && n_unmanaged=0 && n_absent=0 && n_orphan=0 \
+	&& for entry in `ls -1 "${io.fs.drop_in.src}"`; do \
+		case "$${entry}" in \
+			*.d) name="$${entry%.d}"; kind=drop_in;  expect="$${runner}";; \
+			*)   name="$${entry}";    kind=plain; expect="$${srcdir}/$${entry}";; \
+		esac; \
+		tgt="$${linkdir}/$${name}"; \
+		if [ -L "$${tgt}" ]; then \
+			if [ "`_drop_in_rl "$${tgt}"`" = "$${expect}" ]; then \
+				st="${green}linked${no_ansi}"; n_linked=$$((n_linked+1)); \
+			else \
+				st="${yellow}stale${no_ansi} ${dim}-> ${no_ansi}`readlink "$${tgt}"`"; n_stale=$$((n_stale+1)); \
+			fi; \
+		elif [ -e "$${tgt}" ]; then \
+			st="${yellow}unmanaged${no_ansi} ${dim}(real file, left as-is)${no_ansi}"; n_unmanaged=$$((n_unmanaged+1)); \
+		else \
+			st="${dim}absent${no_ansi}"; n_absent=$$((n_absent+1)); \
+		fi; \
+		if [ "$${kind}" = drop_in ]; then \
+			cmk.log(${bold}$${linkdir}/$${name}${no_ansi} ${dim}(drop_in)${no_ansi} ${sep} $${st}); \
+			for p in "$${srcdir}/$${entry}"/*; do \
+				[ -e "$${p}" ] || continue; \
+				pb="$${p##*/}"; \
+				case "$${pb}" in .*) continue;; esac; \
+				if [ -f "$${p}" ] && [ -x "$${p}" ]; then pm="${green}run${no_ansi}"; \
+				elif [ -f "$${p}" ]; then pm="${red}skipped (not +x)${no_ansi}"; \
+				else pm="${dim}skipped (not a file)${no_ansi}"; fi; \
+				cmk.log.io(${dim}  - ${no_ansi}$${pb} ${sep} $${pm}); \
+			done; \
+		else \
+			if [ -x "$${expect}" ]; then mode="${dim}+x${no_ansi}"; else mode="${red}not +x${no_ansi}"; fi; \
+			cmk.log(${bold}$${linkdir}/$${name}${no_ansi} ${dim}[${no_ansi}$${mode}${dim}]${no_ansi} ${sep} $${st}); \
+		fi; \
+	done \
+	&& for tgt in "$${linkdir}"/*; do \
+		[ -L "$${tgt}" ] || continue; \
+		base="$${tgt##*/}"; \
+		if [ "`_drop_in_rl "$${tgt}"`" = "$${runner}" ]; then \
+			[ -d "${io.fs.drop_in.src}/$${base}.d" ] && continue; \
+		else \
+			case "`_drop_in_rl "$${tgt}"`" in "$${srcdir}/"*) [ -e "${io.fs.drop_in.src}/$${base}" ] && continue;; *) continue;; esac; \
+		fi; \
+		cmk.log(${yellow}orphan${no_ansi} ${sep} ${bold}$${linkdir}/$${base}${no_ansi} ${dim}-> ${no_ansi}`readlink "$${tgt}"` ${dim}(source gone; run ${no_ansi}io.fs.drop_in.uninstall${dim})${no_ansi}); \
+		n_orphan=$$((n_orphan+1)); \
+	done \
+	&& cmk.log.io(${dim}tally ${sep} ${no_ansi}$${n_linked} ${dim}linked${no_ansi}${comma} $${n_stale} ${dim}stale${no_ansi}${comma} $${n_unmanaged} ${dim}unmanaged${no_ansi}${comma} $${n_absent} ${dim}absent${no_ansi}${comma} $${n_orphan} ${dim}orphan${no_ansi})
+
+io.fs.drop_in.run/%: io.fs.drop_in.runner.ensure
+	@# Run every part in the `.d` directory `${*}` now via the runner (for non-git consumers driving
+	@# a `<x>.d/` from make).  Forwards no args and no stdin.  USAGE:  make io.fs.drop_in.run/path/to/foo.d
+	runner="`cd "$(dir ${io.fs.drop_in.runner})" && pwd`/$(notdir ${io.fs.drop_in.runner})" \
+	&& "$${runner}" "${*}"
+
+_io.fs.drop_in.install/%:
+	@# Install one entry `${*}` from `${io.fs.drop_in.src}` into `${io.fs.drop_in.linkdir}`.  A `<name>.d` dir links
+	@# `<name>` at the runner (and makes every part +x); a regular file links itself 1:1.  Links are
+	@# absolute, so they survive worktrees / relative-path moves.
+	entry="${*}" \
+	&& src="${io.fs.drop_in.src}/$${entry}" \
+	&& linkdir="${io.fs.drop_in.linkdir}" \
+	&& srcdir="`cd "${io.fs.drop_in.src}" && pwd`" \
+	&& mkdir -p "$${linkdir}" \
+	&& case "$${entry}" in \
+		*.d) \
+			if [ ! -d "$${src}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} no such dir ${no_ansi}$${src}); exit 1; fi; \
+			name="$${entry%.d}"; \
+			runner="`cd "$(dir ${io.fs.drop_in.runner})" && pwd`/$(notdir ${io.fs.drop_in.runner})"; \
+			if [ ! -f "$${runner}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} runner missing at ${no_ansi}${io.fs.drop_in.runner}); exit 1; fi; \
+			chmod +x "$${runner}"; \
+			for p in "$${srcdir}/$${entry}"/*; do [ -f "$${p}" ] && chmod +x "$${p}"; done; \
+			ln -sf "$${runner}" "$${linkdir}/$${name}"; \
+			cmk.log.io(${green}installed ${sep} ${no_ansi}$${linkdir}/$${name} ${dim}(drop_in)${no_ansi}) ;; \
+		*) \
+			if [ ! -f "$${src}" ]; then cmk.log.io(${red}Error:${no_ansi_dim} no such file ${no_ansi}$${src}); exit 1; fi; \
+			chmod +x "$${src}"; \
+			ln -sf "$${srcdir}/$${entry}" "$${linkdir}/$${entry}"; \
+			cmk.log.io(${green}installed ${sep} ${no_ansi}$${linkdir}/$${entry}) ;; \
+	esac
+
+_io.fs.drop_in.uninstall/%:
+	@# Uninstall one entry `${*}`: remove `${io.fs.drop_in.linkdir}/<name>` only if it is a symlink (one we
+	@# own).  The link name for a `<name>.d` source is `<name>` (suffix stripped).  A real file left
+	@# there by something else is not touched.
+	entry="${*}" \
+	&& name="$${entry%.d}" \
+	&& tgt="${io.fs.drop_in.linkdir}/$${name}" \
+	&& if [ -L "$${tgt}" ]; then rm -f "$${tgt}" && cmk.log.io(${green}removed ${sep} ${no_ansi}$${tgt}); \
+	elif [ -e "$${tgt}" ]; then cmk.log.io(${yellow}note:${no_ansi_dim} ${no_ansi}$${tgt}${no_ansi_dim} is not a managed symlink${comma} leaving it); \
+	else cmk.log.io(${dim}not installed ${sep} $${name}); fi
+
+# ░░ the drop-in runner (materialized to `${io.fs.drop_in.runner}` by `io.fs.drop_in.runner.ensure`) ░░
+# The portable `<prefix>.d` (drop-in dir) loop, formerly the standalone `.cmk/drop_in` bin.  Read
+# verbatim via `mk.def.to.file` (`$(value)`, so single `$` survives -- no make-escaping); the body
+# is plain bash.  Deliberately does not shell out to `run-parts` (absent on macOS, a different impl
+# on busybox/Alpine, inconsistently packaged on RHEL; it also can't replay stdin to each part nor
+# fail-fast reliably).  See docs/io.fs.drop_in.md.
+#
+# Parts in <dir> run in lexical (LC_ALL=C) order.  Each part receives the forwarded ARGS and a
+# replay of this invocation's STDIN (buffered once, since a stream is consumed only once).  FAIL
+# FAST: the first part to exit non-zero aborts with that status.  Parts that are dotfiles, or are
+# not executable regular files, are skipped (a `.keep` placeholder or a stray temp file never runs).
+#
+# Two modes, disambiguated by argv[0]'s basename:
+#   * invoked as `drop_in`            -> generic:  `drop_in <dir> [args...]`  (dir is the first argument)
+#   * invoked under any other name -> git hook: it is a symlink named for the hook (e.g. installed
+#       at .git/hooks/pre-commit); the parts dir is `<toplevel>/${DROP_IN_SRC:-hooks}/<name>.d`,
+#       resolved via `git rev-parse --show-toplevel`.  Everything the loop needs is derived here, so
+#       there is no script-to-script path lookup (which would need macOS-missing `readlink -f`).
+define io.fs.drop_in.runner.script
+#!/usr/bin/env bash
+set -euo pipefail
+
+self="$(basename "$0")"
+if [ "${self}" = drop_in ]; then
+	[ "$#" -ge 1 ] || { echo "usage: drop_in <parts-dir> [args...]" >&2; exit 2; }
+	dir="$1"; shift
+else
+	toplevel="$(git rev-parse --show-toplevel)"
+	dir="${toplevel}/${DROP_IN_SRC:-hooks}/${self}.d"
+fi
+
+# No parts dir => nothing to do.  A hook/run that does nothing must succeed.
+[ -d "${dir}" ] || exit 0
+
+# Buffer stdin once so every part sees the same payload.  Streams git feeds on a pipe (pre-push,
+# pre-receive, post-rewrite) deliver refs/objects exactly once.  But when stdin is the TERMINAL
+# (e.g. pre-commit during an interactive `git commit`) we must NOT drain it -- `cat` would block on
+# an EOF that never comes, hanging the commit -- so leave the buffer empty.  A part that needs to
+# prompt can open /dev/tty itself.
+stdin_buf="$(mktemp "${TMPDIR:-/tmp}/drop_in.XXXXXX")"
+trap 'rm -f "${stdin_buf}"' EXIT
+[ -t 0 ] || cat >"${stdin_buf}"
+
+# Run each part in lexical order.  `LC_ALL=C` keeps ordering stable across locales so numeric
+# prefixes (10-, 20-, ...) sort as intended.
+for part in $(LC_ALL=C ls -1 "${dir}"); do
+	p="${dir}/${part}"
+	case "${part}" in .*) continue;; esac       # skip dotfiles / placeholders
+	[ -f "${p}" ] && [ -x "${p}" ] || continue   # skip non-executable / non-file entries
+	"${p}" "$@" <"${stdin_buf}"                  # set -e aborts on the first non-zero part
+done
+endef

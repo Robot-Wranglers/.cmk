@@ -1,0 +1,41 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+dsl.golang: inline Go as a first-class dsl -- code.compiled (build/cache/run)
+mixed with the Language protocol (structural reflection).  Sibling of dsl.python.
+'''
+
+from cmk import dsl
+
+# go.mod + build script (block bodies cannot nest in a cooked body).
+dsl.golang.default.mod(|
+    module poly
+    go 1.24
+|)
+_dsl.golang.build.sh(|
+    set -e
+    echo "dsl.golang [1/3]: resolving modules (go mod tidy -- can be slow)..." >&2
+    go mod tidy
+    echo "dsl.golang [2/3]: compiling (go build -v -> $OUT)..." >&2
+    CGO_ENABLED=0 go build -v -trimpath -buildvcs=false -o "$OUT" .
+    echo "dsl.golang [3/3]: built $OUT; fixing ownership..." >&2
+    [ -n "$HOST_UID" ] && chown -R "$HOST_UID:$HOST_GID" . || true
+|)
+
+# scalar spec on the instance; __args__ redirects lookups (lang=self).
+dsl golang(bases=code.compiled ifaces=Language entrypoint=true classvars='__lang__=.go')[|
+  self.base = golang:1.24-alpine
+  self.fmtentry = gofmt
+  self.srcmap = src:main.go mod:go.mod
+  self.mounts = -v $$HOME/go/pkg/mod:/go/pkg/mod -v $$HOME/.cache/go-build:/root/.cache/go-build
+  self.env = -e GOOS=$${GOOS:-`uname -s | tr A-Z a-z`} -e GOARCH=$${GOARCH:-`uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/`}
+  self.buildsh = _dsl.golang.build.sh
+  self.__args__ = src=self lang=self mod=$(or $(call mk.kwargs.get,${1},mod),dsl.golang.default.mod) $(filter-out def=% src=% mod=% namespace=% bases=%,${1})
+  self.fmt:
+    cat ⬥self \
+      | quiet=1 img=$(self.base) entrypoint=$(self.fmtentry) ${make} docker.run.sh
+|]
+
+# publish the build spec at class level, so a class-qualified lang= reference resolves.
+$(call dsl.export!, dsl.golang, base srcmap buildsh mounts env fmtentry)

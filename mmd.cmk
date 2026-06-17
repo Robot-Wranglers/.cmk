@@ -1,0 +1,67 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# mmd.cmk: render Mermaid diagrams (*.mmd) to PNG.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+#   Wraps mermaid-cli (mmdc) in a container, then trims each PNG to content with
+#   imagemagick.  Surface: self.mmd.render for one file; docs.mmd or docs.mermaid
+#   for one file or all diagrams under the root; docs.mmd.build / .shell / .stat /
+#   .version as container helpers.
+#
+#   A library (no __main__), loaded via the root Makefile plugin list.
+
+# `Dockerfile` is a cmk KIND (inline image + build/dispatch scaffolding).
+from cmk import Dockerfile
+
+# Root walked by the docs.mmd / docs.mermaid targets; honors DOCS_ROOT.
+docs.root ?= $(call m5|,DOCS_ROOT,docs)
+
+mmd.config=.cmk/.mmd.config
+img.imagemagick=dpokidov/imagemagick
+define Dockerfile.mermaid
+FROM ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.1
+USER root 
+RUN apk add -q --update --no-cache coreutils build-base bash procps-ng
+RUN ln -s /home/mermaidcli/node_modules/.bin/mmdc /usr/local/bin/mmd
+endef
+
+docs.mmd.stat: docs.mmd.build
+	@# Show availability/version info for mermaid
+	${jb} version=`${make} docs.mmd.version | tr -d '\r'`
+
+docs.mmd.version:; cmd="--version" ${make} mk.docker/mermaid
+	@# Show availability/version info for mermaid
+
+docs.mmd.build: Dockerfile.build/mermaid
+	@# Build the mermaid base container
+docs.mmd/%:; ${make} self.mmd.render/${*}
+	@# Render a single mermaid file.
+	@# In-place, except that .mmd extension becomes .png
+	
+docs.mermaid docs.mmd: docs.mmd.build
+	@# Renders all diagrams for use with the documentation 
+	$(call log, rendering all mermaid diagrams)
+	find ${docs.root} | grep '[.]mmd$$' | ${stream.peek} | ${flux.each}/self.mmd.render
+	$(call log, ${dim}rendering all mermaid diagrams ${sep} ${green}${bold}${GLYPH_CHECK})
+
+docs.mmd.shell:; entrypoint=bash ${make} mk.docker/mermaid
+	@# Starts debugging shell for the mermaid base container
+
+self.mmd.render/%:
+	@# Renders the given mermaid file,
+	@# including some post-processing that does trim-to-content
+	output=`dirname ${*}`/`basename -s.mmd ${*}`.png \
+	&& mmd_config=`ls ${mmd.config} >/dev/null 2>/dev/null \
+		&& echo '--configFile ${mmd.config}' \
+		|| echo ''` \
+	&& cmd="-i ${*} $${mmd_extra:-} $${mmd_config} -o $${output} $${mmd_args:--b transparent }" \
+		img=mermaid ${make} mk.docker \
+	&& ${io.mktemp} \
+	&& cmd='-flatten -fuzz 1% -trim +repage' \
+	&& cmd="$${output} $${cmd}" \
+	&& bash -x -c "${docker.run.base} \
+		--entrypoint magick ${img.imagemagick} \
+		$${output} $${cmd} $${tmpf}" \
+	&& mv -f $${tmpf} $${output} \
+	&& $(call log,previewing $${output}) \
+	&& cat $${output} | ${stream.img}

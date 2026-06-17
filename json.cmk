@@ -1,0 +1,75 @@
+#!/usr/bin/env -S ./compose.mk cmk run
+# json.cmk: Populates `json.*` namespace with JSON-related helpers.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+# This includes basic stuff for validation and conversion.  Nothing fancy
+# here, but left out of `compose.mk` standard-library just to avoid the clutter
+#
+# The helpers also read naturally as members of the io and stream namespaces, so
+# each is surfaced there too: validation contributes `io.json.validate/`, the
+# conversions contribute `stream.json.*`.  The `json.*` names stay canonical
+# (backward compat); the aliases at the bottom are thin prereqs onto them.
+#
+# Executable module: runnable and importable (Pythonic).  Run it directly
+# (`./json.cmk`) and the `__main__` overview below prints.  Import it
+# (`cmk.include.plugins(json.cmk)`) and __main__ is demoted to a plain
+# `json` target -- so `${make} json` prints the overview and there is no
+# collision with the importer's own __main__.
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+__main__:
+	@# Overview of the json.* helpers.  Shown on a bare `./json.cmk`; on import
+	@# this entrypoint is demoted to the `json` target (see the header note).
+	cmk.log(${bold}json.cmk${no_ansi} ${sep} helpers for the ${ital}json.*${no_ansi} namespace)
+	printf '%b\n' \
+		'  ${bold}json.validate/${no_ansi}<path>  validate a JSON file, or all *.json under a dir' \
+		'  ${bold}json.from_cols${no_ansi}        autodetect columns then emit JSON (nushell)' \
+		'  ${bold}json.parse${no_ansi}            parse JSON from line input by pattern (nushell)' \
+		'  ${bold}json.to_yaml${no_ansi}          convert JSON to YAML (nushell)' \
+		'  ${dim}(also io.json.validate/, stream.json.{from_cols,parse,to_yaml})${no_ansi}' \
+	| ${stream.to.stderr}
+	cmk.log(run one ${sep} ${dim}./json.cmk json.validate/pkg.json)
+
+json.validate/%:
+	@# Validates the given JSON file, or if a directory, validates all JSON files
+	ls ${*} > /dev/null \
+	|| ( cmk.log(${*} ${sep} ${red} does not exist) ; exit 23 )
+	if [ -d "${*}" ]; then \
+		cmk.log(${*} ${sep} is a directory) \
+		&& find ${*} -type f | grep .json$$ | ${flux.each}/json.validate ; \
+	else \
+		cmk.log.part1(json.validate ${sep} ${ital}${*}) \
+		&& cat ${*} | ${jq} -c . > /dev/null \
+		&& cmk.log.part2(ok) ; \
+	fi
+
+# Conversion helpers, leveraging `stream.nushell` directly or indirectly
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+json.from_cols: stream.nushell.parse_cols
+	@# Attempts to create JSON by autodetecting column headers and column width.
+	@# See the docs for `stream.nushell.parse_cols`
+
+json.parse: stream.nushell.parse
+	@# Parse JSON from line-oriented input, using a given pattern.
+	@# See the docs for `stream.nushell.parse`
+
+json.to_yaml: stream.nushell/from_json,to_yaml
+	@# Converts JSON to yaml (via nushell)
+
+# io.* / stream.* aliases: the same helpers, contributed into the namespaces they
+# belong to.  Thin prereq-only delegations -- the json.* targets above stay canonical.
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+io.json.validate/%: json.validate/%
+	@# Alias for `json.validate/<path>`, contributed into the io.* namespace.
+
+stream.json.from_cols: json.from_cols
+	@# Alias for `json.from_cols`, contributed into the stream.* namespace.
+
+stream.json.parse: json.parse
+	@# Alias for `json.parse`, contributed into the stream.* namespace.
+
+stream.json.to_yaml: json.to_yaml
+	@# Alias for `json.to_yaml`, contributed into the stream.* namespace.

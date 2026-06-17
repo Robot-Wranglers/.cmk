@@ -1,0 +1,1308 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# tux.repl.cmk: a reusable 3-region Bubbletea REPL
+#
+# cmk_pragma ::: { "kind": "module" } :::
+#
+#   A library (no __main__), so the shebang compiles it as a parse check; import it to use it.
+#   Installed under CMK_PLUGINS_DIR (.cmk), so import by name (use `require` -- idempotent +
+#   child-safe; see the import-contract note below):
+#       $(call __plugins__.require, tux.repl.cmk)
+#       then tux.repl.declare with namespace/read/eval/print kwargs.
+#   ...which wires a `ui` target whose recipe launches the REPL.  (The underlying callable is the
+#   `tux.repl` macro -- usable directly as `cmk.tux.repl(..)` on a recipe line if you prefer.)
+#
+#   It wires up to four targets in the importing file to regions of the TUI:
+#     * print : called with no args; its stdout/stderr stream onto the scrolling panel (top).
+#     * eval  : a stdin sink; each textarea submission (one word = a target name) is written to its
+#               stdin, and eval's own stdout/stderr also stream to the panel (read-eval-PRINT loop).
+#     * read  : called with no args, long-lived; continuously emits line-oriented output, the latest
+#               line painting the MODE-LINE (bottom).
+#     * minimap : optional, long-lived (assumed to LOOP, not exit); its output streams into a small
+#               buffered pane on the RIGHT-HAND SIDE of the panel.  Omit it -> no pane (unchanged
+#               layout).  If it does exit, the pane shows "error with minimap".
+#
+#   The macro ends in `exec <wrapper> <runner> <read> <eval> <print>`, so the Go binary (not a
+#   signal-trapped recipe) spawns the three supervised children -- which sidesteps the nested-cmk-run
+#   deadlock.  <runner> defaults to ${__interpreting__} (the importing program file); pass `runner=`
+#   to override.  The wrapper is materialized from the inline block-refs + container-built on first
+#   use into a per-host XDG cache (via the dsl.golang.cmk plugin); no scratch dir is committed to the repo.
+#
+#   Import contract: the wrapper's children re-parse the importing file; they do not use the macro, and
+#   concurrent re-imports would race on the shared module-staging path.  So import this plugin with
+#   `__plugins__.require` -- idempotent + child-safe: the children inherit the exported `__plugins__`
+#   registry and skip the re-import (the registry-based successor to the old host_only=/CMK_HOST flag):
+#       $(call __plugins__.require, tux.repl.cmk)
+# (No __main__: this is a library -- import it; do not run it directly.  See demos/repl.mk for a plain-
+# Makefile REPL via the `tux.repl/%` helper; the `.cmk` paths use the `repl` pragma / `cmk repl`.)
+# The Go-build/cache pipeline is factored into the dsl.golang.cmk plugin: dsl.golang.ensure(..)
+# sets `bin` to the per-host cache path (keyed by a hash of the Go block-refs below, so editing the
+# source busts it), cross-building it on a miss.  tux.repl is thus a client of the same build-if-needed
+# block dsl.golang.lambda uses -- it just adds a tty gate and execs with its own arg list.  Import
+# unguarded -- tux.repl.cmk is itself guarded by its importers for the concurrent-children case, so
+# polyglot is never re-imported by racing children.
+cmk.include.plugins(dsl.golang.cmk)
+
+# ░░ the macro: unpack kwargs, gate on a tty, build-if-needed, exec the wrapper ░░
+# GATE is on STDOUT being a tty (the display): `tty stdout -> launch the TUI`.  If STDIN is a pipe (e.g.
+# `echo target | prog`), the wrapper still launches, reads KEYS from /dev/tty (WithInputTTY), and injects the
+# piped stdin lines as submissions (a PRELUDE -- "as if typed"), then stays interactive.  If stdout is not a
+# tty (redirected / scripted / test harness), there is no display: fall back to BATCH -- stream stdin straight
+# into the eval (run + exit).  So `echo target | prog` opens the REPL in a terminal but runs headless in a pipe.
+# Opt-in structured batch: set `CMK_REPL_STRUCTURED=1` and the no-tty path instead execs the wrapper headless
+# (it self-detects the non-tty stdout), which runs eval over piped stdin and emits the JSON SIGN-OFF to stdout
+# (with the captured output in `screen.stdout_buffer`) -- the pty-free roundtrip: `echo t | prog | jq
+# .screen.stdout_buffer`.  This builds the Go wrapper on first use (docker), so plain batch stays the default.
+# eval=/print= are optional (empty default); read= defaults to the core `tux.repl.modeline` (the
+# diagnostic + __vm__ stack-summary mode-line -- pass `read=<your.target>` to override, or `read= `
+# for none).  The wrapper degrades gracefully on a missing one: no print = no scrolling stream (the
+# spinner still shows while an eval command runs); no eval = the input is inert.  A bare
+# `cmk.tux.repl(eval=..)` is therefore a clean input/output REPL that still gets the default mode-line,
+# while the full `cmk.tux.repl(read=.. eval=.. print=..)` is the 3-region overlay -- same wrapper, same
+# keybindings.  exit_after=1 makes the wrapper shut down gracefully once the print stream closes (a
+# self-terminating demo).  The exec args are quoted so an omitted target stays an empty positional arg.
+# CMK_REPL_CLI (the REPL'd program's launch CLI) is bridged into the child env by the launchers below
+# (and core's _cmk.repl.launch) so tux.repl.modeline can show the program's CLI, not its own.
+define tux.repl
+$(call mk.unpack.kwargs, ${1}, read=tux.repl.modeline eval print exit_after minimap events complete enter runner=${__interpreting__})
+if ${io.tty.stdout} || { [ -n "$${CMK_REPL_STRUCTURED}" ] && [ -n "${kwargs_eval}" ]; }; then \
+  { printf '${dim}tux.repl ${sep} preparing wrapper ${sep} first run cross-builds in docker (progress below; NOT a hang)${no_ansi}\n' >/dev/tty ; } 2>/dev/null || true ; \
+  $(call code.compiled.ensure, lang=dsl.golang src=_tux.wrapper.main.go mod=_tux.wrapper.go.mod name=tux-repl-wrapper base=${dsl.golang.base}) \
+  && { { printf '${dim}tux.repl ${sep} preflight ${sep} wrapper-bin ${no_ansi}%s${dim} ${sep} %s ${sep} runner ${no_ansi}%s${no_ansi}\n' "$${bin}" "$$( [ -x "$${bin}" ] && printf '${green}exists${no_ansi}' || printf '${red}MISSING${no_ansi}' )" "${kwargs_runner}" >/dev/tty ; } 2>/dev/null || true ; \
+       export CMK_REPL_WRAPPER_BIN="$${bin}"; \
+       ea=false; [ -n "${kwargs_exit_after}" ] && ea=true; \
+       _enter="${kwargs_enter}"; case "$${_enter}" in 1|true|yes|on|TRUE|YES|ON) _enter=__main__ ;; esac; export CMK_REPL_ENTER="$${_enter}"; \
+       export CMK_REPL_REGIONS="$$(printf '{"runner":"%s","read":"%s","eval":"%s","print":"%s","minimap":"%s","events":"%s","complete":"%s","enter":"%s","exit_after":%s}' "${kwargs_runner}" "${kwargs_read}" "${kwargs_eval}" "${kwargs_print}" "${kwargs_minimap}" "${kwargs_events}" "${kwargs_complete}" "$${_enter}" "$$ea")"; \
+       exec "$${bin}" "${kwargs_runner}" "${kwargs_read}" "${kwargs_eval}" "${kwargs_print}" "${kwargs_exit_after}" "${kwargs_minimap}"; } ; \
+elif [ -n "${kwargs_eval}" ]; then \
+  $(call log.io, ${dim}tux.repl ${sep} no tty ${sep} BATCH ${sep} streaming stdin into eval ${no_ansi}${kwargs_eval}${dim} ${sep} set CMK_REPL_STRUCTURED=1 for a JSON signoff${no_ansi}) ; \
+  CMK_REPL_TARGETS= ${kwargs_runner} ${kwargs_eval} | grep -av "^$$(printf '\036')" || true ; \
+else $(call log.io, no tty + no eval target -- nothing to stream) ; fi
+endef
+
+# tux.repl.declare: mint a named REPL target plus its .repl var.
+
+# kwargs read/eval/print/exit_after/runner flow to tux.repl.
+define _tux.repl.declare
+$(call mk.unpack.kwargs, ${1}, namespace)
+${kwargs_namespace}.repl = $$(call tux.repl, ${1})
+${kwargs_namespace}:; $${${kwargs_namespace}.repl}
+endef
+tux.repl.declare=$(eval $(call _tux.repl.declare,${1}))
+
+# tux.repl.run: the env-driven launch entrypoint for REPL-as-execution-mode -- it owns the launch logic
+# (what core's `_cmk.repl.launch` used to do inline).  compose.mk's `cli.cmk.run` (on a `# cmk_pragma repl`
+# program) / `cli.cmk.repl` (the `cmk repl [<file>]` subcommand) compile this plugin (with a `__main__:
+# tux.repl.run` appended) and run it, having exported three env vars:
+#   CMK_REPL_RUNNER  -- the compiled program the harness dispatches against (-> runner + __interpreting__)
+#   CMK_REPL_SOURCE  -- the program SOURCE, scraped here for the launch banner's LOCAL target namespace
+#   CMK_REPL_KWARGS  -- `eval=.. [read=.. print=.. exit_after=..]` (runner is omitted -> defaults to
+#                       ${__interpreting__}, pinned below to the runner)
+# So core keeps only the irreducible bridge (it can't import this plugin, so it compiles + runs it); the
+# scrape + runner-pinning + wrapper exec all live here.  This (a target) replaced the old standalone
+# tux.repl.launch.cmk launcher file.  The two env values are TARGET-SPECIFIC exports (the tux.repl macro
+# is multi-line and must be the whole recipe).
+tux.repl.run: export CMK_REPL_TARGETS = $(shell [ -f "$(CMK_REPL_SOURCE)" ] && awk -f <(${mk.def.read}/.awk.completion.scan) -v param=keep "$(CMK_REPL_SOURCE)" 2>/dev/null | sort -u | tr '\n' ' ')
+tux.repl.run: export __interpreting__ = $(CMK_REPL_RUNNER)
+tux.repl.run:; $(call tux.repl, ${CMK_REPL_KWARGS})
+
+# tux.repl.wrapper.bin: build the Go wrapper if needed and print its cache path on stdout (build logs go to
+# stderr).  A small introspection hook -- the black-box test harness uses it to locate/build the binary once,
+# then drives it directly (headless, fake runners) without going through the macro or a live tty.
+tux.repl.wrapper.bin:; @$(call code.compiled.ensure, lang=dsl.golang src=_tux.wrapper.main.go mod=_tux.wrapper.go.mod name=tux-repl-wrapper base=${dsl.golang.base}) >&2 && printf '%s\n' "$${bin}"
+
+# ░░ BRIDGE CONTRACT + Go test-screen ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# tux.repl.test_screen.print: emit the whole metadata schema the Go TUI understands -- this target is the
+# bridge contract, so KEEP IT IN SYNC with the Go dispatch table (`metaHandlers`).  Fields (any omittable):
+#   mode_lhs, mode_rhs ; mm_width ; mm_config {pos:mode} ; the per-position <pos>_mm_{tree|buffer|top|bottom}
+#   fields (bare `mm_*` = middle); the CHROME keys prompt/input/modeline/panel/split/title (input/modeline/
+#   panel are tri-state bools -- omit = visible); a determinate progress {pct,label,color,show}; and a
+#   transient toast {text,level,ttl}.  Each value here
+#   is a NAME-AS-PLACEHOLDER so the live screen labels which field drives which pixels.  Built with `${jb}`
+#   (json.bash) -- scalars `k=v`, numbers/objects via `:raw`, the nested trees via `mm_tree:raw=<json>` (`:raw`
+#   embeds a literal JSON value; `:json` validates but its coprocess is flaky in this image; dynamic feeders
+#   instead do `${jb} k=v | ${jq} -s '...'`).  Row built once (one container) then looped, so the read channel
+#   stays fed cheaply.  Drive the whole TUI from this (every section at once) to eyeball pure-Go changes.
+tux.repl.test_screen.print:; buf=`printf 'bottom_mm_buffer\nrunning frame.w2\nio.wait/1\ndone rc=0'` ; row=`${jb} mode_lhs="mode_lhs" mode_rhs="mode_rhs" prompt="prompt>" title="tux.repl test_screen" input:raw=true modeline:raw=true panel:raw=true split:raw=36 progress:raw='{"pct":0.5,"label":"progress","color":"45","show":true}' toast:raw='{"text":"toast","level":"info","ttl":5}' spinner:raw='{"kind":"line","color":"42"}' mm_width:raw=36 mm_config:raw='{"top":"buffer","middle":"tree","bottom":"mode"}' top_mm_top="top_mm_top (buffer:scroll)" top_mm_bottom="top_mm_bottom" top_mm_buffer="top_mm_buffer" mm_top="mm_top (tree)" mm_bottom="✓ mm_bottom" mm_tree:raw='{"label":"vm","children":[{"label":"frame.demo","note":"·40","children":[{"label":"frame.compile","note":"·41","children":[{"label":"frame.link","note":"·42","active":true,"children":[{"label":"frame.w1","note":"·43"},{"label":"frame.w2","note":"·44"},{"label":"frame.w3","note":"·45"}]}]}]}]}' bottom_mm_top="bottom_mm_top (mode:overwrite)" bottom_mm_bottom="bottom_mm_bottom" bottom_mm_buffer="$$buf"` && while true; do printf '%s\n' "$$row" ; sleep 1 ; done
+# tux.repl.test_screen: drive the TUI from the contract emitter on the metadata (read) channel.
+$(call tux.repl.declare, namespace=tux.repl.test_screen read=tux.repl.test_screen.print eval=tux.repl.kernel)
+
+# tux.repl/<t1,t2,..>: the canonical way to add a REPL to a plain Makefile -- without cmk-pragma.  Import
+# this plugin, then `__main__: tux.repl/t1,t2,t3`.  It lists the comma-separated <targets> at launch and
+# dispatches them (or any core target) via the generic core `tux.repl.kernel`, run over the live program
+# (the runner is the makefile itself, so nothing is compiled).  Bare eval-only -- the single re-parsing
+# child is sequential, so no concurrency race and no `host_only` needed.  The runner is `${__interpreting__}`
+# when set (the `cmk run`/`mk.interpret` shebangs), else the makefile being built ($(firstword
+# $(MAKEFILE_LIST))) for a plain `make -f` shebang; either must be executable as `<file> <target>`.  We
+# export it so the macro's default `runner=${__interpreting__}` and the wrapper's children (which run
+# tux.repl.kernel -> `${__interpreting__} mk.kernel.each`) all resolve to it.  Contrast the `.cmk` paths (a
+# `repl` pragma under `cmk run`, or `cmk repl <file>`), which REPL over a compiled standalone.  Needs a tty.
+# The two env values are TARGET-SPECIFIC exports (not shell `&&`-prefixes) because `tux.repl` is a
+# multi-line macro meant to be the whole recipe -- chaining it after `&&` would split the recipe.
+#   USAGE (in a Makefile):  __main__: tux.repl/t1,t2,t3
+tux.repl/%: export CMK_REPL_TARGETS = $(subst ${comma},${space},$*)
+tux.repl/%: export __interpreting__ = $(abspath $(firstword ${MAKEFILE_LIST}))
+tux.repl/%: export CMK_REPL_CLI = $(MAKE_CLI)
+tux.repl/%:
+	$(call tux.repl, eval=tux.repl.kernel)
+
+# ░░ block-refs: the Go sources (private -- materialized + cross-built by dsl.golang.ensure) ░░
+# Aggressively minified (no comments/blank lines, statements combined, closing brackets pulled up +
+# compressed): a generated, gitignored build artifact.
+define _tux.wrapper.go.mod
+module compose.mk/tux-repl-wrapper
+go 1.24
+require (
+	github.com/charmbracelet/bubbles v0.20.0
+	github.com/charmbracelet/bubbletea v1.1.1
+	github.com/charmbracelet/lipgloss v0.13.0
+	github.com/creack/pty v1.1.23
+)
+endef
+
+define _tux.wrapper.main.go
+package main
+import (
+	"bufio"; "encoding/json"; "fmt"; "io"; "os"; "os/exec"; "strconv"; "strings"; "syscall"; "time"; "unicode/utf8"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/lipgloss/tree"
+	"github.com/creack/pty" )
+type chunkMsg []byte
+type evalMsg []byte
+type evalDoneMsg struct{}
+type modeMsg string
+type modeDoneMsg struct{}
+type doneMsg struct{}
+type completeMsg struct { line string; cands []string }
+type minimapMsg []byte
+type minimapDoneMsg struct{}
+type toastTickMsg struct{}
+// preludeMsg: a line piped on stdin (when stdin is NOT a tty) -> injected as if typed + submitted at the
+// prompt.  Keys still come live from /dev/tty (WithInputTTY), so the session stays interactive after.
+type preludeMsg string
+type preludeArmMsg struct{}
+// regions: the freeze-proof launch config -- a CMK_REPL_REGIONS JSON map supersedes the positional args, so
+// future regions/options add KEYS (never reshuffle positions).  Empty positional args remain a fallback.
+type regions struct {
+	Runner   string `json:"runner"`
+	Read     string `json:"read"`
+	Eval     string `json:"eval"`
+	Print    string `json:"print"`
+	Minimap  string `json:"minimap"`
+	Events   string `json:"events"`   // NEW region: wrapper WRITES UI events as JSON to this target's stdin
+	Complete string `json:"complete"` // NEW: client-provided completion target (overrides the make default)
+	Enter    string `json:"enter"`    // NEW: a target auto-submitted once after the first render (start-by-default)
+	ExitAfter bool  `json:"exit_after"` }
+// toastT: a transient notification (text + level + expiry), driven by the `toast` metadata key.
+type toastT struct { text, level string; exp time.Time }
+// the structured mode-line protocol emitted by the default `read` (tux.repl.modeline): a runtime
+// fingerprint, with an optional `vm` sub-object reflecting the live __vm__ control stack.
+type model struct {
+	vp viewport.Model
+	ta textarea.Model
+	content string
+	readErr bool
+	ready, done bool
+	w, h, rc int
+	printCmd *exec.Cmd
+	readCmd *exec.Cmd
+	printPty *os.File
+	evalCmd *exec.Cmd
+	evalIn io.WriteCloser
+	evalOut *os.File
+	readScan *bufio.Scanner
+	minimapCmd *exec.Cmd
+	minimapOut *os.File
+	minimapRaw string         // the raw minimap CHANNEL's accumulation buffer (feeds mms["middle"])
+	minimapW int              // mm_width: shared width of EVERY minimap box (default 36)
+	// ── UNIFIED metadata channel: ONE `read`/meta target emits a JSON object per line, any field omittable.
+	//    Up to THREE stacked minimaps (top/middle/bottom) on the RHS; bare `mm_*` aliases `middle_mm_*`
+	//    (backcompat solo).  mm_config {pos:mode} chooses which positions show + their mode (tree|buffer|mode). ──
+	mms map[string]*mmState   // position ("top"/"middle"/"bottom") -> its state
+	mmConfig map[string]string// mm_config: position -> mode; empty => just the solo middle
+	unknownMeta map[string]bool // metadata keys with no handler, logged ONCE each
+	modeLhs, modeRhs string   // mode_lhs / mode_rhs : a custom feeder's modeline text (left/right)
+	modeSegs []segment        // mode_segs : the DEFAULT modeline's prioritized left segments (feeder-formatted in jq)
+	metaMode bool             // a meta line was applied (drives signoff.meta_mode); the bar always paints via paintModeline
+	inN, outN int
+	evalBuf string
+	history []string
+	histIdx int
+	histStash string
+	spin spinner.Model
+	spinning bool
+	busy bool
+	lastOut time.Time   // last time the main panel received output -> "the buffer is streaming"
+	lastRc int          // return code of the last completed operation (eval command / print region)
+	haveRc bool         // an operation has completed -> show the rc status indicator when idle
+	exitAfter bool
+	lastKey string
+	children []*exec.Cmd
+	cmkBin string
+	cmkEnv []string
+	runner string                   // the program the regions are dispatched against (for the events/complete regions)
+	// ── event channel (UI -> client): wrapper writes JSON events to the events child's stdin (the twin of read) ──
+	eventsCmd *exec.Cmd
+	eventsCh chan []byte            // buffered; a writer goroutine drains it to the events child (emit never blocks the UI)
+	completeTarget string          // client completion target (regions.Complete); empty => the make `cmk cli complete` default
+	// ── chrome/layout, metadata-driven (tri-state *bool: nil = the default "visible"; so the debugger client is unchanged) ──
+	showInput, showModeline, showPanel *bool
+	customPrompt string            // `prompt` metadata: overrides the In[N]: prompt when set
+	winTitle string                // `title` metadata: desired window title
+	titleSent string               // last title actually sent (dedup tea.SetWindowTitle)
+	splitW int                     // `split`: explicit minimap column width override (0 = use mm_width default)
+	// ── progress bar (hand-rolled with lipgloss -- bubbles/progress pulls in harmonica, absent from the offline cache) ──
+	progShow bool
+	progPct float64
+	progLabel string
+	progColor string
+	// ── persistent + reverse-searchable history ──
+	histFile *os.File              // append-on-submit; loaded at startup from CMK_REPL_HISTFILE
+	searching bool                 // ctrl-r reverse-incremental-search sub-mode
+	searchQuery string
+	searchN int                    // which match (ctrl-r cycles older)
+	// ── follow-lock: when the user scrolls up, stop auto-pinning to the bottom ──
+	noFollow bool
+	enter string                   // `enter`/CMK_REPL_ENTER: a target auto-submitted once after first render
+	// ── toasts: transient notifications overlaid top-right ──
+	toasts []toastT
+	// ── prelude (piped stdin): closed after the first render, so stdin is consumed only AFTER stdout flushes ──
+	preludeReady chan struct{}
+	// ── vertical-layout tracking: when a relayout moves the input/modeline rows (a chrome toggle or a
+	// resize), the diff renderer must fully repaint, else the vacated row (e.g. the static In[N] prompt)
+	// ghosts under strict emulators (vhs/ttyd) that never re-touch an unchanged line ──
+	layoutSig int; haveLayout, needClear bool }
+// spinningNow: the spinner is shown ONLY when the main buffer is actively STREAMING (an eval command is in
+// flight, or print output arrived recently) OR the user is TYPING.  An idle print region (e.g. waiting in
+// io.wait) stops streaming, so the spinner stops -- it tracks activity, not mere process liveness.
+func (m model) spinningNow() bool {
+	if strings.TrimSpace(m.ta.Value()) != "" { return true }                         // user typing
+	if m.busy { return true }                                                        // eval command in flight
+	return m.printCmd != nil && !m.done && time.Since(m.lastOut) < time.Second }      // main buffer streaming
+// spinKick: (re)start the spinner tick if it should be running but isn't (the tick self-perpetuates via
+// TickMsg while spinningNow, so it only needs kicking when activity resumes after going idle).
+func (m *model) spinKick() tea.Cmd { if !m.spinning && m.spinningNow() { m.spinning = true; return m.spin.Tick }; return nil }
+// applySpinner: live spinner reconfiguration from metadata (graceful -- unknown kind / empty color keep the
+// current value, which defaults to newSpin's env/dot+214 when no `spinner` metadata is sent).
+func (m *model) applySpinner(kind, color string) {
+	if k, ok := spinnerKinds[kind]; ok { m.spin.Spinner = k }
+	if color != "" { m.spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(color)) } }
+var inStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+var outStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Bold(true)
+// mode-line styles: build the WHOLE bar from per-segment bg-styled pieces (each Render self-resets,
+// so an outer Width/Background wrapper would be punched out by the inner resets -- there is no wrapper).
+var barBG = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+var barDim = barBG.Foreground(lipgloss.Color("245"))     // dim CLI / chain context / K-E / diag
+var barIP = barBG.Foreground(lipgloss.Color("159")).Bold(true)  // the bold instruction pointer
+var barHint = barBG.Foreground(lipgloss.Color("159"))    // right-zone usage hints + golang-state
+var barErr = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Faint(true)  // STREAM only, never the bar
+var barOK = barBG.Foreground(lipgloss.Color("42")).Bold(true)    // idle status indicator: last rc == 0 (green)
+var barBad = barBG.Foreground(lipgloss.Color("203")).Bold(true)  // idle status indicator: last rc != 0 (red)
+var mmStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Faint(true)  // the minimap pane: dim/faint
+// newSpin: the busy spinner, configurable via env with graceful defaults --
+//   CMK_REPL_SPINNER       kind: dot|line|minidot|jump|pulse|points|globe|moon|monkey|meter|hamburger|ellipsis (default dot)
+//   CMK_REPL_SPINNER_COLOR lipgloss color (default 214)
+var spinnerKinds = map[string]spinner.Spinner{"dot": spinner.Dot, "line": spinner.Line, "minidot": spinner.MiniDot, "jump": spinner.Jump, "pulse": spinner.Pulse, "points": spinner.Points, "globe": spinner.Globe, "moon": spinner.Moon, "monkey": spinner.Monkey, "meter": spinner.Meter, "hamburger": spinner.Hamburger, "ellipsis": spinner.Ellipsis}
+func newSpin() spinner.Model {
+	s := spinner.New()
+	if sp, ok := spinnerKinds[os.Getenv("CMK_REPL_SPINNER")]; ok { s.Spinner = sp } else { s.Spinner = spinner.Dot }
+	color := os.Getenv("CMK_REPL_SPINNER_COLOR"); if color == "" { color = "214" }
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+	return s }
+func inLabel(n int) string { return fmt.Sprintf("In[%d]: ", n) }
+func outLabel(n int) string { return fmt.Sprintf("Out[%d]: ", n) }
+func setPrompt(ta *textarea.Model, n int) {
+	raw := inLabel(n); w := len(raw); col := inStyle.Render(raw)
+	ta.SetPromptFunc(w, func(i int) string { if i == 0 { return col }; return strings.Repeat(" ", w) }) }
+func newTA(w int) textarea.Model {
+	ta := textarea.New()
+	ta.Placeholder = "type a target name -- enter submits it to the eval target (alt+enter or ctrl+j for a newline)"
+	setPrompt(&ta, 1)
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 0
+	ta.SetWidth(w); ta.SetHeight(3)
+	ta.KeyMap.InsertNewline.SetKeys("alt+enter", "ctrl+j")
+	ta.KeyMap.WordBackward.SetKeys("alt+left", "alt+b", "ctrl+left")
+	ta.KeyMap.WordForward.SetKeys("alt+right", "alt+f", "ctrl+right")
+	ta.KeyMap.LineStart.SetKeys("home", "ctrl+a")
+	ta.KeyMap.LineEnd.SetKeys("end", "ctrl+e")
+	ta.Focus()
+	return ta }
+func readPty(f *os.File) tea.Cmd {
+	return func() tea.Msg {
+		b := make([]byte, 8192)
+		n, err := f.Read(b)
+		if n > 0 { return chunkMsg(b[:n]) }
+		_ = err
+		return doneMsg{} } }
+func readEval(f *os.File) tea.Cmd {
+	return func() tea.Msg {
+		b := make([]byte, 8192)
+		n, err := f.Read(b)
+		if n > 0 { return evalMsg(b[:n]) }
+		_ = err
+		return evalDoneMsg{} } }
+func readMode(sc *bufio.Scanner) tea.Cmd {
+	return func() tea.Msg { if sc.Scan() { return modeMsg(sc.Text()) }; return modeDoneMsg{} } }
+func readMinimap(f *os.File) tea.Cmd {
+	return func() tea.Msg { b := make([]byte, 8192); n, err := f.Read(b); if n > 0 { return minimapMsg(b[:n]) }; _ = err; return minimapDoneMsg{} } }
+// completeCmd queries completions with the current buffer on stdin (CMK_COMPLETE_QUERY=1).  With a client
+// `complete` target it runs `<runner> <target>` (the client owns completion -- any language); otherwise it
+// falls back to `<cmkBin> cmk cli complete` (the make default).  Either prints candidates one-per-line.
+func completeCmd(runner, target, bin string, env []string, line string) tea.Cmd {
+	return func() tea.Msg {
+		var c *exec.Cmd
+		if target != "" { c = exec.Command(runner, target) } else { c = exec.Command(bin, "cmk", "cli", "complete") }
+		c.Env = append(append([]string{}, env...), "CMK_COMPLETE_QUERY=1")
+		c.Stdin = strings.NewReader(line)
+		out, _ := c.Output()
+		cands := []string{}
+		for _, s := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") { if s = strings.TrimSpace(s); s != "" { cands = append(cands, s) } }
+		return completeMsg{line: line, cands: cands} } }
+// lastWord splits a buffer into its head and the final whitespace-delimited token (the word being
+// completed); commonPrefix is the longest shared prefix of the candidates (for the partial fill).
+func lastWord(s string) (head, last string) { if i := strings.LastIndexAny(s, " \t"); i >= 0 { return s[:i+1], s[i+1:] }; return "", s }
+func commonPrefix(ss []string) string { if len(ss) == 0 { return "" }; p := ss[0]; for _, s := range ss[1:] { for !strings.HasPrefix(s, p) { p = p[:len(p)-1]; if p == "" { return "" } } }; return p }
+func (m model) Init() tea.Cmd {
+	cmds := []tea.Cmd{textarea.Blink}
+	if m.printPty != nil { cmds = append(cmds, readPty(m.printPty), m.spin.Tick) }
+	if m.evalOut != nil { cmds = append(cmds, readEval(m.evalOut)) }
+	if m.readScan != nil { cmds = append(cmds, readMode(m.readScan)) }
+	if m.minimapOut != nil { cmds = append(cmds, readMinimap(m.minimapOut)) }
+	if len(m.toasts) > 0 { cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return toastTickMsg{} })) }   // expire the startup toast
+	return tea.Batch(cmds...) }
+// syncVP pushes m.content into the viewport BOTTOM-ANCHORED: when the content is shorter than the
+// pane it is padded with blank lines ABOVE, so output grows upward from the bottom (not down from the
+// top) and the newest line is always pinned to the bottom edge.
+func (m *model) syncVP() {
+	if !m.ready { return }
+	c := m.content
+	if lines := strings.Count(c, "\n"); lines < m.vp.Height { c = strings.Repeat("\n", m.vp.Height-lines) + c }
+	m.vp.SetContent(c); if !m.noFollow { m.vp.GotoBottom() } }   // follow-lock: stay put when the user scrolled up
+func (m *model) appendStream(s string) {
+	m.content += s
+	if n := len(m.content); n > 131072 { c := m.content[n-131072:]; if i := strings.IndexByte(c, '\n'); i >= 0 { c = c[i+1:] }; m.content = c }
+	m.syncVP() }
+func (m *model) histPrev() {
+	if m.histIdx > 0 {
+		if m.histIdx == len(m.history) { m.histStash = m.ta.Value() }
+		m.histIdx--; m.ta.SetValue(m.history[m.histIdx]); m.ta.CursorEnd() } }
+func (m *model) histNext() {
+	if m.histIdx < len(m.history) {
+		m.histIdx++
+		if m.histIdx == len(m.history) { m.ta.SetValue(m.histStash) } else { m.ta.SetValue(m.history[m.histIdx]) }
+		m.ta.CursorEnd() } }
+// submit: run a line as a prompt submission -- echo an In[N] cell, write it to the eval, advance the prompt,
+// record history.  Shared by the enter key and the stdin PRELUDE (piped lines injected as if typed).
+func (m *model) submit(v string) {
+	if v == "" { return }
+	m.appendStream(inStyle.Render(inLabel(m.inN)) + v + "\n")
+	if m.evalIn != nil { io.WriteString(m.evalIn, v+"\n"); m.busy = true }
+	m.emit(map[string]any{"ev": "submit", "text": v, "in": m.inN})
+	m.outN = m.inN; m.inN++; m.applyPrompt()
+	m.history = append(m.history, v)
+	if m.histFile != nil { io.WriteString(m.histFile, strings.ReplaceAll(v, "\n", " ")+"\n") }
+	m.histIdx = len(m.history) }
+// isTTY: is this file a terminal (char device)?  Used to decide PRELUDE mode (piped stdin -> /dev/tty keys).
+func isTTY(f *os.File) bool { fi, err := f.Stat(); return err == nil && fi.Mode()&os.ModeCharDevice != 0 }
+// feedPrelude: read piped stdin line-by-line and inject each as a prompt submission.  Waits for `ready`
+// (closed after the FIRST render) before consuming stdin, so the startup/interpreter logging flushes to the
+// display BEFORE the piped input lands -- i.e. flush stdout, THEN flush stdin.
+func feedPrelude(p *tea.Program, r io.Reader, ready <-chan struct{}) {
+	if ready != nil { <-ready }
+	sc := bufio.NewScanner(r); sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() { p.Send(preludeMsg(sc.Text())) } }
+// show: tri-state visibility -- a nil pointer means VISIBLE (the default), so a client that sends no
+// chrome metadata gets the unchanged 3-region layout.
+func show(p *bool) bool { return p == nil || *p }
+// emit: write one UI event as a JSON line to the events child (NON-BLOCKING -- dropped if the buffer is full,
+// so a slow/absent client can never stall the UI loop).  No-op when no events region is wired.
+func (m *model) emit(ev map[string]any) {
+	if m.eventsCh == nil { return }
+	b, err := json.Marshal(ev); if err != nil { return }
+	select { case m.eventsCh <- append(b, '\n'): default: } }
+// relayout: recompute the viewport size from the CURRENT chrome flags (input/modeline/panel/progress).  Called
+// on resize AND after metadata that toggles chrome, so hiding a region reclaims its rows (and showing it gives
+// them back).  vp width stays full -- minimaps overlay as an inset.
+func (m *model) relayout() {
+	if !m.ready { return }
+	segH, nSeg := 0, 0
+	if show(m.showInput) { segH += 3; nSeg++ }      // textarea is 3 rows
+	if m.progShow { segH += 1; nSeg++ }             // progress bar is 1 row
+	if show(m.showModeline) { segH += 1; nSeg++ }   // modeline is 1 row
+	rules := nSeg; if !show(m.showPanel) { rules = nSeg - 1 }; if rules < 0 { rules = 0 }   // a rule sits between adjacent sections
+	vh := m.h - segH - rules; if vh < 1 { vh = 1 }
+	sig := vh<<8 | segH   // the vertical layout signature (panel height + chrome rows)
+	if m.haveLayout && sig != m.layoutSig { m.needClear = true }   // rows moved -> force a full repaint (no ghosts)
+	m.layoutSig, m.haveLayout = sig, true
+	vpW := m.desiredVPW()
+	m.vp.Width = vpW; m.vp.Height = vh
+	m.ta.SetWidth(m.w)
+	if m.printPty != nil { _ = pty.Setsize(m.printPty, &pty.Winsize{Rows: uint16(vh), Cols: uint16(vpW)}) }
+	m.syncVP() }
+// clearCmd drains a pending needClear (set by relayout when the vertical layout moved) into a full-repaint
+// command, so a row vacated by a chrome toggle / resize can't ghost under a diff-only renderer + strict emulator.
+func (m *model) clearCmd() tea.Cmd { if m.needClear { m.needClear = false; return tea.ClearScreen }; return nil }
+// applyPrompt: set the input prompt, honoring a metadata `prompt` override; else the notebook In[N]: label.
+func (m *model) applyPrompt() {
+	if m.customPrompt != "" {
+		raw := m.customPrompt; w := lipgloss.Width(raw) + 1; col := inStyle.Render(raw) + " "
+		m.ta.SetPromptFunc(w, func(i int) string { if i == 0 { return col }; return strings.Repeat(" ", w) })
+	} else { setPrompt(&m.ta, m.inN) } }
+// reverse-search (ctrl-r): searchMatch returns the searchN-th history entry (from newest) containing the query.
+func (m model) searchMatch() string {
+	if m.searchQuery == "" { if len(m.history) > 0 { return m.history[len(m.history)-1] }; return "" }
+	skip := m.searchN
+	for i := len(m.history) - 1; i >= 0; i-- {
+		if strings.Contains(m.history[i], m.searchQuery) { if skip == 0 { return m.history[i] }; skip-- } }
+	return "" }
+func (m model) searchView() string {
+	return inStyle.Render("(reverse-i-search)`"+m.searchQuery+"': ") + m.searchMatch() }
+func loadHistory(path string) []string {
+	b, err := os.ReadFile(path); if err != nil { return nil }
+	var h []string
+	for _, ln := range strings.Split(string(b), "\n") { if ln != "" { h = append(h, ln) } }
+	return h }
+// toast styling + a top-right overlay (one toast per top row), ANSI-aware like overlayInset.
+func toastStyle(level string) lipgloss.Style {
+	bg := "238"; switch level { case "warn": bg = "94"; case "err": bg = "52" }
+	return lipgloss.NewStyle().Background(lipgloss.Color(bg)).Foreground(lipgloss.Color("231")).Bold(true) }
+func (m model) overlayToasts(base string) string {
+	if len(m.toasts) == 0 { return base }
+	bl := strings.Split(base, "\n")
+	for i, t := range m.toasts {
+		if i >= len(bl) { break }
+		box := toastStyle(t.level).Render(" " + t.text + " ")
+		bw := lipgloss.Width(box); left := m.w - bw; if left < 0 { left = 0 }
+		cut := lipgloss.NewStyle().MaxWidth(left).Render(bl[i]); if pad := left - lipgloss.Width(cut); pad > 0 { cut += strings.Repeat(" ", pad) }
+		bl[i] = cut + "\x1b[0m" + box }
+	return strings.Join(bl, "\n") }
+// progBar: a determinate bar drawn with lipgloss (no bubbles/progress -> no harmonica dep).  pct clamps to [0,1].
+func progBar(pct float64, width int, color string) string {
+	if width < 1 { width = 1 }
+	if pct < 0 { pct = 0 }; if pct > 1 { pct = 1 }
+	fill := int(pct*float64(width) + 0.5); if fill > width { fill = width }
+	c := color; if c == "" { c = "42" }
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Render(strings.Repeat("█", fill)) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("░", width-fill)) }
+// progView: the determinate progress bar row + optional label (label eats into the bar width).
+func (m model) progView() string {
+	w := m.w; lbl := ""
+	if m.progLabel != "" { lbl = barDim.Render(m.progLabel + " "); w -= lipgloss.Width(m.progLabel) + 1 }
+	return lbl + progBar(m.progPct, w, m.progColor) }
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if m.searching {   // ctrl-r reverse-incremental-search sub-mode intercepts keys first
+			switch msg.String() {
+			case "ctrl+r": m.searchN++; return m, nil                                   // cycle to an older match
+			case "esc", "ctrl+c": m.searching, m.searchN, m.searchQuery = false, 0, ""; return m, nil
+			case "enter": if mt := m.searchMatch(); mt != "" { m.ta.SetValue(mt); m.ta.CursorEnd() }; m.searching, m.searchN, m.searchQuery = false, 0, ""; return m, nil
+			case "backspace": if m.searchQuery != "" { m.searchQuery = m.searchQuery[:len(m.searchQuery)-1] }; m.searchN = 0; return m, nil
+			default:
+				if len(msg.Runes) > 0 { m.searchQuery += string(msg.Runes); m.searchN = 0; return m, nil }
+				if mt := m.searchMatch(); mt != "" { m.ta.SetValue(mt); m.ta.CursorEnd() }   // any other key accepts + exits
+				m.searching, m.searchN, m.searchQuery = false, 0, "" } }
+		m.lastKey = msg.String()
+		switch msg.String() {
+		case "ctrl+d": return m, tea.Quit
+		case "ctrl+c":
+			if m.evalCmd != nil && m.evalCmd.Process != nil { _ = syscall.Kill(-m.evalCmd.Process.Pid, syscall.SIGINT) }
+			m.appendStream(inStyle.Render(inLabel(m.inN)) + m.ta.Value() + "  ^C  (ctrl-d to exit)\n")
+			m.ta.Reset(); m.histStash = ""; m.histIdx = len(m.history)
+			return m, nil
+		case "ctrl+l":
+			m.content = ""; m.syncVP()
+			return m, tea.ClearScreen
+		case "ctrl+r":
+			m.searching, m.searchQuery, m.searchN = true, "", 0; return m, nil
+		case "enter":
+			m.submit(strings.TrimSpace(m.ta.Value()))   // FULL line (multi-arg ops, custom kernels)
+			m.histStash = ""; m.ta.Reset()
+			if m.busy && !m.spinning { m.spinning = true; return m, m.spin.Tick }
+			return m, nil
+		case "up":
+			if m.ta.Line() == 0 { mp := &m; mp.histPrev(); return m, nil }
+		case "down":
+			if m.ta.Line() == m.ta.LineCount()-1 { mp := &m; mp.histNext(); return m, nil }
+		case "tab":
+			return m, completeCmd(m.runner, m.completeTarget, m.cmkBin, m.cmkEnv, m.ta.Value())  // never inserts a literal tab
+		case "pgup", "pgdown":
+			m.vp, cmd = m.vp.Update(msg)
+			m.noFollow = !m.vp.AtBottom()   // follow-lock: engage when scrolled up, release at the bottom
+			m.emit(map[string]any{"ev": "scroll", "pos": m.vp.ScrollPercent()})
+			return m, cmd }
+		if len(msg.Runes) == 0 { m.emit(map[string]any{"ev": "key", "key": msg.String()}) }   // UNBOUND special key -> client
+		m.ta, cmd = m.ta.Update(msg); return m, tea.Batch(cmd, m.spinKick())   // typing -> spinner active
+	case completeMsg:
+		// apply the completion only if the buffer is unchanged since Tab (no stale overwrite).
+		if m.ta.Value() != msg.line || len(msg.cands) == 0 { return m, nil }
+		head, last := lastWord(msg.line)
+		if len(msg.cands) == 1 { m.ta.SetValue(head + msg.cands[0]); m.ta.CursorEnd(); return m, nil }
+		if p := commonPrefix(msg.cands); len(p) > len(last) { m.ta.SetValue(head + p); m.ta.CursorEnd() } else { m.appendStream(strings.Join(msg.cands, "  ") + "\n") }  // no progress -> list options
+		return m, nil
+	case tea.WindowSizeMsg:
+		first := !m.ready
+		m.w, m.h = msg.Width, msg.Height
+		if m.minimapW > 0 && m.minimapW > m.w/2 { m.minimapW = max(8, m.w/2) }  // never let the minimap take more than half
+		if !m.ready { m.vp = viewport.New(m.desiredVPW(), max(1, m.h-6)); m.ready = true }
+		m.relayout()   // size the viewport from the current chrome flags (input/modeline/panel/progress)
+		m.emit(map[string]any{"ev": "resize", "w": m.w, "h": m.h})
+		if first && m.preludeReady != nil { return m, tea.Batch(m.clearCmd(), tea.Tick(3*time.Second, func(time.Time) tea.Msg { return preludeArmMsg{} })) }   // fallback: an eval that emits no startup marker still gets its prelude/enter
+		return m, m.clearCmd()
+	case preludeArmMsg:
+		if m.preludeReady != nil { close(m.preludeReady); m.preludeReady = nil }   // fallback timer fired -> let feedPrelude consume stdin now
+		if m.enter != "" { e := m.enter; m.enter = ""; return m, func() tea.Msg { return preludeMsg(e) } }   // start-by-default: submit the enter target (fallback path, no startup marker seen)
+		return m, nil
+	case chunkMsg:
+		m.appendStream(strings.ReplaceAll(string(msg), "\r\n", "\n"))
+		m.lastOut = time.Now()
+		return m, tea.Batch(readPty(m.printPty), m.spinKick())
+	case evalMsg:
+		m.evalBuf += strings.ReplaceAll(string(msg), "\r\n", "\n")
+		var enterCmd tea.Cmd   // start-by-default: fire the enter target AFTER the namespace/startup logging flushes (the first marker), so it doesn't interleave
+		for {
+			i := strings.IndexByte(m.evalBuf, '\n')
+			if i < 0 { break }
+			line := m.evalBuf[:i]; m.evalBuf = m.evalBuf[i+1:]
+			if i := strings.IndexByte(line, '\x1e'); i >= 0 {   // eval emits \x1e<rc> when a command returns
+				m.busy = false
+				if n, err := strconv.Atoi(strings.TrimSpace(line[i+1:])); err == nil { m.lastRc = n; m.haveRc = true }
+				if m.preludeReady != nil { close(m.preludeReady); m.preludeReady = nil   // first eval marker == region ready + its startup logging flushed -> NOW consume the piped stdin / fire the enter target
+					if m.enter != "" { e := m.enter; m.enter = ""; enterCmd = func() tea.Msg { return preludeMsg(e) } } }
+				line = line[:i]; if line == "" { continue } }
+			m.appendStream(outStyle.Render(outLabel(m.outN)) + line + "\n") }
+		m.lastOut = time.Now()
+		return m, tea.Batch(readEval(m.evalOut), m.spinKick(), enterCmd)
+	case evalDoneMsg:
+		if m.evalBuf != "" { m.appendStream(outStyle.Render(outLabel(m.outN)) + m.evalBuf + "\n"); m.evalBuf = "" }
+		return m, nil
+	case modeMsg:
+		meta := false
+		if s := string(msg); s != "" {
+			if m.applyMetaLine(s) {                   // UNIFIED metadata channel: route present fields to their sections
+				meta = true
+			} else if looksLikePlain(s) {
+				m.modeLhs = s; m.modeSegs = nil       // a custom read emitting plain text -> verbatim LHS
+			} else if !m.readErr {
+				m.readErr = true                       // garbage: keep the last-good bar, note it ONCE on the stream
+				m.appendStream(barErr.Render("[modeline: unparseable read line] " + oneLine(s)) + "\n") }
+		}
+		cmds := []tea.Cmd{readMode(m.readScan)}
+		if meta {
+			m.relayout()   // chrome metadata may have toggled input/modeline/panel/progress -> resize the viewport
+			if c := m.clearCmd(); c != nil { cmds = append(cmds, c) }   // layout moved -> full repaint so the old rows don't ghost
+			if m.winTitle != m.titleSent { m.titleSent = m.winTitle; cmds = append(cmds, tea.SetWindowTitle(m.winTitle)) }
+			if len(m.toasts) > 0 { cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return toastTickMsg{} })) } }
+		return m, tea.Batch(cmds...)
+	case modeDoneMsg: return m, nil
+	case toastTickMsg:
+		now := time.Now(); kept := m.toasts[:0]
+		for _, t := range m.toasts { if t.exp.After(now) { kept = append(kept, t) } }
+		m.toasts = kept
+		if len(m.toasts) > 0 { return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return toastTickMsg{} }) }
+		return m, nil
+	case preludeMsg:   // a piped stdin line -> submit it as if typed (keys still come live from /dev/tty)
+		m.submit(strings.TrimSpace(string(msg)))
+		if m.busy && !m.spinning { m.spinning = true; return m, m.spin.Tick }
+		return m, m.spinKick()
+	case tea.FocusMsg: m.emit(map[string]any{"ev": "focus", "on": true}); return m, nil
+	case tea.BlurMsg: m.emit(map[string]any{"ev": "focus", "on": false}); return m, nil
+	case minimapMsg:
+		m.minimapRaw += strings.ReplaceAll(string(msg), "\r\n", "\n")
+		if n := len(m.minimapRaw); n > 65536 { c := m.minimapRaw[n-65536:]; if i := strings.IndexByte(c, '\n'); i >= 0 { c = c[i+1:] }; m.minimapRaw = c }
+		m.scanMiddleChannel()
+		return m, readMinimap(m.minimapOut)
+	case minimapDoneMsg:
+		m.mm("middle").err = true   // contract: the minimap target LOOPS; if it exits, surface it in the pane
+		return m, nil
+	case spinner.TickMsg:
+		if m.spinningNow() { m.spin, cmd = m.spin.Update(msg); return m, cmd }
+		m.spinning = false; return m, nil
+	case doneMsg:
+		if !m.done {
+			m.done = true; m.rc = 0
+			if m.printCmd != nil {
+				if err := m.printCmd.Wait(); err != nil {
+					if ee, ok := err.(*exec.ExitError); ok { m.rc = ee.ExitCode() } else { m.rc = 1 }}}
+			m.lastRc = m.rc; m.haveRc = true }   // print region finished -> its rc drives the idle status indicator
+		if m.exitAfter { return m, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return tea.Quit() }) }  // print stream closed -> graceful shutdown
+		return m, nil }
+	m.ta, cmd = m.ta.Update(msg); return m, cmd }
+func (m model) rule() string { return lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(strings.Repeat("─", max(1, m.w))) }
+// vsep: a vertical rule h cells tall, separating the panel from the minimap.
+func (m model) vsep(h int) string { return lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(strings.TrimRight(strings.Repeat("│\n", h), "\n")) }
+// --- JSON tree view --------------------------------------------------------------------------------
+// A minimap feeder that prints one {label,active,children} JSON object PER LINE turns the pane into a live
+// lipgloss TREE (the latest object replaces the whole pane); any other (non-JSON) line keeps the scrolling-
+// text behaviour.  "active" frames are highlighted bright; their ancestors render on-path; the rest dim.
+// Almost a pure data->view mapping -- the feeder decides what's active, the Go just draws + path-highlights.
+// See demos/cmk/repl-tree.cmk.
+type tnode struct {
+	Label    string  `json:"label"`
+	Active   bool    `json:"active"`
+	Note     string  `json:"note"`  // dim annotation rendered after the label (e.g. a step number)
+	Title    string  `json:"title"` // (older; prefer mm_top) root-only TOP border label
+	Foot     string  `json:"foot"`  // (older; prefer mm_bottom) root-only BOTTOM border label
+	Children []tnode `json:"children"`
+}
+
+// mmState: one minimap's state.  mode is one of:
+//   "tree"   -- render mm_tree as a lipgloss tree
+//   "buffer" -- SCROLL: each mm_buffer update APPENDS (distinct consecutive lines) to a scrollback (a log)
+//   "mode"   -- OVERWRITE: each mm_buffer update REPLACES the pane with the latest (multi-line) snapshot
+// top/bottom are the box's pager-border labels; err marks a minimap whose target exited.
+type mmState struct {
+	mode   string
+	tree   *tnode
+	buffer string   // the rendered text (buffer: joined scrollback; mode: latest snapshot)
+	lines  []string // buffer-mode scrollback (accumulated, consecutive-dup-collapsed)
+	top    string
+	bottom string
+	err    bool
+}
+var mmOrder = []string{"top", "middle", "bottom"}
+const mmDefaultW = 36
+const mmScrollMax = 256   // buffer-mode scrollback cap (lines)
+// mm returns (creating) the state for a position.
+func (m *model) mm(pos string) *mmState {
+	if m.mms == nil { m.mms = map[string]*mmState{} }
+	if m.mms[pos] == nil { m.mms[pos] = &mmState{mode: "tree"} }
+	return m.mms[pos] }
+// mmActive: the positions to render, top->bottom.  With an mm_config, exactly its positions; else the solo
+// middle when it has any content (the backcompat path).
+func (m model) mmActive() []string {
+	out := []string{}
+	for _, p := range mmOrder {
+		if len(m.mmConfig) > 0 {
+			if _, ok := m.mmConfig[p]; ok { out = append(out, p) }
+		} else if s := m.mms[p]; s != nil && (s.tree != nil || s.buffer != "" || s.err) {
+			out = append(out, p) }
+	}
+	return out }
+// metaHandlers: the DISPATCH TABLE for the metadata schema -- key -> handler that routes the value to its UI
+// section.  Scalars are listed explicitly; the 4 minimap fields x {top,middle,bottom} (+ bare `mm_*` = middle)
+// are registered in init().  An incoming key with NO entry here is logged once + skipped (see applyMetaLine).
+//   mode_lhs, mode_rhs   -> modeline left/right text
+//   mm_width             -> shared width of all minimaps
+//   mm_config {pos:mode} -> which positions show + their mode (tree|buffer|mode; default tree)
+//                           buffer = SCROLL (append a log); mode = OVERWRITE (replace w/ latest snapshot)
+//   [<pos>_]mm_{tree|buffer|top|bottom} -> a minimap's content + border labels (bare = middle)
+type metaHandler func(m *model, v json.RawMessage)
+func jstr(v json.RawMessage) string { var x string; _ = json.Unmarshal(v, &x); return x }
+var metaHandlers = map[string]metaHandler{
+	"mode_lhs":  func(m *model, v json.RawMessage) { m.modeLhs = jstr(v) },
+	"mode_rhs":  func(m *model, v json.RawMessage) { m.modeRhs = jstr(v) },
+	"mode_segs": func(m *model, v json.RawMessage) { var ss []segment; if json.Unmarshal(v, &ss) == nil { m.modeSegs = ss } },
+	"mm_width":  func(m *model, v json.RawMessage) { var n int; if json.Unmarshal(v, &n) == nil && n > 0 { m.minimapW = n } },
+	"mm_config": func(m *model, v json.RawMessage) { _ = json.Unmarshal(v, &m.mmConfig) },
+	"spinner":   func(m *model, v json.RawMessage) { var sp struct{ Kind string `json:"kind"`; Color string `json:"color"` }; if json.Unmarshal(v, &sp) == nil { m.applySpinner(sp.Kind, sp.Color) } },
+	// ── chrome / layout (tri-state bools: present=set, absent=leave at the default "visible") ──
+	"prompt":   func(m *model, v json.RawMessage) { m.customPrompt = jstr(v); m.applyPrompt() },
+	"input":    func(m *model, v json.RawMessage) { var b bool; if json.Unmarshal(v, &b) == nil { m.showInput = &b } },
+	"modeline": func(m *model, v json.RawMessage) { var b bool; if json.Unmarshal(v, &b) == nil { m.showModeline = &b } },
+	"panel":    func(m *model, v json.RawMessage) { var b bool; if json.Unmarshal(v, &b) == nil { m.showPanel = &b } },
+	"split":    func(m *model, v json.RawMessage) { var n int; if json.Unmarshal(v, &n) == nil && n > 0 { m.minimapW = n; m.splitW = n } },
+	"title":    func(m *model, v json.RawMessage) { m.winTitle = jstr(v) },
+	"progress": func(m *model, v json.RawMessage) { var p struct{ Pct float64 `json:"pct"`; Label string `json:"label"`; Color string `json:"color"`; Show *bool `json:"show"` }; if json.Unmarshal(v, &p) == nil { m.progPct = p.Pct; m.progLabel = p.Label; m.progColor = p.Color; if p.Show != nil { m.progShow = *p.Show } else { m.progShow = true } } },
+	"toast":    func(m *model, v json.RawMessage) { var t struct{ Text string `json:"text"`; Level string `json:"level"`; TTL float64 `json:"ttl"` }; if json.Unmarshal(v, &t) == nil && t.Text != "" { ttl := t.TTL; if ttl <= 0 { ttl = 3 }; m.toasts = append(m.toasts, toastT{text: t.Text, level: t.Level, exp: time.Now().Add(time.Duration(ttl * float64(time.Second)))}) } },
+}
+func init() {   // register the [<pos>_]mm_<field> handlers so the table stays the single source of truth
+	for _, f := range []string{"tree", "buffer", "top", "bottom"} {
+		ff := f
+		metaHandlers["mm_"+f] = func(m *model, v json.RawMessage) { m.setMmField("middle", ff, v) }   // bare -> middle
+		for _, pos := range mmOrder {
+			pp := pos
+			metaHandlers[pos+"_mm_"+f] = func(m *model, v json.RawMessage) { m.setMmField(pp, ff, v) } } } }
+func (m *model) setMmField(pos, field string, v json.RawMessage) {
+	st := m.mm(pos)
+	switch field {
+	case "tree": var t tnode; if json.Unmarshal(v, &t) == nil { st.tree = &t }
+	case "buffer":
+		val := jstr(v)
+		if st.mode == "buffer" {   // SCROLL: append distinct consecutive lines to the scrollback log
+			for _, ln := range strings.Split(val, "\n") {
+				if n := len(st.lines); n > 0 && st.lines[n-1] == ln { continue }   // collapse repeats (same cmd held across ticks)
+				st.lines = append(st.lines, ln) }
+			if len(st.lines) > mmScrollMax { st.lines = st.lines[len(st.lines)-mmScrollMax:] }
+			st.buffer = strings.Join(st.lines, "\n")
+		} else {   // "mode" (and any non-tree default): OVERWRITE with the latest snapshot
+			st.buffer = val }
+	case "top": st.top = jstr(v)
+	case "bottom": st.bottom = jstr(v) } }
+func (m *model) logUnknownMeta(k string) {
+	if m.unknownMeta == nil { m.unknownMeta = map[string]bool{} }
+	if m.unknownMeta[k] { return }   // once per key -- the feeder re-emits every tick
+	m.unknownMeta[k] = true
+	m.appendStream(barErr.Render("[meta: no handler for '"+k+"' -- skipped]") + "\n") }
+// applyMetaLine: parse one metadata line; if ANY key is a known handler it's a meta line -> dispatch each key
+// (unknown keys logged + skipped) and return true; else (the structured modeline JSON / plain) return false so
+// the caller falls back -- which keeps a custom feeder's plain-text line (no handler keys) from being logged.
+func (m *model) applyMetaLine(s string) bool {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal([]byte(s), &raw) != nil || len(raw) == 0 { return false }
+	known := false
+	for k := range raw { if _, ok := metaHandlers[k]; ok { known = true; break } }
+	if !known { return false }
+	if cfg, ok := raw["mm_config"]; ok {   // modes FIRST -- setMmField's buffer-append vs overwrite depends on the mode
+		_ = json.Unmarshal(cfg, &m.mmConfig)
+		for p, mode := range m.mmConfig { if mode == "" { mode = "tree" }; m.mm(p).mode = mode } }
+	for k, v := range raw {
+		if k == "mm_config" { continue }   // already applied above
+		if h, ok := metaHandlers[k]; ok { h(m, v) } else { m.logUnknownMeta(k) } }
+	m.metaMode = true
+	if m.minimapW == 0 { m.minimapW = mmDefaultW }
+	return true }
+var (
+	treeActiveStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213")) // the active frame
+	treePathStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))            // ancestors of an active frame
+	treeDimStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("245")) // everything else
+)
+// hasActive: n or any descendant is flagged active -> n sits ON the active branch (so the whole path lights).
+func (n tnode) hasActive() bool { if n.Active { return true }; for _, c := range n.Children { if c.hasActive() { return true } }; return false }
+func treeLabel(n tnode) string {
+	var s string
+	switch { case n.Active: s = treeActiveStyle.Render(n.Label); case n.hasActive(): s = treePathStyle.Render(n.Label); default: s = treeDimStyle.Render(n.Label) }
+	if n.Note != "" { s += " " + treeDimStyle.Render(n.Note) }
+	return s }
+// borderRow: a box border line `<L>─ label ─...─<R>` (dashes/corners dim, label brighter); plain `<L>──<R>` if
+// no label.  w = inner width (between corners).  titledBox draws a manual border so it can carry pager labels.
+func borderRow(left, right string, w int, label string) string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	lab := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	if label == "" { return dim.Render(left + strings.Repeat("─", w) + right) }
+	t := " " + label + " "
+	if lipgloss.Width(t) > w { t = lipgloss.NewStyle().MaxWidth(w).Render(t) }
+	ld := (w - lipgloss.Width(t)) / 2; if ld < 0 { ld = 0 }   // CENTER the label between the dashes
+	rd := w - lipgloss.Width(t) - ld; if rd < 0 { rd = 0 }
+	return dim.Render(left+strings.Repeat("─", ld)) + lab.Render(t) + dim.Render(strings.Repeat("─", rd)+right) }
+// titledBox: a rounded box around `lines` (each already <= w wide), w/ optional TOP/BOTTOM border labels.
+func titledBox(lines []string, w int, title, foot string) string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	var b strings.Builder
+	b.WriteString(borderRow("╭", "╮", w, title) + "\n")
+	for _, ln := range lines {
+		pad := w - lipgloss.Width(ln); if pad < 0 { pad = 0 }
+		b.WriteString(dim.Render("│") + ln + strings.Repeat(" ", pad) + dim.Render("│") + "\n") }
+	b.WriteString(borderRow("╰", "╯", w, foot))
+	return b.String() }
+// buildTree: a leaf -> its (pre-styled) label string; a branch -> a *tree.Tree.  lipgloss renders a string
+// child verbatim, so baking the per-node ANSI style into the label is how the "active branch" gets highlighted.
+func buildTree(n tnode) any {
+	if len(n.Children) == 0 { return treeLabel(n) }
+	t := tree.Root(treeLabel(n))
+	for _, c := range n.Children { t.Child(buildTree(c)) }
+	return t }
+func renderTree(n tnode) string { switch r := buildTree(n).(type) { case *tree.Tree: return r.String(); case string: return r }; return "" }
+// scanMiddleChannel: the raw `minimap` CHANNEL feeds the MIDDLE minimap.  A complete {label,...} tree line
+// -> tree mode; any other non-empty output -> buffer (scroll) mode.  Partial/blank lines are ignored, so a
+// flickery feeder just holds the last good content.
+func (m *model) scanMiddleChannel() {
+	i := strings.LastIndexByte(m.minimapRaw, '\n'); if i < 0 { return }
+	last := m.minimapRaw[:i]; if j := strings.LastIndexByte(last, '\n'); j >= 0 { last = last[j+1:] }
+	last = strings.TrimSpace(last); if last == "" { return }
+	mid := m.mm("middle")
+	if m.minimapW == 0 { m.minimapW = mmDefaultW }
+	if strings.HasPrefix(last, "{") {
+		var n tnode
+		if err := json.Unmarshal([]byte(last), &n); err == nil && (n.Label != "" || len(n.Children) > 0) { mid.tree = &n; mid.mode = "tree"; return } }
+	mid.buffer = m.minimapRaw; mid.mode = "buffer"; mid.tree = nil }
+
+// desiredVPW: the panel keeps FULL width -- every minimap (tree or buffer) is now OVERLAID as an inset on the
+// right edge (paintMinimapColumn + overlayInset), not a reserved column.
+func (m model) desiredVPW() int { return m.w }
+
+// commonIndent: the fewest leading spaces among the non-blank lines (their shared left margin).
+func commonIndent(lines []string) int {
+	mn := -1
+	for _, ln := range lines { if strings.TrimSpace(ln) == "" { continue }; c := 0; for _, r := range ln { if r == ' ' { c++ } else { break } }; if mn < 0 || c < mn { mn = c } }
+	if mn < 0 { return 0 }; return mn }
+
+// collectActive: the styled labels of every Active node -- used to locate the active line in the rendered tree.
+func collectActive(n tnode, out *[]string) { if n.Active { *out = append(*out, treeActiveStyle.Render(n.Label)) }; for _, c := range n.Children { collectActive(c, out) } }
+
+// mmBox: render position `pos`'s minimap into a titled box of EXACTLY bandH rows (fills its band -> no jitter;
+// the band size derives only from the viewport height).  TREE mode renders mm_tree (clipped to a window
+// CENTERED on the active node when too tall, shared-indent trimmed); BUFFER mode tails the scroll text; both
+// DIM.  Border labels = the position's top/bottom.  "error with minimap" if the target exited.
+func (m model) mmBox(pos string, bandH int) string {
+	cw := m.minimapW; if cw < 1 { cw = 1 }; if bandH < 3 { bandH = 3 }
+	ch := bandH - 2   // content rows (minus the 2 border rows)
+	s := m.mm(pos)
+	pad := func(l []string) []string { if len(l) > ch { l = l[:ch] }; for len(l) < ch { l = append(l, "") }; return l }
+	if s.err { return titledBox(pad([]string{mmStyle.Render("error with minimap")}), cw, s.top, s.bottom) }
+	var lines []string
+	switch {
+	case s.mode == "tree":
+		if s.tree != nil {
+			lines = strings.Split(strings.TrimRight(renderTree(*s.tree), "\n"), "\n")
+			if len(lines) > ch {                               // clip to a ch-row window centered on the active node
+				var act []string; collectActive(*s.tree, &act); idx := 0
+				for i, ln := range lines { hit := false; for _, a := range act { if a != "" && strings.Contains(ln, a) { idx, hit = i, true; break } }; if hit { break } }
+				start := idx - ch/2; if start < 0 { start = 0 }; if start+ch > len(lines) { start = len(lines) - ch }
+				lines = lines[start : start+ch] }
+			if mn := commonIndent(lines); mn > 0 { for i := range lines { if len(lines[i]) >= mn { lines[i] = lines[i][mn:] } } }
+			for i := range lines { lines[i] = lipgloss.NewStyle().MaxWidth(cw).Render(lines[i]) } }
+	default:   // "buffer" (scrollback log) and "mode" (overwrite snapshot): a bottom-tailed text pane, 1em left pad
+		lines = strings.Split(strings.TrimRight(s.buffer, "\n"), "\n")
+		if len(lines) > ch { lines = lines[len(lines)-ch:] }   // tail (newest at bottom)
+		for i := range lines { lines[i] = mmStyle.MaxWidth(cw).Render(" " + lines[i]) }
+	}
+	return titledBox(pad(lines), cw, s.top, s.bottom) }
+// paintMinimapColumn: stack the active minimaps in equal vertical bands (top->bottom) into ONE RHS column of
+// vpH rows x (mm_width+2), for overlayInset to composite onto the panel's right edge.
+func (m model) paintMinimapColumn(vpH int, active []string) string {
+	cw := m.minimapW; if cw < 1 { cw = 1 }
+	col := make([]string, vpH); blank := strings.Repeat(" ", cw+2)
+	for i := range col { col[i] = blank }
+	n := len(active); if n == 0 { return strings.Join(col, "\n") }
+	for i, pos := range active {
+		r0 := i * vpH / n; r1 := (i + 1) * vpH / n; bandH := r1 - r0
+		if bandH < 1 { continue }
+		bl := strings.Split(m.mmBox(pos, bandH), "\n")
+		for j := 0; j < bandH && j < len(bl); j++ { if r0+j < vpH { col[r0+j] = bl[j] } } }
+	return strings.Join(col, "\n") }
+
+// overlayInset: composite `inset` onto the right edge of `base`, vertically CENTERED.  ANSI-aware: each
+// covered base row is truncated+padded to the gap width (a reset guards against style bleed) then the inset
+// row is appended.  `base` rows are full vp.Width wide (viewport pads them), so the result stays aligned.
+func (m model) overlayInset(base, inset string) string {
+	bl := strings.Split(base, "\n"); il := strings.Split(inset, "\n")
+	iw := lipgloss.Width(inset); ih := len(il)
+	leftW := m.vp.Width - iw; if leftW < 0 { leftW = 0 }
+	top := (len(bl) - ih) / 2; if top < 0 { top = 0 }
+	cut := lipgloss.NewStyle().MaxWidth(leftW)   // TRUNCATE only -- Width() would WRAP the row + desync the layout
+	for i := 0; i < ih; i++ {
+		r := top + i; if r < 0 || r >= len(bl) { continue }
+		left := cut.Render(bl[r]); if pad := leftW - lipgloss.Width(left); pad > 0 { left += strings.Repeat(" ", pad) }  // right-align the inset
+		bl[r] = left + "\x1b[0m" + il[i] }
+	return strings.Join(bl, "\n") }
+
+// sameFile: do two open files refer to the same underlying file (same device+inode)?  Used to avoid
+// double-writing signoff when /dev/tty and stderr are the same terminal.
+func sameFile(a, b *os.File) bool { ai, e1 := a.Stat(); bi, e2 := b.Stat(); return e1 == nil && e2 == nil && os.SameFile(ai, bi) }
+func looksLikePlain(s string) bool { return utf8.ValidString(s) && !strings.ContainsAny(s, "\x00\x1b") }
+func oneLine(s string) string {
+	if len(s) > 120 { s = s[:120] }
+	return strings.Map(func(r rune) rune { if r < 32 { return ' ' }; return r }, s) }
+// keepLeft/keepRight truncate a PLAIN string to n display cells (ANSI-aware via lipgloss.Width),
+// adding a single-cell ellipsis on the dropped side.  keepLeft drops the tail; keepRight the head.
+func keepLeft(s string, n int) string {
+	if n <= 0 { return "" }
+	if lipgloss.Width(s) <= n { return s }
+	out := ""; budget := n - 1
+	for _, c := range s { cs := string(c); if lipgloss.Width(out)+lipgloss.Width(cs) > budget { break }; out += cs }
+	return out + "…" }
+func keepRight(s string, n int) string {
+	if n <= 0 { return "" }
+	if lipgloss.Width(s) <= n { return s }
+	r := []rune(s); out := ""; budget := n - 1
+	for i := len(r) - 1; i >= 0; i-- { cs := string(r[i]); if lipgloss.Width(out)+lipgloss.Width(cs) > budget { break }; out = cs + out }
+	return "…" + out }
+func (m model) statusBar() string { return m.paintModeline(m.w) }   // ONE modeline path: segments (default) or mode_lhs (custom)
+// paintModeline: the META modeline -- mode_lhs (left, dim) + mode_rhs (right, hint), bg-filled to width w,
+// with the live status glyph (spinner / done) prefixed.  lhs is truncated first if the two don't fit.
+// statusSlot: a CONSTANT-WIDTH (spinner-glyph-width + 1) status cell so the modeline doesn't JITTER when the
+// spinner appears/leaves -- the live spinner while active, ✓ when the print finished, else blanks of the same
+// width.  (The slot width tracks the configured spinner, since e.g. globe/moon glyphs are 2 cells.)
+func (m model) statusSlot() string {
+	gw := lipgloss.Width(m.spin.View()); if gw < 1 { gw = 1 }
+	pad := barBG.Render(strings.Repeat(" ", gw))   // fills the slot to a CONSTANT gw+1 cells -> no jitter
+	switch {
+	case m.spinningNow(): return barBG.Render(m.spin.View()) + barBG.Render(" ")   // active: live spinner
+	case m.haveRc && m.lastRc == 0: return barOK.Render("✓") + pad                 // idle: last op succeeded (green)
+	case m.haveRc: return barBad.Render("✗") + pad                                 // idle: last op failed (red)
+	default: return barBG.Render(strings.Repeat(" ", gw+1)) } }                    // nothing has run yet
+// paintModeline: the ONE modeline composer -- [status][left][gap][right], bg-filled to width w, panic-safe.
+// LEFT is either the DEFAULT modeline's feeder-supplied prioritized segments (mode_segs, width-elided HERE
+// since the terminal width is unknown to the feeder) or a custom feeder's plain mode_lhs.  RIGHT is a STATIC
+// "^D quit" hint the WRAPPER owns -- ctrl-d is the built-in, non-optional quit, so the bar always documents it
+// (a feeder can neither supply nor suppress it); the feeder's optional mode_rhs is shown BEFORE it, and dropped
+// first when the bar is too narrow (the quit hint is kept).  statusSlot is constant-width -> no jitter.
+func (m model) paintModeline(w int) (out string) {
+	defer func() { if r := recover(); r != nil { out = barBG.Render(" tux.repl") } }()
+	if w < 1 { return "" }
+	status := m.statusSlot(); sw := lipgloss.Width(status)
+	avail := w - sw
+	if avail < 1 { return barBG.Render(strings.Repeat(" ", w)) }
+	right := "^D quit"                              // wrapper-owned, always shown
+	if m.modeRhs != "" { right = m.modeRhs + "  ^D quit" }
+	if lipgloss.Width(right) > avail { right = "^D quit"; if lipgloss.Width(right) > avail { right = keepRight(right, avail) } }   // narrow: drop mode_rhs, keep the quit hint
+	rw := lipgloss.Width(right)
+	budget := avail - rw - 1; if budget < 0 { budget = 0 }
+	var left string; var lw int
+	if len(m.modeSegs) > 0 {
+		left, lw = elideSegs(m.modeSegs, budget)
+	} else {
+		s := m.modeLhs
+		if s == "" && !m.metaMode { if m.readScan != nil { s = "(waiting for the read target...)" } else { s = "tux.repl" } }
+		s = keepLeft(s, budget); left, lw = barDim.Render(s), lipgloss.Width(s) }
+	gap := w - sw - lw - rw; if gap < 0 { gap = 0 }
+	return status + left + barBG.Render(strings.Repeat(" ", gap)) + barHint.Render(right) }
+// segment: one styled, prioritized piece of the DEFAULT modeline's left side.  The feeder builds these in jq,
+// so ALL the fingerprint formatting (diag / IP / chain / K-E) lives cmk-side, not in Go.  s = dim|ip|hint;
+// p = drop-priority (0 = never dropped, only trimmed; higher dropped first); k = trim side (R keeps the tail).
+type segment struct { T string `json:"t"`; S string `json:"s"`; P int `json:"p"`; K string `json:"k"` }
+func styleFor(s string) lipgloss.Style { switch s { case "ip": return barIP; case "hint": return barHint; default: return barDim } }
+// elideSegs fits segments into `budget` plain cells: drop the highest-priority segments until the rest fit,
+// then trim the survivors per keep-side.  The feeder bakes any separators into the text; Go just concatenates.
+func elideSegs(segs []segment, budget int) (string, int) {
+	if budget <= 0 || len(segs) == 0 { return "", 0 }
+	keep := make([]bool, len(segs)); for i := range segs { keep[i] = true }
+	sum := func() int { w := 0; for i, s := range segs { if keep[i] { w += lipgloss.Width(s.T) } }; return w }
+	for sum() > budget {
+		v, mp := -1, 0
+		for i, s := range segs { if keep[i] && s.P > mp { mp, v = s.P, i } }
+		if v < 0 { break }
+		keep[v] = false }
+	over := sum() - budget
+	var b strings.Builder; plain := 0
+	for i, s := range segs {
+		if !keep[i] { continue }
+		t := s.T
+		if over > 0 {
+			w := lipgloss.Width(t); cut := over; if cut > w-1 { cut = w - 1 }
+			if cut > 0 { if s.K == "R" { t = keepRight(t, w-cut) } else { t = keepLeft(t, w-cut) }; over -= cut } }
+		b.WriteString(styleFor(s.S).Render(t)); plain += lipgloss.Width(t) }
+	return b.String(), plain }
+func (m model) View() string {
+	if !m.ready { return "\n  initializing..." }
+	parts := []string{}
+	if show(m.showPanel) {   // the main panel (with minimap inset + toast overlay) -- hideable for chrome-free clients
+		top := m.vp.View()
+		if active := m.mmActive(); len(active) > 0 { top = m.overlayInset(top, m.paintMinimapColumn(m.vp.Height, active)) }
+		top = m.overlayToasts(top)
+		parts = append(parts, top) }
+	seg := func(s string) { if len(parts) > 0 { parts = append(parts, m.rule()) }; parts = append(parts, s) }
+	if show(m.showInput) {
+		if m.searching { seg(m.searchView() + "\n\n") } else { seg(m.ta.View()) } }   // search line keeps the input's 3-row height
+	if m.progShow { seg(m.progView()) }
+	if show(m.showModeline) { seg(m.statusBar()) }
+	return strings.Join(parts, "\n") }
+// signoff: on teardown, write a few last details to the controlling terminal's stderr -- the bootstrap
+// r/e/p(/minimap) targets, and how each subproc ended: "reaped" (we SIGKILLed it at teardown = the normal
+// case) vs "exited(n)" (it returned ON ITS OWN before teardown).  An early self-exit of a region meant to run
+// the whole session -- esp. the minimap, which must loop -- or any non-zero exit is flagged as abnormal.
+// stripANSI drops SGR escape sequences so the signoff's buffer-tails are plain, assertable text.
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !((s[j] >= '@' && s[j] <= '~')) { j++ }
+			if j < len(s) { j++ }
+			i = j
+			continue }
+		b.WriteByte(s[i]); i++ }
+	return b.String() }
+// tailLines returns up to the last n non-blank lines of s, ANSI-stripped -- the "recent part" of a buffer.
+func tailLines(s string, n int) []string {
+	out := []string{}
+	for _, l := range strings.Split(strings.ReplaceAll(stripANSI(s), "\r", ""), "\n") {
+		if strings.TrimSpace(l) != "" { out = append(out, l) } }
+	if len(out) > n { out = out[len(out)-n:] }
+	return out }
+// minimapsSnapshot: the recent state of every active RHS minimap, for the signoff screen dump.
+func minimapsSnapshot(m model) map[string]any {
+	out := map[string]any{}
+	for _, pos := range mmOrder {
+		s := m.mms[pos]
+		if s == nil { continue }
+		e := map[string]any{"mode": s.mode, "err": s.err}
+		if s.top != "" { e["top"] = stripANSI(s.top) }
+		if s.bottom != "" { e["bottom"] = stripANSI(s.bottom) }
+		if len(s.lines) > 0 {
+			t := make([]string, 0, len(s.lines))
+			for _, l := range s.lines { t = append(t, stripANSI(l)) }
+			if len(t) > 20 { t = t[len(t)-20:] }
+			e["tail"] = t
+		} else if s.buffer != "" { e["tail"] = tailLines(s.buffer, 20) }
+		if s.tree != nil { e["tree_label"] = s.tree.Label }
+		out[pos] = e }
+	if len(out) == 0 { return nil }
+	return out }
+func signoff(w io.Writer, runner, rT, eT, pT, mT string, m model) {
+	nz := func(s string) any { if s == "" { return nil }; return s }
+	var abnormal []string
+	sub := func(name string, c *exec.Cmd, early bool) map[string]any {
+		if c == nil { return map[string]any{"status": "absent"} }
+		ps := c.ProcessState
+		switch {
+		case ps == nil:
+			return map[string]any{"status": "unknown"}
+		case ps.Exited():   // returned on its own (Wait on an already-dead proc gives its real status, not our kill)
+			ab := early || ps.ExitCode() != 0
+			if ab { abnormal = append(abnormal, name) }
+			return map[string]any{"status": "exited", "code": ps.ExitCode(), "abnormal": ab}
+		default:            // signalled by our teardown kill -- the expected ending for a long-running region
+			return map[string]any{"status": "reaped"} } }
+	mErr := false; if s := m.mms["middle"]; s != nil { mErr = s.err }   // the (raw channel) middle minimap exited?
+	subprocs := map[string]any{
+		"read": sub("read", m.readCmd, false), "eval": sub("eval", m.evalCmd, false),
+		"print": sub("print", m.printCmd, false), "minimap": sub("minimap", m.minimapCmd, mErr)}
+	if abnormal == nil { abnormal = []string{} }
+	// screen: the recent state of every region's buffer -- lets a caller read WHAT the REPL showed from
+	// structured JSON instead of scraping the altscreen framebuffer.  `stdout_buffer` is the full (ANSI-stripped)
+	// panel text (print + eval output), the load-bearing field for the `... | jq .screen.stdout_buffer` roundtrip;
+	// `panel_tail` is its last lines for cheap eyeballing.
+	screen := map[string]any{
+		"stdout_buffer": stripANSI(m.content),
+		"panel_tail":    tailLines(m.content, 60),
+		"panel_bytes":   len(m.content),
+		"modeline":      map[string]any{"lhs": nz(stripANSI(m.modeLhs)), "rhs": nz(stripANSI(m.modeRhs)), "segs": len(m.modeSegs), "rendered": nz(strings.TrimRight(stripANSI(m.paintModeline(m.w)), " "))},
+		"counts":        map[string]any{"in": m.inN, "out": m.outN},
+		"last_rc":       m.lastRc,
+		"have_rc":       m.haveRc,
+		"meta_mode":     m.metaMode}
+	if mm := minimapsSnapshot(m); mm != nil { screen["minimaps"] = mm }
+	out := map[string]any{
+		"rc":        m.rc,
+		"bootstrap": map[string]any{"runner": nz(runner), "wrapper_bin": nz(os.Getenv("CMK_REPL_WRAPPER_BIN")), "read": nz(rT), "eval": nz(eT), "print": nz(pT), "minimap": nz(mT)},
+		"subprocs":  subprocs,
+		"abnormal":  abnormal,
+		"screen":    screen}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil { return }
+	fmt.Fprintf(w, "%s\n", b)
+	// also persist to a file when asked -- a clean capture channel for e2e (no altscreen byte-noise on the tty).
+	if p := os.Getenv("CMK_REPL_SIGNOFF"); p != "" { _ = os.WriteFile(p, append(append([]byte{}, b...), '\n'), 0o644) }
+}
+
+// runHeadless runs the eval region non-interactively over piped stdin (no bubbletea, no tty) and prints the
+// signoff JSON -- with the captured output in screen.stdout_buffer -- to STDOUT.  This is the pty-free roundtrip
+// channel:  echo flux.ok | <prog> | jq -r .screen.stdout_buffer  (each piped line is submitted as if typed).
+func runHeadless(rg regions, runner string, childEnv []string) int {
+	m := model{inN: 1, runner: runner}
+	rc := 0
+	if rg.Eval != "" {
+		c := exec.Command(runner, rg.Eval)
+		c.Env = append(append([]string{}, childEnv...), "CLICOLOR_FORCE=1", "FORCE_COLOR=1", "CMK_REPL_TARGETS=")
+		stdin, _ := c.StdinPipe()
+		var buf strings.Builder
+		c.Stdout = &buf; c.Stderr = &buf
+		if err := c.Start(); err == nil {
+			m.evalCmd = c
+			sc := bufio.NewScanner(os.Stdin); sc.Buffer(make([]byte, 1<<20), 1<<23)   // feed every piped line as a submission
+			for sc.Scan() { _, _ = io.WriteString(stdin, sc.Text()+"\n") }
+			_ = stdin.Close()
+			_ = c.Wait()
+			// strip the \x1e<rc> markers the kernel emits after each command; the LAST rc is the session rc.
+			var out strings.Builder
+			for _, line := range strings.Split(strings.ReplaceAll(buf.String(), "\r\n", "\n"), "\n") {
+				if i := strings.IndexByte(line, '\x1e'); i >= 0 {
+					if n, err := strconv.Atoi(strings.TrimSpace(line[i+1:])); err == nil { m.lastRc = n; m.haveRc = true; rc = n }
+					line = line[:i]; if line == "" { continue } }
+				out.WriteString(line + "\n") }
+			m.content = out.String(); m.outN = m.inN }
+	}
+	if rg.Read != "" { sampleRead(&m, runner, rg.Read, childEnv) }   // populate the model's meta fields for the signoff
+	m.w = 120; if c := os.Getenv("COLUMNS"); c != "" { if n, e := strconv.Atoi(c); e == nil && n > 0 { m.w = n } }   // a width so screen.modeline.rendered reflects the elide
+	m.rc = rc
+	signoff(os.Stdout, runner, rg.Read, rg.Eval, rg.Print, rg.Minimap, m)
+	return rc }
+
+// sampleRead grabs a snapshot of the read (metadata) channel and applies it through the SAME applyMetaLine the
+// TUI uses, so the headless sign-off's `screen` reflects the parsed model -- the config-JSON -> model mapping
+// layer becomes observable (and pytest-pinnable) without any rendering.  Bounded: stops at the first metadata
+// line (a feeder emits a complete object per line) or after CMK_REPL_READ_SAMPLE_MS (default 500) / EOF.
+func sampleRead(m *model, runner, target string, childEnv []string) {
+	c := exec.Command(runner, target); c.Env = childEnv
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ro, err := c.StdoutPipe()
+	if err != nil || c.Start() != nil { return }
+	dur := 500 * time.Millisecond
+	if ms := os.Getenv("CMK_REPL_READ_SAMPLE_MS"); ms != "" { if n, e := strconv.Atoi(ms); e == nil && n >= 0 { dur = time.Duration(n) * time.Millisecond } }
+	t := time.AfterFunc(dur, func() { if c.Process != nil { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) } })
+	sc := bufio.NewScanner(ro); sc.Buffer(make([]byte, 1<<20), 1<<23)
+	for sc.Scan() { if m.applyMetaLine(sc.Text()) { break } }   // first parsed metadata snapshot is enough
+	t.Stop()
+	if c.Process != nil { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	_ = c.Wait() }
+
+const helpText = `tux-repl-wrapper -- compose.mk's metadata-driven terminal REPL / TUI host.
+
+HOW A REGION BECOMES A COMMAND:
+  Each region is spawned with Go's exec.Command(runner, target) -- i.e. LITERALLY:
+      <runner> <target>
+  RUNNER is the executable being REPL'd (regions.runner, else $CMK_REPL_RUNNER -- normally the compiled
+  .cmk program or the makefile-runner).  TARGET is passed as its SINGLE argv: a plain make-goal name.
+  No shell is involved, and no extra args are appended.  Each region differs only in HOW its stdio is
+  wired (pty vs pipe, who reads/writes) -- see REGIONS.
+  This is NOT the docker entrypoint=/cmd= mechanism: those are 'docker.run.sh' kwargs used by the
+  dsl.golang CONTAINER BUILD (a separate layer); this wrapper never uses them.
+
+  Concrete (the debugger-example demo, runner = the compiled program):
+      print  ->  <runner> frame.demo       its stdout (a pty) streams into the panel
+      read   ->  <runner> frame.meta       its stdout lines drive the metadata channel
+      eval   ->  <runner> tux.repl.kernel   submitted lines go to its stdin; its stdout -> the panel
+
+REGIONS (all optional; each = '<runner> <target>', differing only in stdio wiring):
+  read      one line per tick -> the METADATA channel (JSON: modeline, minimaps, chrome, progress,
+            toasts, ...; or plain text -> the modeline).            default: tux.repl.modeline
+  eval      stdin sink: each submitted line is written to it; its stdout streams to the panel,
+            terminated by a 0x1e + return-code marker.              default: tux.repl.kernel
+  print     long-lived; its stdout (on a pty) streams into the scrolling panel.
+  minimap   long-lived; output -> a right-hand pane (a JSON tree, else a scrolling buffer).
+  events    the wrapper WRITES UI events (key/submit/resize/focus/scroll) as JSON to its stdin.
+  complete  tab-completion provider (stdin = buffer, stdout = candidates).  default: cmk cli complete
+
+CONFIG (preferred) -- CMK_REPL_REGIONS, a JSON object:
+  CMK_REPL_REGIONS='{"runner":"./prog","read":"my.read","eval":"my.eval","print":"my.print",
+                     "minimap":"","events":"","complete":"","exit_after":false}'
+  Empty/omitted keys disable that region.  New regions add KEYS -- arg positions never shift.
+
+POSITIONAL FALLBACK (used only when CMK_REPL_REGIONS is unset):
+  tux-repl-wrapper <runner> <read> <eval> <print> [exit_after] [minimap]
+
+ENV:
+  CMK_REPL_REGIONS      region map (JSON; supersedes the positional args)
+  CMK_REPL_RUNNER       runner used when regions.runner is empty
+  CMK_REPL_HISTFILE     input-history file (default: XDG_STATE_HOME/compose.mk/repl_history)
+  CMK_REPL_SPINNER      spinner kind (dot|line|minidot|jump|pulse|points|globe|moon|...)
+  CMK_REPL_SPINNER_COLOR  spinner color (a lipgloss color)
+  CMK_REPL_WRAPPER_BIN  path to this binary (echoed in the exit sign-off)
+  CMK_REPL_DEBUG        verbose teardown logging to the controlling terminal
+  CMK_REPL_SIGNOFF      path: also write the exit sign-off JSON to this file (a clean capture channel)
+  CMK_BIN               host for the default 'cmk cli complete'
+
+  When stdout is NOT a tty, the wrapper runs HEADLESS: it feeds piped stdin into the eval region, captures
+  the output, and prints the sign-off JSON (with screen.stdout_buffer = the captured output) to stdout.
+  This is the pty-free roundtrip:  echo <target> | <prog> | jq -r .screen.stdout_buffer
+
+KEYS: enter=submit  alt+enter/ctrl+j=newline  ctrl+r=reverse-history-search  up/down=history
+      tab=complete  pgup/pgdn=scroll  ctrl+l=clear  ctrl+c=interrupt eval  ctrl+d=quit
+
+On exit it writes a JSON SIGN-OFF: the bootstrap targets (incl. wrapper_bin), how each region ended, AND a
+screen object with the recent state of every buffer (stdout_buffer/panel_tail, modeline, minimaps, counts).
+It goes to the controlling terminal (and to CMK_REPL_SIGNOFF / stdout in the headless case).
+
+EXAMPLE (the usual path -- a compose.mk program with a repl pragma launches this automatically):
+  # cmk_pragma ::: { "repl": { "read":"my.read", "eval":"my.eval", "print":"my.print" } } :::
+  $ ./myprog.cmk
+`
+
+func main() {
+	for _, a := range os.Args[1:] {   // explicit help: the wrapper is normally exec'd with region args, but `--help` is useful directly
+		if a == "-h" || a == "--help" || a == "help" { fmt.Print(helpText); return } }
+	// REGION MAP (freeze-proof): a CMK_REPL_REGIONS JSON map supersedes the positional args.  Falls back to the
+	// positional contract <runner> <read> <eval> <print> [exit_after] [minimap] when the env is unset.
+	var rg regions
+	if env := os.Getenv("CMK_REPL_REGIONS"); env != "" {
+		if err := json.Unmarshal([]byte(env), &rg); err != nil { fmt.Fprintln(os.Stderr, "tux-repl: bad CMK_REPL_REGIONS:", err); os.Exit(2) }
+	} else {
+		if len(os.Args) < 5 { fmt.Fprintln(os.Stderr, "tux-repl-wrapper: no CMK_REPL_REGIONS and too few args.\n  usage: tux-repl-wrapper <runner> <read> <eval> <print> [exit_after] [minimap]   (each region runs as `<runner> <target>`)\n  preferred: set CMK_REPL_REGIONS=<json>   ;   run `tux-repl-wrapper --help` for the full model."); os.Exit(2) }
+		rg.Runner, rg.Read, rg.Eval, rg.Print = os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+		rg.ExitAfter = len(os.Args) > 5 && os.Args[5] != ""
+		if len(os.Args) > 6 { rg.Minimap = os.Args[6] } }
+	runner := rg.Runner; if runner == "" { runner = os.Getenv("CMK_REPL_RUNNER") }
+	childEnv := os.Environ()  // children inherit the exported __plugins__ registry, so a `require`-imported tux-repl plugin self-skips the re-import -> no staging race
+	cmkBin := os.Getenv("CMK_BIN"); if cmkBin == "" { cmkBin = runner }  // `cmk cli complete` host for Tab completion (falls back to the runner, which also carries the cmk target)
+	// HEADLESS: stdout not a tty (piped/redirected/test) -> no display to draw.  Run eval over piped stdin and
+	// emit the signoff JSON (screen.stdout_buffer = captured output) to stdout, instead of launching the TUI.
+	if !isTTY(os.Stdout) { os.Exit(runHeadless(rg, runner, childEnv)) }
+	enter := rg.Enter; if enter == "" { enter = os.Getenv("CMK_REPL_ENTER") }   // start-by-default target (auto-submitted after first render)
+	m := model{ta: newTA(80), inN: 1, spin: newSpin(),
+		done: rg.Print == "", spinning: rg.Print != "", exitAfter: rg.ExitAfter,
+		cmkBin: cmkBin, cmkEnv: childEnv, runner: runner, completeTarget: rg.Complete, enter: enter}  // no print stream -> nothing to wait for
+	// LAUNCH INFO: the altscreen hides any pre-launch (compile/build/preflight) output on the primary screen,
+	// so surface it IN the repl.  Two ways: (1) a banner seeding the panel (a scrollback record; mirrors the
+	// exit sign-off), and (2) a startup TOAST -- an overlay that does NOT scroll, so it stays visible for a few
+	// seconds even when a streaming `print` region floods the panel (the debugger case).
+	{
+		dash := func(s string) string { if s == "" { return "-" }; return s }
+		m.content = mmStyle.Render("tux.repl ▸ runner="+runner+"  wrapper="+os.Getenv("CMK_REPL_WRAPPER_BIN")) + "\n" +
+			mmStyle.Render("  regions: read="+dash(rg.Read)+" eval="+dash(rg.Eval)+" print="+dash(rg.Print)+" minimap="+dash(rg.Minimap)+" events="+dash(rg.Events)+" complete="+dash(rg.Complete)) + "\n"
+		m.toasts = []toastT{{text: "tux.repl ▸ read=" + dash(rg.Read) + " eval=" + dash(rg.Eval) + " print=" + dash(rg.Print), level: "info", exp: time.Now().Add(6 * time.Second)}}
+	}
+	// persistent history: load + open for append (default under XDG_STATE_HOME)
+	histPath := os.Getenv("CMK_REPL_HISTFILE")
+	if histPath == "" { st := os.Getenv("XDG_STATE_HOME"); if st == "" { st = os.Getenv("HOME") + "/.local/state" }; histPath = st + "/compose.mk/repl_history" }
+	m.history = loadHistory(histPath)
+	if i := strings.LastIndexByte(histPath, '/'); i > 0 { _ = os.MkdirAll(histPath[:i], 0o755) }
+	if f, err := os.OpenFile(histPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil { m.histFile = f }
+	m.histIdx = len(m.history)
+	if rg.Print != "" {
+		m.printCmd = exec.Command(runner, rg.Print); m.printCmd.Env = childEnv
+		pp, err := pty.Start(m.printCmd)
+		if err != nil { fmt.Fprintln(os.Stderr, "tux-repl: print pty:", err); os.Exit(1) }
+		m.printPty = pp; m.children = append(m.children, m.printCmd) }
+	if rg.Eval != "" {
+		m.evalCmd = exec.Command(runner, rg.Eval)
+		m.evalCmd.Env = append(append([]string{}, childEnv...), "CLICOLOR_FORCE=1", "FORCE_COLOR=1")  // keep the target's ANSI color (eval is a pipe, not a tty)
+		m.evalCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}  // own group, so ctrl-c can SIGINT the running dispatch
+		m.evalIn, _ = m.evalCmd.StdinPipe()
+		er, ew, _ := os.Pipe(); m.evalCmd.Stdout = ew; m.evalCmd.Stderr = ew
+		_ = m.evalCmd.Start(); _ = ew.Close()
+		m.evalOut = er; m.children = append(m.children, m.evalCmd) }
+	if rg.Read != "" {
+		readCmd := exec.Command(runner, rg.Read); readCmd.Env = childEnv
+		ro, _ := readCmd.StdoutPipe(); _ = readCmd.Start()
+		m.readScan = bufio.NewScanner(ro); m.readCmd = readCmd; m.children = append(m.children, readCmd) }
+	if rg.Minimap != "" {                            // OPTIONAL minimap: a looping target -> a buffered RHS pane
+		m.minimapCmd = exec.Command(runner, rg.Minimap); m.minimapCmd.Env = childEnv
+		m.minimapCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}  // own group, so teardown can reap the whole supervised loop
+		mr, mw, _ := os.Pipe(); m.minimapCmd.Stdout = mw   // ONLY stdout feeds the tree channel; stderr -> /dev/null (nil)
+		if dn, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil { m.minimapCmd.Stderr = dn }  // keep feeder logs/warnings/teardown noise out of the JSON tree channel (else a stray line flips it to buffer mode)
+		_ = m.minimapCmd.Start(); _ = mw.Close()
+		m.minimapOut = mr; m.minimapW = 36; m.children = append(m.children, m.minimapCmd) }
+	if rg.Events != "" {                             // OPTIONAL events region: wrapper WRITES UI events to its stdin
+		m.eventsCmd = exec.Command(runner, rg.Events); m.eventsCmd.Env = childEnv
+		m.eventsCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		ein, _ := m.eventsCmd.StdinPipe()
+		if dn, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil { m.eventsCmd.Stdout = dn; m.eventsCmd.Stderr = dn }  // its stdout would corrupt the TUI; it acts via shared state, not stdout
+		_ = m.eventsCmd.Start()
+		m.eventsCh = make(chan []byte, 256)
+		go func(w io.WriteCloser, ch chan []byte) { for b := range ch { if _, err := w.Write(b); err != nil { return } } }(ein, m.eventsCh)
+		m.children = append(m.children, m.eventsCmd) }
+	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithReportFocus()}
+	prelude := !isTTY(os.Stdin)   // piped stdin -> read keys from /dev/tty, inject the piped lines as submissions
+	var preludeReady chan struct{}
+	if prelude || m.enter != "" { preludeReady = make(chan struct{}); m.preludeReady = preludeReady }   // gate BOTH piped-stdin prelude and start-by-default enter on the startup-marker flush
+	if prelude { opts = append(opts, tea.WithInputTTY()) }
+	p := tea.NewProgram(m, opts...)
+	if prelude { go feedPrelude(p, os.Stdin, preludeReady) }   // launch the REPL AND stream stdin into the eval, as if typed (after the first render flushes)
+	fm, err := p.Run()
+	if err != nil { fmt.Fprintln(os.Stderr, "tux-repl:", err); os.Exit(1) }
+	final := fm.(model)
+	// signoff/debug go to the CONTROLLING TERMINAL: the `cmk run` launch chain redirects the wrapper's stderr
+	// (so the TUI stays clean), which would otherwise swallow them.  Write to /dev/tty AND stderr when they
+	// differ (so the JSON is both visible interactively AND capturable when stderr is piped to a file).
+	term := io.Writer(os.Stderr)
+	if tf, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		if sameFile(tf, os.Stderr) { _ = tf.Close() } else { term = io.MultiWriter(os.Stderr, tf) } }
+	if final.evalIn != nil { _ = final.evalIn.Close() }
+	if final.histFile != nil { _ = final.histFile.Close() }
+	dbg := os.Getenv("CMK_REPL_DEBUG") != ""
+	// reap: SIGKILL a region (its whole GROUP when it leads one) then Wait with a HARD TIMEOUT, so a stuck
+	// Wait (a grandchild holding a pipe/tty) can never hang teardown -> signoff always runs + the terminal is
+	// always restored.  print is Setsid (pty.Start) so it leads a group: group-kill it too, so its recipe's
+	// children (e.g. a goto trampoline's sub-makes) are reaped rather than orphaned onto the controlling tty.
+	reap := func(name string, c *exec.Cmd, group bool) {
+		if c == nil || c.Process == nil { return }
+		if group { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+		_ = c.Process.Kill()
+		done := make(chan struct{})
+		go func() { _ = c.Wait(); close(done) }()
+		select {
+		case <-done: if dbg { fmt.Fprintf(term, "[tux-repl] reaped %s\n", name) }
+		case <-time.After(2 * time.Second): if dbg { fmt.Fprintf(term, "[tux-repl] TIMEOUT reaping %s -- abandoned\n", name) } } }
+	reap("print", final.printCmd, true)
+	reap("eval", final.evalCmd, true)
+	reap("read", final.readCmd, false)
+	reap("minimap", final.minimapCmd, true)
+	reap("events", final.eventsCmd, true)
+	if final.printPty != nil { _ = final.printPty.Close() }
+	// tea's WithAltScreen restores the prior screen (INCLUDING the shell prompt) on Run() return.  Do NOT
+	// clear it afterwards -- the old `\x1b[2J\x1b[H` wiped that restored prompt, leaving a blank screen until
+	// the next keypress.  Just normalize: show the cursor, reset attributes, emit a CRLF so the shell's next
+	// prompt lands on a fresh line, and Sync to FLUSH before exit (os.Exit skips deferred/buffered flushes).
+	fmt.Fprint(os.Stdout, "\x1b[?25h\x1b[0m\r\n")
+	_ = os.Stdout.Sync()
+	signoff(term, runner, rg.Read, rg.Eval, rg.Print, rg.Minimap, final)   // last details to the controlling terminal
+	_ = os.Stderr.Sync()
+	os.Exit(final.rc) }
+endef

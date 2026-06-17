@@ -1,6 +1,9 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
 ## py.mk: Populates `py.*` namespace with python-related automation.
 ##
-## This covers especially things related to pip, tox, and twine.  
+## cmk_pragma ::: { "kind": "plugin" } :::
+##
+## This covers especially things related to pip, tox, and twine.
 ## See `pdoc.mk` for something more centric to python docs.
 ##
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -8,19 +11,22 @@
 # What will be installed by py.init 
 py.pkg_optional_extras?=dev,testing,publish
 py.src_root?=src
+# Package dir under the src-root (the one holding __init__.py).  Auto-detected;
+# override from the client (e.g. `py.pkg_name := mypkg`) for non-standard layouts.
+py.pkg_name ?= $(notdir $(patsubst %/__init__.py,%,$(firstword $(wildcard ${py.src_root}/*/__init__.py))))
 py.done.glyph=${no_ansi}${bold}${green}${GLYPH_CHECK}
 
 pip.install=pip install \
 	-q --disable-pip-version-check $${pip_args:-} \
 	$(shell [ "$${verbose:-0}" = "0" ] && echo "--quiet" || echo )
 
-pip.install.build:; $(call log.target, installing build module with pip); pip install build
-pip.install/%: mk.require.tool/pip
+pip.install.build:; $(call log, installing build module with pip); pip install build
+pip.install/%: assert.tool.required/pip
 	@# NB: Pass `verbose=1` to avoid pip --quiet
-	$(call log.target, verbose=$${verbose:-0} ${sep} ${dim}pip_args=$${pip_args:-})
-	$(call log.target.pad_bottom, ${pip.install} ${*} ${sep} ${cyan_flow_right} ) 
+	$(call log, verbose=$${verbose:-0} ${sep} ${dim}pip_args=$${pip_args:-})
+	$(call log.pad_bottom, ${pip.install} ${*} ${sep} ${cyan_flow_right} ) 
 	set -x && ${pip.install} ${*}
-	$(call log.target.pad_top, ${dim}${pip.install} ${*} ${sep} ${py.done.glyph})
+	$(call log.pad_top, ${dim}${pip.install} ${*} ${sep} ${py.done.glyph})
 py.pkg.extra.install/%:; pip_args=$${pip_args:--e} ${make} pip.install/.[${*}]
 	@#
 pip.install.many/%:
@@ -29,7 +35,7 @@ pip.install.many/%:
 py.pkg.extra.install.many/%:
 	@#
 	echo ${*} | ${stream.comma.to.nl} | ${make} flux.each/py.pkg.extra.install
-pip.release pypi.release: mk.require.tool/twine mk.assert/PYPI_USER,PYPI_TOKEN
+pip.release pypi.release: assert.tool.required/twine assert.env/PYPI_USER,PYPI_TOKEN
 	@#
 	PYPI_RELEASE=1 ${make} py.build \
 	&& twine upload \
@@ -47,37 +53,58 @@ py.stat:
 	@# Show details about the python version / platform
 	_version=`python --version | awk -F' ' '{print $$2}'` \
 	&& _bin=`which python` \
-	&& $(call log.target, $${_version} ${sep} $${_bin}) 
+	&& $(call log, $${_version} ${sep} $${_bin}) 
 
 py.build py.pkg.build: py.clean
 	@# Build python package in working directory
 	export version=`python setup.py --version` \
-	&& $(call log.target, extracted details ${sep} package=${py.pkg_name} version=$${version}) \
+	&& pkg="${py.pkg_name}" \
+	&& { [ -n "$${pkg}" ] || { $(call log, ${red}py.pkg_name unset and not auto-detectable under ${py.src_root}/); exit 34; }; } \
+	&& $(call log, extracted details ${sep} package=$${pkg} version=$${version}) \
 	&& (git tag $${version} \
-	|| ( $(call log.target, ${yellow}WARNING: Failed to git-tag with release-tag; normal if tag already exists )) \
+	|| ( $(call log, ${yellow}WARNING: Failed to git-tag with release-tag; normal if tag already exists )) \
 	&& printf "# WARNING: file is maintained by automation\n\n__version__ = \"$${version}\"\n\n" \
-	| tee src/${py.pkg_name}/_version.py \
+	| tee ${py.src_root}/$${pkg}/_version.py \
 	&& pip install build && set -x && python -m build
 
 py.clean: tox.clean
 	@# Clean working directory
-	$(call log.target.part1, cleaning eggs/build/dist)
-	$(call log.target.part2, ${GLYPH_CHECK})
-	rm -rf tmp.pypi* dist/* build/* 
-	rm -rf src/*.egg-info/
-	rm -rf .ruff_cache
-	$(call log.target.part1, cleaning pycs/cache)
-	$(call log.target.part2, ${GLYPH_CHECK})
+	$(call log.part1, cleaning eggs/build/dist)
+	$(call log.part2, ${GLYPH_CHECK})
+	rm -rf -- tmp.pypi* dist/* build/*
+	rm -rf -- src/*.egg-info/
+	rm -rf -- .ruff_cache
+	$(call log.part1, cleaning pycs/cache)
+	$(call log.part2, ${GLYPH_CHECK})
 	find . -name '*.tmp.*' -delete
 	find . -name '*.pyc' -delete
-	rm -rf .mypy_cache
+	rm -rf -- .mypy_cache
 	find . -name  __pycache__ -delete
 	rmdir build 2>/dev/null || true
-	$(call log.target, done cleaning python tmp files)
+	$(call log, done cleaning python tmp files)
 
 py.version py.pkg.version:; python setup.py --version
 	@# Answer version info for the current project.
 	@# Relies on (python setup.py --version)
+
+# Where the python project to release lives (the dir holding pyproject.toml/setup.py).
+# Override from the client project, e.g. `py.release.root := via/pip`.
+py.release.root ?= .
+
+gitops.release.py: assert.env/VERSION
+	@# Release step for the python package: a layout-agnostic, build-only step that defers to
+	@# python conventions (PEP 517 `python -m build`) and respects `VERSION` (the project's
+	@# packaging must read it -- see via/pip).  Auto-discovered + run by `gitops.release` (see
+	@# gitops.cmk).  No upload: publishing to PyPI is intentionally out of scope here; a project
+	@# that wants it can add its own `gitops.release.pip` alias onto `pypi.release`.
+	@#
+	@# Builds `${py.release.root}` (default: the working dir); skips cleanly if no python
+	@# project is found there.  USAGE:  VERSION=<x.y.z> make gitops.release.py
+	root="${py.release.root}" \
+	&& if [ ! -e "$${root}/pyproject.toml" ] && [ ! -e "$${root}/setup.py" ]; then $(call log, ${dim}skip ${sep} no python project at ${no_ansi}$${root}); exit 0; fi \
+	&& $(call log, ${dim}build ${sep} ${no_ansi}$${root}${dim} @ VERSION=${no_ansi}$${VERSION}) \
+	&& ( cd "$${root}" && export VERSION="$${VERSION}" && pip install -q build && python -m build ) \
+	&& $(call log, ${green}built ${sep} ${no_ansi}`ls -1 $${root}/dist/*$${VERSION}* 2>/dev/null | ${stream.nl.to.comma} || echo "$${root}/dist"`)
 
 ## Linters, formatters, checkers. (Typically combined with tox)
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -100,7 +127,7 @@ py.shed:
 	pushd ${py.src_root} 2>/dev/null \
 	; case $$? in \
 		0) shed;; \
-		*) $(call log.target,${yellow}warning ${sep} cannot change dir to ${py.src_root});; \
+		*) $(call log,${yellow}warning ${sep} cannot change dir to ${py.src_root});; \
 	esac
 
 py.autopep:
@@ -110,12 +137,12 @@ py.autopep:
 py.normalize.targets=py.isort py.autopep py.shed
 py.normalize: 
 	@# py.isort py.autopep py.shed }
-	$(call log.target, Normalizing py.src_root @ ${dim_cyan}${py.src_root})
+	$(call log, Normalizing py.src_root @ ${dim_cyan}${py.src_root})
 	${make} ${py.normalize.targets}
 
 
 py.static-analysis: 
-	$(call log.target, Analyzing py.src_root @ ${dim_cyan}${py.src_root})
+	$(call log, Analyzing py.src_root @ ${dim_cyan}${py.src_root})
 	${make} py.flake8
 
 ## Tox Support 
@@ -128,11 +155,11 @@ _tox.force=case $${force:-0} in \
 
 tox.clean:
 	@# Clean working directory
-	$(call log.target.part1,cleaning)
-	rm -rf .tox
+	$(call log.part1,cleaning)
+	rm -rf -- .tox
 	# find . -type d -name .tox | xargs -I% bash -x -c "rm -rf %"
-	$(call log.target.part2,${GLYPH_CHECK})
-tox/%: mk.require.tool/tox 
+	$(call log.part2,${GLYPH_CHECK})
+tox/%: assert.tool.required/tox 
 	@# Runs the named tox environment.
 	@#
 	@# USAGE: tox/<tox_env_name>
@@ -145,7 +172,7 @@ tox/%: mk.require.tool/tox
 		0) label_color="${dim}"; msg="${py.done.glyph}${no_ansi_dim} ok";; \
 		*) label_color="${red}"; msg="${red}failed!${no_ansi} exit=$${exit_code}";;  \
 	esac \
-	&& $(call log.target, env=${*} ${sep} $${msg}) \
+	&& $(call log, env=${*} ${sep} $${msg}) \
 	&& ${io.print.banner} \
 	&& exit $${exit_code}
 
@@ -156,7 +183,7 @@ tox.dispatch/%:
 	export target=$(strip $(shell echo ${*} | cut -d, -f2-)) \
 	&& _tox_env="$(strip $(shell echo ${*} | cut -d, -f1))" \
 	&& ${_tox.force}  \
-	&& $(call log.target, env=${ital}${bold}$${_tox_env} ${sep} $${tox_args:-} $${force}) \
+	&& $(call log, env=${ital}${bold}$${_tox_env} ${sep} $${tox_args:-} $${force}) \
 	&& set -x && tox $${force} -e $${_tox_env}
 
 # MACRO: tox.import
@@ -164,8 +191,9 @@ tox.dispatch/%:
 # USAGE: 
 #   $(call tox.import,env1 env2) =>
 #     env1: tox/env1
-#     env2: tox/env1
-#     env2.dispatch/%: tox.dispatch/env2,%
+#     env2: tox/env2
+#     tox.env1.dispatch/%: tox.dispatch/env1,%
+#     tox.env2.dispatch/%: tox.dispatch/env2,%
 tox.import=$(eval $(call _tox.import,${1}))
 define _tox.import
 $(eval __code_blocks__:=$(shell echo "${1}"))

@@ -1,20 +1,27 @@
-# pdoc.mk: Populates `pdocs.*` namespace with python documentation tools.
+#!/usr/bin/env -S ./compose.mk cmk compile
+# pdoc.mk: Provides the `pdoc/<module>` target (+ `pdoc.*` config) for python API docs.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
 #
 # This covers especially things related to markdown, mkdocs, pdoc, and jinja.
 # See `docs.mk` for something less about python packages or apis.
 #
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
-pdocs.args=--no-search -d markdown 
-pdocs.theme_dir=docs/theme/pdoc/
-pdocs.output_dir=docs/api
+pdoc.args=--no-search -d markdown
+pdoc.theme_dir=docs/theme/pdoc/
+pdoc.output_dir=docs/api
 
-pdoc/%: mk.require.tool/pdoc
+# Local fallback so `pdoc/%` works standalone (docs.mk defines this too; `?=` yields to it
+# when both plugins are loaded, regardless of include order).
+mkdocs.site_name ?= `cat mkdocs.yml | ${yq} -r .site_name`
+
+pdoc/%: assert.tool.required/pdoc
 	@# Runs `pdoc` for the given python module.
 	set -x \
-	&& ls ${pdocs.theme_dir} \
+	&& ls ${pdoc.theme_dir} \
 	&& export SITE_RELATIVE_URL=/${mkdocs.site_name} \
-	&& pdoc ${*} ${pdocs.args} \
-		-t ${pdocs.theme_dir} \
-		-o ${pdocs.output_dir} \
+	&& pdoc ${*} ${pdoc.args} \
+		-t ${pdoc.theme_dir} \
+		-o ${pdoc.output_dir} \
 		--logo "$${PDOCS_LOGO:-$${SITE_RELATIVE_URL}/img/logo.png}"

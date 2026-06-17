@@ -1,0 +1,418 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# virtual-machine.cmk: the control-stack + __vm__ CEK machine (a compose.mk module).
+#
+# cmk_pragma ::: { "kind": "module" } :::
+#
+# Docs: https://robot-wranglers.github.io/compose.mk/plugins/cmk-virtual-machine
+#
+## The goals after the current target on the command line are the CONTINUATION (what's left to do).
+## `__vm__` exposes it as a small CEK machine bound to the live make process: C = the current goal
+## (read from MAKE_CLI), E = an environment of bindings, K = a tree of saved {cont,env} frames.  It
+## extends the generic, source-agnostic `control_stack` module (the top/below/size/after filters + a
+## plain frame stack) by binding it to the supervisor: every transfer re-dispatches FLAT via the
+## supervisor trampoline (`mk.super.tramp`), so even an unbounded goto-loop runs at constant process depth.  Use
+## the operators inline in a recipe, where `${@}` is the current target -- e.g. `$(call vm.push, setup)`.
+##
+## The machine is both reflective (read its own state) and steerable (rewrite its own future):
+##
+## | operator | C/E/K | effect |
+## | --- | --- | --- |
+## | `${__vm__.peek}` / `.rest` / `.depth` | C read | inspect the pending goals (top / below-top / count) |
+## | `$(call vm.push, <g>)` | C xfer | run `<g>` next, then resume the continuation (subroutine, implicit return) |
+## | `$(call vm.drop)` | C xfer | skip the next pending goal |
+## | `$(call vm.goto, <g>)` | C xfer | tail-jump to `<g>`, keeping the goals after it |
+## | `$(call vm.replace, <gs>)` | C xfer | replace the whole continuation with `<gs>` |
+## | `$(call __vm__.getenv, <k>)` / `$(call __vm__.setenv, <k>, <v>)` | E | read / bind one env key |
+## | `${__vm__.current_frame[.environment]}` / `${__vm__.caller_frame[.environment]}` | E/K read | the live or caller frame (both composed into `__vm__.snapshot`) |
+## | `$(call vm.call, <g>)` / `$(call vm.return)` | K xfer | call saves `{goal,cont,env}` + jumps; return pops + resumes |
+## | `$(call vm.yield, <v>)` (= `vm.ctx.send`) | K xfer | generator yield: bind `<v>` as `yielded` in the caller env, then return |
+## | `${vm.ctx.receive}` | E receive | re-hydrate the context E into the shell at a goal's entry (auto-injected by the compiler; was `__vm__.env.load`) |
+## | `$(call vm.fork, "<a b>")` | K | record a branching frame and run the branches via `flux.pipeline` |
+## | `${make} __vm__.backtrace` | K read | print the control tree (K frames + live continuation) |
+## | `${__vm__}` (= `.snapshot` / `.snap`) | C/E/K read | the live machine is its snapshot: the whole self-model as one JSON `{chain,ip,k,e,lvl,levels}` -- the canonical dashboard source |
+## | `${__vm__.stack}` (= `.kontinuation`) | K read | the saved CEK frames (the kontinuation) |
+## | `${__vm__.ip}` (= `.instruction_pointer` / `.control`) | C read | the innermost goal (the instruction pointer), projected from `${__vm__}` |
+##
+## Opt-in reflective E via `vm.reflect` (`prefix=P` allowlist) or
+## `... exclude=MAKE CMK MFLAGS` (env minus a parse-time baseline) makes E mirror the live shell env --
+## `export <var>` is snapshotted at each transfer and re-hydrated by `vm.ctx.receive` (auto-injected by
+## the compiler into every recipe; or the explicit `@vm.ctx.hydrate` decorator
+## in plain make) for first-class `$var` reads.  Dormant (zero cost, nothing created) unless declared.
+##
+## Every transfer needs the supervisor (a `mk.interpret` / `cmk run` invocation): the supervisor's
+## trampoline loop re-dispatches each continuation FLAT.  One engine -- the legacy `mk.yield` path
+## (the old `vm_legacy` pragma / `CMK_VM_LEGACY`) was removed.
+##
+## IMPORT: `cmk.include.plugins(virtual-machine.cmk)` -- a `.mk` plugin (PURE MAKE with jq/awk the
+## cmk compiler would mangle, so included verbatim, never JIT-compiled).  Needs compose.mk first
+## (declare.stack/io.stack/mk.super.tramp/jq.run).  Worked examples: demos/call_stack.mk, demos/vm.mk,
+## demos/cmk/vm-steer.cmk (the live steer+dashboard REPL).
+
+# The generic control-stack algebra.  Bodies are pure make, imported FLAT (names written out in
+# full, so no namespacing pass is needed and the operators reference each other directly).
+define control_stack
+# Stdin = a continuation (one goal per line, top first).  Inspect filters:
+control_stack.top=head -1
+control_stack.below=tail -n +2
+control_stack.size=grep -c .
+# control_stack.after <marker>: keep the goals AFTER the marker's first occurrence (the
+# goals before it -- and the marker itself -- are dropped); empty if the marker is absent.
+control_stack.after=awk -v g='$(strip ${1})' 'f{print} $$0==g{f=1}'
+# Frames (K): a run-shared stack of JSON objects (io.stack).  control_stack stays GENERIC
+# -- it stores/retrieves frames as opaque JSON; consumers (e.g. __vm__) define the shape,
+# such as {goal,cont,env} for a CEK closure.  `frame.push` reads a JSON frame on stdin;
+# `frame.pop` emits+removes the top; `frame.peek` emits the top without removing; `frames`
+# is the whole stack (oldest first).  The stack can hold sub-stacks (a tree): a frame may
+# carry a `branches` array of frame-lists, which is how a fork is reflected.
+$(call declare.stack,CONTROL_STACK_FRAMES)
+control_stack.frames=$(call io.stack,${CONTROL_STACK_FRAMES})
+control_stack.frame.push=$(call io.stack.push,${CONTROL_STACK_FRAMES})
+control_stack.frame.pop=$(call io.stack.pop,${CONTROL_STACK_FRAMES})
+control_stack.frame.peek=( ${control_stack.frames} | ${jq.run} -c '.[-1] // {}' )
+endef
+
+# `__vm__`: the control stack realized over the live make process.  Imports the generic
+# `control_stack` (def FAST-PATH -- in-place eval) and reuses its filters.
+$(call import.module, def=control_stack flat=1 preprocs=stream.echo)
+
+# ░░ AMBIENT ISOLATION ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# _vm.ambient <key>: an env-prefix that runs a goal in a fresh, caller-keyed VM
+# namespace -- the substrate under fork / reflect-fork.  It re-keys the whole
+# run-id-suffixed leaf set onto <key>: K (CONTROL_STACK_FRAMES), the io-stack
+# (CMK_IO_STACK), and -- through MAKE_SUPER -- E (vmenv), the caller-provenance
+# (vmcaller) and the value channel (mk.super).  CMK_SUPERVISOR=0 gives it no
+# trampoline, so its own teardown never fires and its K/E/value files SURVIVE
+# for the caller to harvest after the join; the caller owns their teardown.
+# Positive isolation: the caller picks <key>, so it can seed the child K and
+# read it back.  The <key> arg is a loop-time value, so callers pass it as a
+# shell var (spliced verbatim into the env-prefix, which then leads a make run).
+_vm.ambient=MAKE_SUPER="$(strip ${1})" CONTROL_STACK_FRAMES=".tmp.CONTROL_STACK_FRAMES.$(strip ${1})" CMK_IO_STACK=".tmp.cmk.stack.$(strip ${1})" CMK_SUPERVISOR=0 CMK_INTERNAL=1
+
+# _vm.ambient.leaves: the run-id-keyed files _vm.ambient re-keys, one per VM
+# concern.  An ambient leaves this many tmpfiles because the machine keeps each
+# concern in its own leaf: the control stack (K), the environment (E), the
+# value/error channel, the io-stack, backrefs, nesting level, caller
+# provenance, and the four per-hop trace files.  Consolidating them into one
+# per-ambient container is a deeper change; for now they are swept as a set.
+_vm.ambient.leaves=CONTROL_STACK_FRAMES cmk.vmenv cmk.vmcaller cmk.vmlvl cmk.brf cmk.stack mk.super cmk.vmlast cmk.vmstep cmk.vmframe cmk.vmcmd
+
+# _vm.ambient.sweep <key-glob>: the destroy-companion of _vm.ambient.  Removes
+# every leaf for keys matching <key-glob> in one guarded pass, so callers stop
+# hand-rolling a family loop with mixed quoting.  A glob by nature (a caller
+# rarely keeps the exact keys), so the fixed leaf prefix is quoted and only the
+# caller-supplied key tail is left to expand.
+_vm.ambient.sweep=for _vl in ${_vm.ambient.leaves}; do rm -f -- ".tmp.$${_vl}."$(strip ${1}) 2>/dev/null || true; done
+
+# READ the continuation: the pending goals after the current target ${@}, one per line
+# (top first).  Drops make flags (everything before ${@}) plus the supervisor.enter /
+# flux.pre|post hook tokens, so it reads the same in a supervised top-level run and in
+# the recursive `${make}` a jump produces.
+__vm__.read=echo "$${MAKE_CLI}" | tr ' ' '\n' | grep -avE '^(flux\.(pre|post)/|mk\.super\.enter/|)$$' | awk -v t='${@}' 'f{print} $$0==t{f=1}'
+# Inspect (C read): compose the read with the generic filters.  Macros only -- use inline in a
+# recipe (e.g. `top="`${__vm__.peek}`"`); a CLI-inspectable target wraps them as needed (see the
+# `peek` target in demos/call_stack.mk).
+__vm__.peek=${__vm__.read} | ${control_stack.top}
+__vm__.rest=${__vm__.read} | ${control_stack.below} | ${stream.nl.to.space}
+__vm__.depth=${__vm__.read} | ${control_stack.size}
+
+# TRANSFER: recompute the goal list into a shell var `cont` (so commas/spaces don't trip
+# the `$(call ..)` arg split, and so the `[ cond ] && .. || $(call vm.goto,..)` idiom
+# stays safe -- when the `||` branch is not taken the guarded `cont=` is skipped, leaving
+# `cont` empty == "transfer to nothing" == terminate).  The hand-off is `vm.fire` -- the ISA's
+# adapter onto the single flat engine, the supervisor trampoline (`mk.super.tramp`).  It must
+# stay an indirection (not inlined into each verb): the multi-line trampoline define inlined into a
+# macro value gets mangled when the plugin is (re)compiled under nested mk.interpret; deferring it
+# through `${vm.fire}` keeps each verb a stable one-liner.  (The old process-nesting `mk.yield`
+# fallback + the `vm_legacy` pragma were removed -- one engine now.)
+vm.fire=$(call mk.super.tramp, $${cont})
+# C-TRANSFER ops (semantics in the block-doc table above).  ${__vm__.env.capture} is empty
+# unless a reflective env is declared (see below), in which case the tail transfer first
+# snapshots the live env subset into E.
+vm.push=${__vm__.env.capture}cont="$(strip ${1}) `${__vm__.read} | ${stream.nl.to.space}`" && ${vm.fire}
+vm.drop=${__vm__.env.capture}cont="`${__vm__.read} | ${control_stack.below} | ${stream.nl.to.space}`" && ${vm.fire}
+vm.goto=${__vm__.env.capture}cont="$(strip ${1}) `${__vm__.read} | $(call control_stack.after,${1}) | ${stream.nl.to.space}`" && ${vm.fire}
+vm.replace=${__vm__.env.capture}cont="${1}" && ${vm.fire}
+# ░░ ENVIRONMENT (E) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# The current scope's bindings: a run-shared JSON object.  Lazy (created on first setenv).
+# It threads through tail transfers (goto/push/..) untouched, and is captured into a K
+# frame by `call` / restored by `return`/`yield` -- a proper CEK environment, not a global.
+__vm__.env.file=$(call m5|,CMK_VMENV,.tmp.cmk.vmenv.$${MAKE_SUPER})
+# context provenance: each capture stamps the sending goal here, so a receiver can name who it got
+# context FROM (`${__caller__}` in the receive log).  Keyed by MAKE_SUPER like the env file.
+__vm__.env.caller.file=.tmp.cmk.vmcaller.$${MAKE_SUPER}
+__caller__=$$(cat ${__vm__.env.caller.file} 2>/dev/null)
+__vm__.env.read=$(if ${__vm__.env.declared},( ( [ -s ${__vm__.env.file} ] && cat ${__vm__.env.file} || echo '{}' ) ; ${__vm__.env.live} ) | ${jq.run.pipe} -s -c 'add',( [ -s ${__vm__.env.file} ] && cat ${__vm__.env.file} || echo '{}' ))
+__vm__.env.write=cat > ${__vm__.env.file}.tmp && mv -f ${__vm__.env.file}.tmp ${__vm__.env.file}
+# ░░ REFLECTIVE ENV (opt-in via `vm.reflect`) ░░░░░░░░░░░░░░░░░░░░░░░░
+# When a capture POLICY is declared, tail transfers (above) snapshot a subset of the live shell
+# env into E (so `export x=1` needs no setenv) and env reads merge it back -- E becomes a
+# reflection of the process environment.  Dormant otherwise: `${__vm__.env.declared}` is empty,
+# so env.read + the capture prefix collapse to their non-reflective forms (zero fast-path cost,
+# nothing is created).  Env is captured HOST-side and piped into jq (so jq may be dockerized;
+# hence ${jq.run.pipe}).
+__vm__.env.prefix?=
+__vm__.env.exclude?=
+__vm__.env.base?=
+__vm__.env.declared=$(or ${__vm__.env.prefix},${__vm__.env.exclude})
+__vm__.env.capture=$(if ${__vm__.env.declared},( ${__vm__.env.read} | ${__vm__.env.write} ) && printf '%s' "${@}" > ${__vm__.env.caller.file} && ,)
+# parse stdin KEY=value lines into one JSON object (split on the first `=`).
+__vm__.env.tojson=split("\n")|map(select(length>0))|map((index("=")) as $$i|{(.[:$$i]):.[$$i+1:]})|add // {}
+# the live program-env subset as JSON, per the declared policy.
+__vm__.env.live.prefix=env | grep "^${__vm__.env.prefix}" | ${jq.run.pipe} -R -s '${__vm__.env.tojson}'
+__vm__.env.live.exclude=env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | grep -vE "^(${__vm__.env.exclude})" | awk -F= -v base="${__vm__.env.base}" 'BEGIN{n=split(base,a," ");for(i=1;i<=n;i++)b[a[i]]} !($$1 in b)' | ${jq.run.pipe} -R -s '${__vm__.env.tojson}'
+__vm__.env.live=$(if ${__vm__.env.prefix},${__vm__.env.live.prefix},${__vm__.env.live.exclude})
+# vm.ctx.receive: re-hydrate the whole context E into the shell as `export k=v` lines (eval at a goal's
+# entry for first-class `$var` reads) -- the RECEIVE side of the context (the SEND side rides every
+# transfer automatically as ${__vm__.env.capture}).  The `[ -s file ]` guard makes it idempotent and
+# cheap: with no context file (a non-receiver goal, or empty E) it short-circuits to nothing -- no jq
+# spawn -- so it is safe + fast to inject everywhere.  (Was `__vm__.env.load`.)
+vm.ctx.receive=[ -s ${__vm__.env.file} ] \
+  && { __ctx="$$( ${__vm__.env.read} )" ; \
+       __names="$$( printf '%s' "$$__ctx" | ${jq.run} -r 'keys | join(" ")' 2>/dev/null )" ; \
+       __from="${__caller__}" ; \
+       [ -z "$$__names" ] || { $(call log.part1, ${yellow}receiving context from ${bold}$$__from${no_ansi}) ; $(call log.part2, ${dim}$$__names${no_ansi}) ; } ; \
+       printf '%s' "$$__ctx" | ${jq.run} -r 'to_entries[] | "export \(.key)=\(.value|@sh)"' ; } \
+  || true
+# `@vm.ctx.hydrate` (CMK decorator, PREFIX): eval-wrap `vm.ctx.receive` and prepend it to a goal's
+# recipe so it reads its bindings as first-class `$var`s.  A distinct name from the raw `vm.ctx.receive`
+# (which only EMITS the `export` lines) -- the decorator EVALS them.  The compiler auto-injects the
+# (guarded) hydrate into every recipe, so writing the decorator by hand is the legacy/manual form.
+vm.ctx.hydrate=eval "$$(${vm.ctx.receive})"
+
+# ░░ COMPILE STAGE (plugin-owned, pragma-gated) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# _cmk_blk_vm_hydrate: a PREPROC stage that lives here in the plugin (not in core).  It is a generic
+# lifted stage: `compiler_pre: ["vm_hydrate"]` makes core's `.lang.compiler.pipeline`
+# resolve the `vm_hydrate` stage by scanning CMK_PLUGINS_DIR for a `_cmk_blk_vm_hydrate` define (this one),
+# sed-lifting it, and running it over the SOURCE before the `decorators` stage -- via the general
+# `_cmk.stage.lift` mechanism, so core hard-codes NO VM concept and needs no plugin load at compile time.
+# It prepends a `@vm.ctx.hydrate`
+# decorator above every recipe-bearing target (skipping infra/private NAMES + prereq-only targets +
+# `define` bodies); the existing decorators + joinbody stages then lower it to the deferred
+# `$(call vm.ctx.hydrate)` (resolved at runtime when this plugin is imported).  So every recipe
+# auto-receives threaded context -- no hand-placed decorator -- with the logic owned entirely here.
+define _cmk_blk_vm_hydrate
+  BEGIN { depth = 0; have = 0
+    SKIP = "^([._]|__vm__[.]|mk[.]|flux[.]|io[.]|tux[.]|cmk[.]|polyglot[.])" }
+  function emit() { if (have) { print held; have = 0 } }
+  /^[ ]*define[ ]/ { emit(); depth++; print; next }
+  /^[ ]*endef[ ]*$/ { emit(); if (depth > 0) depth--; print; next }
+  depth > 0 { emit(); print; next }
+  have {
+    if ($0 ~ /^\t/) { print "@vm.ctx.hydrate"; print held; have = 0; print; next }
+    emit() }
+  /^[^\t#][^=]*:([^=]|$)/ {
+    name = $0; sub(/:.*/, "", name); sub(/^[ \t]+/, "", name); sub(/[ \t].*/, "", name)
+    if (name ~ SKIP) { print; next }
+    if ($0 ~ /;[ \t]*[^ \t;]/) { print "@vm.ctx.hydrate"; print; next }
+    held = $0; have = 1; next }
+  { print }
+  END { emit() }
+endef
+
+# vm.reflect: bring the reflective env in; pick the capture policy.
+
+# prefix=P allowlists a prefix; exclude=PFXS is env minus a parse-time
+
+# machinery baseline minus those prefixes.
+define _vm.reflect.exclude
+__vm__.env.exclude:=$(strip $(subst ${space},|,$(patsubst exclude=%,%,$(strip ${1}))))
+__vm__.env.base:=$(shell env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=.*//' | LC_ALL=C sort | tr '\n' ' ')
+endef
+vm.reflect=$(if $(findstring prefix=,${1}),$(eval __vm__.env.prefix:=$(strip $(patsubst prefix=%,%,$(strip ${1})))),$(eval $(call _vm.reflect.exclude,${1})))
+# CEK frame accessors (first-class, no magic var names) -- see the block-doc table above.
+# current_frame is the live state (goal+cont+env, always available); caller_frame is the top K frame.
+__vm__.current_frame.environment=${__vm__.env.read}
+__vm__.current_frame=${__vm__.env.read} | ${jq.run} -c --arg g "${@}" --arg c "`${__vm__.rest}`" '{goal:$$g,cont:$$c,env:.}'
+__vm__.caller_frame=${control_stack.frame.peek}
+__vm__.caller_frame.environment=${__vm__.caller_frame} | ${jq.run} -c '.env // {}'
+__vm__.getenv=${__vm__.env.read} | ${jq.run} -r --arg k "$(strip ${1})" '.[$$k] // empty'
+__vm__.setenv=${__vm__.env.read} | ${jq.run} -c --arg k "$(strip ${1})" --arg v "$(strip ${2})" '.[$$k]=$$v' | ${__vm__.env.write}
+# ░░ CALL / RETURN / YIELD / FORK (K frames; semantics in the block-doc table above) ░░
+# call: `cont=` is set first so the `[ c ] && .. || $(call vm.call,..)` idiom stays
+# guarded (a not-taken branch leaves cont empty == terminate).
+vm.call=cont="$(strip ${1})" && fr="$$( ${__vm__.env.read} | ${jq.run} -c --arg g "$(strip ${1})" --arg c "$$( ${__vm__.read} | ${stream.nl.to.space} )" '{goal:$$g,cont:$$c,env:.}' )" && printf '%s' "$$fr" | ${control_stack.frame.push} && ${vm.fire}
+vm.return=fr="$$( ${control_stack.frame.pop} )" && printf '%s' "$$fr" | ${jq.run} -c '.env // {}' | ${__vm__.env.write} && cont="$$( printf '%s' "$$fr" | ${jq.run} -r '.cont // empty' )" && ${vm.fire}
+# yield is the CEK generator transition -- distinct from the process-level mk.yield.  `vm.ctx.send` is
+# its send/receive-vocabulary alias (the SEND side, paired with `vm.ctx.receive` on the consumer).
+vm.yield=fr="$$( ${control_stack.frame.pop} )" && fr="$$( printf '%s' "$$fr" | ${jq.run} -c --arg v "$(strip ${1})" '.env.yielded=$$v' )" && printf '%s' "$$fr" | ${jq.run} -c '.env // {}' | ${__vm__.env.write} && cont="$$( printf '%s' "$$fr" | ${jq.run} -r '.cont // empty' )" && ${vm.fire}
+vm.ctx.send=${vm.yield}
+# fork: branches are SPACE-separated (one `$(call)` arg, since make splits call args on commas);
+# reflection only -- branch EXECUTION stays with flux.pipeline (not the trampoline), and a
+# backtrace inside a branch shows the fork frame with its sibling branches.
+vm.fork=br="$(strip ${1})" && fr="$$( printf '%s\n' $$br | ${jq.run} -R . | ${jq.run} -sc --arg g "$$br" '{goal:($$g|gsub(" ";",")),kind:"fork",branches:.}' )" && printf '%s' "$$fr" | ${control_stack.frame.push} && ( ${make} flux.pipeline/$$( echo $$br | tr ' ' ',' ) ; rc=$$? ; ${control_stack.frame.pop} >/dev/null 2>&1 ; exit $$rc )
+
+# ░░ CHOICE / BACKTRACK (Icon-style goal-directed evaluation) ░░░░░░░░░░░░░░░░░░
+# vm.choose is vm.fork made sequential and resumable: it records the untried
+# alternatives as a `kind:"choice"` frame (the same {cont,env,alts} shape the fork
+# frame uses, minus parallel exec) and runs only the first branch, keeping the rest on
+# K.  A later failure unwinds to this frame and takes the next alt -- classic DFS
+# backtracking.  `vm.choose "a b c"` = Icon alternation `a | b | c`.  Branches are
+# SPACE-separated (one `$(call)` arg).  The choice frame's `cont` is the continuation to
+# resume with each alternative; the env snapshot is the trail (restored on backtrack).  The `alts`
+# are a goal-list -- each is an anonymous lifted goal (its reify is its goal-string, so a stored alt
+# runs identically to the string); the frontier is thus a first-class value (see `__vm__.frontier`).
+vm.choose=${__vm__.env.capture}set -- $(strip ${1}) && _first="$$1" && shift && _alts="$$*" \
+	&& fr="$$( ${__vm__.env.read} | ${jq.run} -c --arg c "$$( ${__vm__.read} | ${stream.nl.to.space} )" --arg a "$$_alts" '{cont:$$c,env:.,kind:"choice",alts:($$a|split(" ")|map(select(length>0)))}' )" \
+	&& printf '%s' "$$fr" | ${control_stack.frame.push} \
+	&& cont="$$_first" && ${vm.fire}
+# __vm__.backtrack.next: pop K to the nearest choice-frame that still has an untried
+# alt, restore its env (the CEK trail-undo), consume one alt, push the frame back with
+# the remaining alts, and PRINT "alt <cont>" (the goals to run next).  Empty output ==
+# no choice frame left == search exhausted.  Non-choice frames above the choice point
+# are discarded (their branch failed, so their work is undone -- correct for DFS).  The
+# single source of truth, shared by the synchronous `vm.backtrack` verb and the
+# supervisor trampoline's failure safety-net (see `_mk.super.tramp`).
+__vm__.backtrack.next:; @${__vm__.backtrack.compute}
+__vm__.backtrack.compute=fr="$$( ${control_stack.frame.pop} )" ; last_cont="" ; \
+	while [ -n "$$fr" ] && [ "$$fr" != null ] ; do \
+	  k="`printf '%s' "$$fr" | ${jq.run} -r '.kind//""' 2>/dev/null`" ; \
+	  n="`printf '%s' "$$fr" | ${jq.run} -r '(.alts|length)//0' 2>/dev/null`" ; \
+	  [ "$$k" = choice ] && last_cont="`printf '%s' "$$fr" | ${jq.run} -r '.cont//""'`" ; \
+	  { [ "$$k" = choice ] && [ "$${n:-0}" -ge 1 ] ; } && break ; \
+	  fr="$$( ${control_stack.frame.pop} )" ; \
+	done ; \
+	{ [ -z "$$fr" ] || [ "$$fr" = null ] ; } && { printf '%s' "$$last_cont" ; exit 0 ; } ; \
+	printf '%s' "$$fr" | ${jq.run} -c '.env//{}' | ${__vm__.env.write} ; \
+	alt="`printf '%s' "$$fr" | ${jq.run} -r '.alts[0]'`" ; \
+	printf '%s' "$$fr" | ${jq.run} -c '.alts|=.[1:]' | ${control_stack.frame.push} ; \
+	printf '%s' "$$alt"
+# vm.backtrack: the synchronous unwind (Icon expression failure).  Ask for the next alt
+# and tail-transfer to it; empty == the whole search failed (log + fall through, so the
+# recipe ends and the trampoline terminates).  For unguarded failures the trampoline
+# catches it instead (the `total` path) -- this verb is the ergonomic, noise-free one.
+vm.backtrack=cont="$$( ${make} __vm__.backtrack.next 2>/dev/null )" ; \
+	case "$$cont" in *[![:space:]]*) ${vm.fire} ;; \
+	  *) $(call log, ${yellow}✗ search exhausted ${sep} ${dim}no more alternatives) ; true ;; esac
+
+# BACKTRACE: the control-stack tree (K frames, outermost first) + the live continuation.
+__vm__.backtrace:
+	@# Render the full control stack: saved frames (with kind/goal and any fork branches)
+	@# followed by this level's pending continuation.
+	@echo "== vm backtrace =="
+	@${control_stack.frames} | ${jq.run} -r 'to_entries[] | "  [\(.key)] \(.value.kind // "call") \(.value.goal)" + ((.value.branches // []) | if length>0 then " {"+join(",")+"}" else "" end)' 2>/dev/null || true
+	@printf '  ...live: [%s]\n' "`${__vm__.rest}`"
+
+# ░░ SELF-MODEL: cross-level ledger + the canonical snapshot ░░░░░░░░░░░░░░░░░░░
+# The per-LEVEL ledger captures the make-process nesting the explicit K frames (call/fork) miss.
+# One file per live make-level (overwrite), keyed by MAKE_SUPER: flux.pre records the goal
+# entering each level, flux.post clears it (wired in compose.mk), so the set of files present at
+# any instant is the live cross-make-level callstack.  Bounded to live depth; gated on the plugin
+# being imported (non-VM programs pay nothing).  Limitation: a bare `${make} x` that bypasses both
+# hooks (CMK_DISABLE_HOOKS) and the supervisor is not recorded -- capturing it would mean
+# instrumenting the `${make}` macro itself, rejected as too hot.
+__vm__.level.file=.tmp.cmk.vmlvl.$${MAKE_SUPER}.$${MAKELEVEL:-0}
+__vm__.level.record=${jq.run} -nc --argjson lvl "$${MAKELEVEL:-0}" --arg g "$(strip ${1})" --arg c "$$( ${__vm__.read} | ${stream.nl.to.space} )" '{lvl:$$lvl,goal:$$g,cont:$$c}' > ${__vm__.level.file}.tmp 2>/dev/null && mv -f ${__vm__.level.file}.tmp ${__vm__.level.file} 2>/dev/null || true
+__vm__.level.clear=rm -f ${__vm__.level.file} 2>/dev/null || true
+
+# ░░ REAL FRAMES: a per-recipe-shell call stack (the `vm_trace` pragma / joinbody injects ${__vm__.frame.enter}
+# as each recipe's first line, so it captures every recipe -- incl `${make}` recursion that flux.pre misses) ░░
+# A frame is one live recipe shell.  On entry it writes a file keyed by MAKE_SUPER.MAKELEVEL.PID (PID-keyed ->
+# parallel same-level workers don't collide, unlike the level ledger) holding {step,goal,lvl,pid}; an EXIT trap
+# records the completed frame's {goal,rc,step,locals} into a single "last" slot (for the modeline) and removes
+# the live file.  The set of live files = the live call stack; the IP is the deepest one -- no ip file needed.
+# Robust to a missed pop (goto/exec): __vm__.frames filters out files whose PID is dead.  Frame vars are set
+# before the locals baseline so they're excluded from the recipe's __locals__ delta.
+__vm__.frame.file=.tmp.cmk.vmframe.$${MAKE_SUPER}.$${MAKELEVEL:-0}.$$$$
+__vm__.frame.cmd.file=.tmp.cmk.vmcmd.$${MAKE_SUPER}.$${MAKELEVEL:-0}.$$$$
+__vm__.frame.step.file=.tmp.cmk.vmstep.$${MAKE_SUPER}
+__vm__.frame.last.file=.tmp.cmk.vmlast.$${MAKE_SUPER}
+__vm__.frame.enter=_vmgoal="$@" ; _vmstep=$$(( $$(cat ${__vm__.frame.step.file} 2>/dev/null || echo 0) + 1 )) ; echo "$$_vmstep" > ${__vm__.frame.step.file} 2>/dev/null || true ; ${jq.run} -nc --arg g "$$_vmgoal" --argjson s "$$_vmstep" --argjson l "$${MAKELEVEL:-0}" --argjson p "$$$$" '{step:$$s,goal:$$g,lvl:$$l,pid:$$p}' > ${__vm__.frame.file} 2>/dev/null || true ; _target_local_baseline="$$(compgen -v 2>/dev/null)" ; __vmframe(){ _cmk_l_rc=$$? ; set +e +o pipefail ; _vmloc="$$(${__locals__} 2>/dev/null)" ; case "$$_vmloc" in [\{]*) : ;; *) _vmloc='{}' ;; esac ; _vmkeys="$$(printf '%s' "$$_vmloc" | ${jq.run} -c 'keys' 2>/dev/null)" ; case "$$_vmkeys" in [\[]*) : ;; *) _vmkeys='[]' ;; esac ; _vmcmdj="$$(head -c 240 ${__vm__.frame.cmd.file} 2>/dev/null | ${jq.run} -Rs . 2>/dev/null)" ; case "$$_vmcmdj" in \"*) : ;; *) _vmcmdj='""' ;; esac ; printf '{"step":%s,"goal":"%s","rc":%s,"locals":%s,"cmd":%s}' "$$_vmstep" "$$_vmgoal" "$${_cmk_l_rc:-0}" "$$_vmkeys" "$$_vmcmdj" > ${__vm__.frame.last.file} 2>/dev/null ; rm -f ${__vm__.frame.file} ${__vm__.frame.cmd.file} 2>/dev/null ; } ; trap __vmframe EXIT ; trap 'printf "%s" "$$BASH_COMMAND" > ${__vm__.frame.cmd.file} 2>/dev/null || :' DEBUG
+
+# __vm__.frames: the live call stack as JSON {step,frames:[{step,goal,lvl,pid}..],last:{goal,rc,step,locals}}.
+# GLOBs frame files (observers run in a different supervisor), drops any whose PID is no longer alive (handles
+# leaked frames from a missed pop), sorts by lvl.  Degrades to empty.  `</dev/null` so the jq -s never blocks.
+__vm__.frames=( live='' ; for f in .tmp.cmk.vmframe.* ; do [ -e "$$f" ] || continue ; p=`printf '%s' "$$f" | sed 's/.*[.]//'` ; { [ -n "$$p" ] && kill -0 "$$p" 2>/dev/null ; } && live="$$live $$f" || rm -f "$$f" `printf '%s' "$$f" | sed s/vmframe/vmcmd/` 2>/dev/null ; done ; \
+  fr=`[ -n "$$live" ] && cat $$live 2>/dev/null | ${jq.run.pipe} -s -c 'sort_by(.lvl,.step)' 2>/dev/null` ; [ -n "$$fr" ] || fr='[]' ; \
+  lastf=`ls .tmp.cmk.vmlast.* 2>/dev/null | head -1` ; last=`{ [ -s "$$lastf" ] && cat "$$lastf" ; } 2>/dev/null` ; [ -n "$$last" ] || last='null' ; \
+  step=`cat .tmp.cmk.vmstep.* 2>/dev/null | sort -n | tail -1` ; [ -n "$$step" ] || step=0 ; \
+  dp=`printf '%s' "$$fr" | ${jq.run} -r '.[-1].pid // empty' 2>/dev/null` ; cmd=`{ [ -n "$$dp" ] && head -c 240 .tmp.cmk.vmcmd.*.$$dp ; } 2>/dev/null` ; \
+  printf '%s' "$$fr" | ${jq.run} -c --argjson last "$$last" --argjson step "$$step" --arg cmd "$$cmd" '{step:$$step,frames:.,last:$$last,cmd:$$cmd}' ) </dev/null
+__vm__.frames:; @${__vm__.frames}
+
+# `__vm__`: the single self-model accessor -- the live machine is its snapshot.  `${__vm__}` emits
+# the whole machine as one JSON object {chain,ip,k,e,lvl,levels} -- the canonical source for every
+# observer (core's tux.repl.modeline + demos/overlay.mk), replacing their hand-rolled temp-file
+# globbing.  It folds in current_frame/caller_frame: `chain` = the K frames' goals + the top frame's
+# pending cont (and, for a flat machine with no K frames, the per-level ledger's goals); `ip` = the
+# innermost goal.  Reads by GLOB because observers run in a different supervisor than the machine
+# (the MAKE_SUPER-keyed paths wouldn't match) -- so it assumes one concurrent run per cwd (same
+# caveat as the overlay).  Degrades to `{}` (legal JSON, not empty) when no VM files exist -- the
+# snapshot contract is TOTAL: `${__vm__}` is always parseable.  The chain/ip/k jq matches the
+# legacy tux.repl.modeline byte-for-byte; lvl/levels are additive (unknown keys ignored downstream).
+# (uses BACKTICKS for the inner captures -- they survive the extra make-expansion that interpreted
+#  `.mk` recipes get; callers wrap with `$$( ${__vm__} )` so outer `$()` + inner backticks nest
+#  cleanly without colliding.)
+__vm__=( f=`ls .tmp.CONTROL_STACK_FRAMES.* 2>/dev/null | head -1` ; e=`ls .tmp.cmk.vmenv.* 2>/dev/null | head -1` ; g=`ls .tmp.cmk.vmlvl.* 2>/dev/null | head -1` ; \
+  [ -n "$$f$$e$$g" ] || { echo '{}' ; exit 0 ; } ; \
+  fr=`{ [ -s "$$f" ] && cat "$$f" ; } 2>/dev/null` ; [ -n "$$fr" ] || fr='[]' ; \
+  ev=`{ [ -s "$$e" ] && cat "$$e" ; } 2>/dev/null` ; [ -n "$$ev" ] || ev='{}' ; \
+  lv=`cat .tmp.cmk.vmlvl.* 2>/dev/null | ${jq.run.pipe} -s -c 'sort_by(.lvl)' 2>/dev/null` ; [ -n "$$lv" ] || lv='[]' ; \
+  printf '%s' "$$fr" | ${jq.run} -c --argjson env "$$ev" --argjson levels "$$lv" --argjson lvl "$${MAKELEVEL:-0}" --arg ip_reg "$(__ip__)" --arg step_reg "$(__step__)" --arg posix_reg "$(__posix_code__)" --arg exit_reg "$(__exit_code__)" \
+    'def chainof:(map(.goal))+((( .[-1].cont)//"")|split(" ")|map(select(length>0))); def numreg(s): if (s|length)>0 then (s|tonumber? // null) else null end; (chainof) as $$c | {chain:((if ($$c|length)>0 then $$c else ($$levels|map(.goal)) end)|join(" ")),ip:(.[-1].goal // ($$levels[-1].goal // (if ($$ip_reg|length)>0 then $$ip_reg else "" end))),k:length,e:$$env,lvl:$$lvl,levels:$$levels,step:numreg($$step_reg),posix_code:numreg($$posix_reg),exit_code:numreg($$exit_reg)}' ) </dev/null
+# `__vm__` is the snapshot; `.snapshot` (preferred long-format, used by core + demos) and `.snap` are aliases.
+__vm__.snapshot=${__vm__}
+__vm__.snap=${__vm__}
+
+# ░░ SELF-MODEL FIELD ACCESSORS (the CEK cells as first-class projections of `__vm__`) ░░
+# K (the kontinuation): the saved CEK frames.  `.stack` is canonical; `.kontinuation` is the
+# long-format alias (preferred in demos for legibility).  Inline accessor (reads this process's
+# MAKE_SUPER-keyed stack); an observer reads K via the glob-based `${__vm__}` snapshot instead.
+__vm__.stack=${control_stack.frames}
+__vm__.kontinuation=${__vm__.stack}
+# C (the instruction pointer / control): the innermost goal, projected from the self-model.  `.ip`
+# is canonical; `.instruction_pointer` and `.control` are long-format aliases (preferred in demos).
+__vm__.ip=${__vm__} | ${jq.run} -r '.ip // empty' 2>/dev/null
+__vm__.instruction_pointer=${__vm__.ip}
+__vm__.control=${__vm__.ip}
+# The C-FRONTIER: the untried alternatives of the nearest choice frame, as a goal-list.  Each alt is
+# an anonymous lifted goal (its reify is its goal-string), so the frontier is a first-class,
+# inspectable value -- the homoiconic face of backtracking.  Empty when no choice frame is live.
+__vm__.frontier=${control_stack.frames} | ${jq.run} -r 'map(select(.kind=="choice")) | last | (.alts // []) | join(" ")' 2>/dev/null
+# The same frontier, read by GLOB (observer-safe) rather than through the MAKE_SUPER-keyed stack, so a
+# separate process (a minimap feeder in another supervisor) can inspect a live machine -- the read-side
+# analogue of `${__vm__}` for the choice frontier (which the snapshot itself does not carry).
+__vm__.frontier.observed=ls .tmp.CONTROL_STACK_FRAMES.* 2>/dev/null | head -1 | xargs -r cat 2>/dev/null | ${jq.run} -r 'map(select(.kind=="choice")) | last | (.alts // []) | join(" ")' 2>/dev/null
+
+# ░░ MINIMAP FEEDER: the live call stack (+ choice frontier) as a tree ░░░░░░░░░░
+# A long-lived feeder for the tux.repl `minimap=` region.  Each tick it reads the real-frame call stack
+# (${__vm__.frames}, glob-based so it observes a machine in another supervisor) and the choice frontier,
+# then emits one {label,active,children} tree object: the innermost frame is `active`, its step rides
+# along as a dim note, and any untried alternatives hang beneath it as the frontier.  Generic -- any
+# `vm_trace`-instrumented program (queens, vm-steer, ..) gets a live stack/frontier minimap with no
+# per-program code.  Emits only on change (the region keeps the last complete line), so an idle machine
+# is quiet.  Poll interval: CMK_MINIMAP_WAIT (default 1s).  Always a valid tree (`{label:"vm"}` when idle).
+__vm__.minimap.view=($$alts | split(" ") | map(select(length>0)) | map({label:.,note:"alt"})) as $$frontier \
+  | (.frames | reverse) as $$r \
+  | ( reduce $$r[] as $$x (null; {label:$$x.goal, note:("·"+($$x.step|tostring)), active:(.==null), children:(if .==null then $$frontier else [.] end)}) ) as $$stack \
+  | {label:"vm", children:(if $$stack==null then [] else [$$stack] end)}
+__vm__.minimap:; @last='' ; while true ; do \
+	fr="$$( ${__vm__.frames} )" ; alts="$$( ${__vm__.frontier.observed} )" ; \
+	line="$$( printf '%s' "$$fr" | ${jq.run} -c --arg alts "$$alts" '${__vm__.minimap.view}' 2>/dev/null )" ; \
+	{ [ -n "$$line" ] && [ "$$line" != "$$last" ] ; } && { printf '%s\n' "$$line" ; last="$$line" ; } ; \
+	sleep $${CMK_MINIMAP_WAIT:-1} ; \
+	done
+
+# CLI observers: each self-model NAME doubles as its own display target -- `${__vm__.x}` embeds the
+# value (in a recipe/macro), `${make} __vm__.x` shows it (CLI).  No `.show` suffix: make's var/target
+# namespaces already draw that line, and this is uniform with `__pragma__` / `__plugins__.paths`.
+# Live during a run; `${__vm__}` degrades to `{}` when idle/after-exit (the snapshot is always JSON).
+__vm__:; @${__vm__}
+__vm__.snapshot:; @${__vm__.snapshot}
+__vm__.stack:; @${__vm__.stack}
+__vm__.kontinuation:; @${__vm__.kontinuation}
+__vm__.ip:; @${__vm__.ip}
+__vm__.instruction_pointer:; @${__vm__.instruction_pointer}
+__vm__.control:; @${__vm__.control}
+__vm__.frontier:; @${__vm__.frontier}
+
+# ░░ INTERACTIVE STEERING: drive a live machine from a separate process ░░░░░░░░
+# A steerable machine BLOCKS waiting for a command (rather than self-looping via the trampoline,
+# which would overwrite its own mailbox every tick and race any external steer).  `__vm__.steer.wait`
+# blocks until a command file appears, then echoes the goal to run (the caller `goto`s it); a separate
+# process (e.g. a REPL eval region) "steers" by writing that file via `__vm__.steer.post`.  The pair
+# is a tiny, race-free control channel layered over the existing `vm.goto`.  See demos/cmk/vm-steer.cmk.
+__vm__.steer.cmd=.tmp.cmk.vm.steer.cmd
+# block (bounded by VM_STEER_MAX poll ticks) until a steer command arrives; echo it, then clear it.
+__vm__.steer.wait=i=0 ; while [ ! -s ${__vm__.steer.cmd} ] ; do sleep $${VM_STEER_WAIT:-1} ; i=$$(( i + 1 )) ; [ "$$i" -lt "$${VM_STEER_MAX:-100000}" ] || { echo ; exit 0 ; } ; done ; cat ${__vm__.steer.cmd} ; rm -f ${__vm__.steer.cmd}
+# post a steer command (the goal to run next) for a waiting machine to pick up.
+__vm__.steer.post=printf '%s\n' "$(strip ${1})" > ${__vm__.steer.cmd}

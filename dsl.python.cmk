@@ -1,0 +1,47 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+dsl.python: a `python` dsl base. __reflect__(kind=functions) lists the members
+of a griffe value.kind defined in the fragment shape, via a small uvx-on-docker
+griffe helper (STATIC analysis, no execution). Import it and write python NAME(|.
+'''
+
+from cmk import dsl, container
+
+IMG_GRIFFE?=ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+# python.box: a stock python container that runs instance bodies.
+# container python.box(img=python:3.12-slim entrypoint=python3)(| |)
+
+# FIXME: reflect is a protocol; dsl needs NotImplemented __reflect__.
+
+# python: dsl base; runs bodies in python.box + reflects via griffe.
+# dsl python(machine=python.box)(|
+dsl python(img=$${IMG_PYTHON:-python:3.12-slim} entrypoint=python3 bases=Language)[|
+  $(call lang.seed.grow!,lang.seed.classvar,self,__lang__=.py)
+  self.__reflect__ = ${make} python.reflect/self,$(or $(strip ${__args__}),functions)
+  self.__symbols__:; $(self.__reflect__)
+|]
+
+# griffe.run: capture stdin to a .py module, dump its API as JSON.
+griffe.run=entrypoint=sh img=${IMG_GRIFFE} cmd='-c "cat > /tmp/mod.py && uvx griffe dump -s /tmp mod"' ${make} docker.run.sh 2>/dev/null
+
+# python.griffe.shape: griffe member names of a value.kind (arg k).
+dsl.jqlang python.griffe.shape(__args__=-r)(|
+  .[].members | to_entries[] | select(.value.kind == $k) | .key
+|)
+
+# python.griffe/<frag>,<kind>: griffe member names of a value.kind.
+python.griffe/%:
+  $(call mk.unpack.args, frag kind) \
+  && ${mk.def.read}/$${frag} | ${griffe.run} | python.griffe.shape(--arg k "$${kind}")
+
+# python.reflect/<frag>,<kind>: chain python.griffe per kind.
+python.reflect/%:
+  $(call mk.unpack.args, frag kind) \
+  && case "$${kind:-functions}" in \
+       functions) gkind=function ;; \
+       *) echo "python.reflect: unknown kind $${kind}" >&2 && exit 3 ;; \
+     esac \
+  && ${make} python.griffe/$${frag},$${gkind}

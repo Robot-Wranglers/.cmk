@@ -1,0 +1,256 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# docs.cmk: docs.* tasks -- markdown, footnotes, spellcheck, and jinja docs rendering.
+#
+# cmk_pragma ::: { "kind": "plugin" } :::
+#
+# The jinja render path is pynchon-free (the jinja section below); the retired
+# pynchon renderer was extracted to pynchon.mk (not loaded by default).
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+from cmk import Dockerfile
+import log, docker
+
+docs.root=$(call m5|,DOCS_ROOT,docs)
+docs.pages=set -x; find ${docs.root} | grep -v meta | grep -E '.md$$|.md.j2$$'
+
+docs.footnotes:
+  '''
+  Returns all footnotes from all pages as JSON like { path: [footnote1, ..] }.
+  '''
+  (|
+    from json import dumps
+    from pathlib import Path
+    import os
+    root = Path(os.environ.get("DOCS_ROOT", "docs"))
+    jinja_files = [p for p in root.iterdir() if str(p).endswith(".md.j2")]
+    skip_list = ["README"]
+    tmp = {p: p for p in jinja_files}
+    tmp = {str(p): open(p, "r").readlines() for p in tmp}
+    tmp = {p: [":".join(l.split(":")[1:]).strip() for l in lines if l.startswith("[^")] for p, lines in tmp.items()}
+    tmp = {k: v for k, v in tmp.items() if v and Path(k).name.split(".")[0] not in skip_list}
+    tmp = {k: tmp[k] for k in sorted(tmp.keys())}
+    print(dumps(tmp, indent=2))
+  |) in python
+
+jq.slurp.nontrivial=map(to_entries) | flatten | group_by(.key) | map({key: .[0].key, value: (map(.value) | map(select(. != null)) | .[0])}) | map(select(.value != null)) | from_entries
+jq.timestamp_file_metadata=($$mtimes | split("\n") | map(select(length > 0) | split("|")) | map({(.[1]): (.[0] | tonumber)}) | add // {}) as $$times | to_entries | map(.value.modified = (($$times[.key] // now) | strftime("%Y-%m-%d"))) | sort_by($$times[.key] // 0) |reverse | from_entries
+
+docs.pages.tags:
+	@# Keys from `docs.pages.metadata` re-grouped by tag
+	@# JSON output:
+	@#   { tag : [ page_path, .. ] }
+	${docs.pages.metadata} | ${jq} 'reduce to_entries[] as $$item ({}; reduce ($$item.value.tags // [])[] as $$tag (.; .[$$tag] += [$$item.key]))'
+
+docs.pages.metadata:
+	@# JSON output:
+	@#   { page_path : { tags: [ .. ], title: "", .. } .. }
+	find ${docs.root} -name '*j2' \
+	| ${make} flux.each.json/markdown.frontmatter | ${jq} --slurp '${jq.slurp.nontrivial}' \
+	| ${jq} --arg mtimes "$$(stat -c "%Y|%n" docs/**/*.j2 2>/dev/null)" '($$mtimes | split("\n") | map(select(length > 0) | split("|")) | map({(.[1]): (.[0] | tonumber)}) | add // {}) as $$times | to_entries | map(.value.modified = (($$times[.key] // now) | strftime("%Y-%m-%d"))) | sort_by($$times[.key] // 0) | reverse | from_entries'
+docs.pages.metadata=${make} docs.pages.metadata
+
+# Markdown Support
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+@io.dirhandler(glob=*.md*)
+markdown.spellcheck/%:
+	@# Spellcheck one file; handed a directory, io.dirhandler fans out over its *.md* files.
+	@# Exits non-zero if aspell fails or unknown words remain.
+	log(${*})
+	_sp="$$(cat ${*} | ${markdown.spellcheck})" && ([ -z "$$_sp" ] || { printf '%s\n' "$$_sp"; exit 1; })
+
+markdown.spellcheck:
+	@# Spellcheck the files matching glob= (progress= drives the bar), else the stdin pipe.
+	if [ -n "$${glob:-}" ]; then printf '%s\n' $${glob} | progress="$${progress:-0}" ${make} flux.progress/markdown.spellcheck; else ${make} markdown.spellcheck//dev/stdin; fi
+
+# Extra words aspell should accept; defaults into the docs folder, override with DOCS_ASPELL_IGNORE.
+docs.spellcheck.ignore=$${DOCS_ASPELL_IGNORE:-${docs.root}/.aspell.ignore}
+markdown.spellcheck=aspell list --mode markdown --add-filter=html \
+		$$([ -f "${docs.spellcheck.ignore}" ] && echo --add-wordlists "${docs.spellcheck.ignore}") \
+	| { grep -v '^[A-Z]' || true; } | sort -u
+
+markdown.frontmatter=awk '/^---$$/{if(++c==2)exit;next}c==1' | ${yq} -o json .
+
+markdown.frontmatter/%:
+	@# Extracts frontmatter / metadata from a single file, as JSON
+	$(call log,${*})
+	cat ${*} | ${markdown.frontmatter}
+markdown.frontmatter: markdown.frontmatter//dev/stdin
+
+# Jinja Rendering 
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+## Renders docs/**/*.md.j2 through an inlined Jinja2 driver (the _docs.render.py
+## define below; generic globals + a latex2mathml hook) instead of pynchon: same include
+## roots, the same custom globals, and the same macros; minus the heavy pynchon
+## dependency and the per-expression MathML shell-out.  Everything runs inside the
+## inlined j2c container (jinja2 + latex2mathml + pyyaml + the mkdocs stack +
+## the mk.parse shim), so the build matches CI and needs nothing on the host.
+
+docs.templates=find ${docs.root} | grep .j2 | sort | grep -v '/includes/' | grep -v '/macros/'
+docs.progress.bin ?= tux.progress
+
+Dockerfile j2c(|
+  FROM python:3.11-bookworm
+  RUN git config --global --add safe.directory /workspace
+  RUN pip3 install --break-system-packages jinja2==3.1.2 latex2mathml pyyaml
+  RUN pip3 install --break-system-packages mkdocs==1.5.3 mkdocs-autolinks-plugin==0.7.1 mkdocs-autorefs==1.0.1 mkdocs-material==9.5.3 mkdocs-material-extensions==1.3.1 mkdocstrings==0.25.2 mkdocs-redirects==1.2.2 mkdocs-toggle-sidebar-plugin mkdocs-terminal
+  RUN apt-get update && apt-get install -y tree jq make procps gawk wget
+  RUN printf '#!/bin/sh\nexec make -sS --no-print-directory -f /workspace/compose.mk mk.parse.exec MKPARSE_ARGV="$*"\n' > /usr/local/bin/mk.parse && chmod +x /usr/local/bin/mk.parse
+  RUN wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+  RUN wget -q https://raw.githubusercontent.com/h4l/json.bash/HEAD/json.bash -O /usr/local/bin/json.bash && chmod +x /usr/local/bin/json.bash && ln -sf json.bash /usr/local/bin/jb
+  RUN wget -q https://github.com/mattvonrocketstein/tux.progress/releases/latest/download/tux.progress-linux-amd64 -O /usr/local/bin/tux.progress && chmod +x /usr/local/bin/tux.progress
+|)
+
+docs.render.io/%:; j2c.dispatch(self.docs.render.io/${*})
+  '''Render one template to an explicit comma-delimited input,output.'''
+
+self.docs.render.io/%:
+  '''Render one template with explicit input,output (runs in the container).'''
+  python3 ⬥_docs.render.py $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)
+
+docs.render/%:; j2c.dispatch(self.docs.render/${*})
+  '''Render one template in place (docs/foo.md.j2 -> docs/foo.md).'''
+
+self.docs.render/%:
+  '''Render one template in place (in the container).  Accepts foo.md.j2, foo.md, or
+  bare foo -- the driver resolves it to the foo.md.j2 source, rendered to foo.md.'''
+  python3 ⬥_docs.render.py ${*} \
+  && log.io(${dim}rendered ${sep} ${*})
+
+## Docs Pipeline
+#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+## The `docs` target IS the whole pipeline and runs identically locally and in CI
+## (.github/workflows/docs.yml just calls `make docs`).  The two project bindings it
+## depends on -- `docs.mirrors` (which files are README mirrors) and the
+## `docs.plugins.sync.allow` policy -- live in the root Makefile.
+
+docs: flux.stage/documentation docs.mirrors docs.plugins.sync docs.render docs.site
+  '''Full docs pipeline (serial): stage marker -> README mirrors -> plugin-doc sync ->
+  render all templates -> build the mkdocs site into site/.'''
+
+docs.render: j2c.build
+  '''Render every docs template (docs/**/*.md.j2 -> .md) in one container pass'''
+  tux_progress_gradient="$${tux_progress_gradient:-charm}" env=${tux.progress.names} img=${j2c.img} docker_args="--user ${DOCKER_UID}:${DOCKER_GID} -e HOME=/tmp" ${make} docker.dispatch/self.docs.render.all
+
+self.docs.render.all:
+  '''
+  Render every template under docs-root in one container pass -- the driver is materialized
+  ONCE and loops over the template list on stdin, emitting NDJSON progress events piped into
+  tux.progress, which draws the bar and passes the stream through.
+  '''
+  log.io(rendering all pages via the jinja driver)
+  ${docs.templates} | python3 ⬥_docs.render.py --all | ${docs.progress.bin} >${devnull}
+
+docs.site: j2c.build
+  '''
+  Build the mkdocs static site into site/ (mkdocs build inside the j2c container).
+  '''
+  img=${j2c.img} docker_args="--user ${DOCKER_UID}:${DOCKER_GID} -e HOME=/tmp" ${make} docker.dispatch/self.docs.site
+
+self.docs.site:
+  '''Build the mkdocs site (runs inside the j2c container).'''
+  log.io(building mkdocs site)
+  mkdocs build --clean && tree site && ls site/index.html
+
+docs.render.mirror/%:
+  '''Render a docs page to another path in the repo (README mirrors).'''
+  dest="${*}" && src="${docs.root}/${*}.j2" \
+  && log.io(docs.render.mirror ${sep} ${no_ansi}${bold}$${dest} ${cyan_flow_left} ${dim}$${src}) \
+  && ${make} docs.render.io/$${src},$${dest} \
+  && cat $${dest} | ${stream.glow}
+docs.render.mirror=${make} docs.render.mirror/${@}
+
+docs.serve: j2c.build
+  '''Serve the docs live from the docs render container (mkdocs serve, port-forwarded).'''
+  docker_args="-p $${MKDOCS_LISTEN_PORT:-8000}:$${MKDOCS_LISTEN_PORT:-8000}" j2c.dispatch(mkdocs.serve)
+
+docs.spellcheck:
+  '''Spellcheck the top-level docs jinja pages (docs-root/*.md.j2) with a progress bar.'''
+  glob=${docs.root}/*.md.j2 progress=1 ${make} markdown.spellcheck
+
+# Jinja2 docs driver banana; block-ref'd to a real file for j2c.
+_docs.render.py=(|
+  # In-repo Jinja2 driver for the docs build (pynchon-free): generic globals (bash/env/mkdocs/
+  # github + a latex2mathml mathml hook); project globals load via the extension seam.
+  # USAGE: python3 <this> <tpl.md.j2|.md|bare> [-o out|-]
+  import argparse, json, os, re, subprocess, sys, urllib.parse
+  from html import escape as _hesc
+  from types import SimpleNamespace
+  import yaml
+  from jinja2 import Environment, FileSystemLoader, StrictUndefined
+  from latex2mathml.converter import convert
+  REPO_ROOT = os.environ.get("SRC_ROOT") or os.getcwd()
+  DOCS_ROOT = os.environ.get("DOCS_ROOT", "docs")
+  def _bash(cmd, load_json=False, **kwargs):
+      proc = subprocess.run(cmd, shell=True, cwd=REPO_ROOT, text=True, capture_output=True)
+      if proc.returncode != 0:
+          sys.stderr.write("render: %s exited %s\n%s" % (cmd, proc.returncode, proc.stderr))
+      return json.loads(proc.stdout) if load_json else proc.stdout
+  class _TolerantLoader(yaml.SafeLoader): pass
+  _TolerantLoader.add_multi_constructor("", lambda loader, suffix, node: None)
+  _TolerantLoader.add_multi_constructor("tag:yaml.org,2002:python/", lambda loader, suffix, node: None)
+  def _read_yaml(path):
+      try:
+          with open(path) as handle:
+              return yaml.load(handle, Loader=_TolerantLoader) or {}
+      except FileNotFoundError:
+          return {}
+  def _config_objects():
+      mkcfg = _read_yaml(os.path.join(REPO_ROOT, "mkdocs.yml"))
+      site_url = mkcfg.get("site_url") or ""
+      mkdocs = SimpleNamespace(site_relative_url=urllib.parse.urlparse(site_url).path if site_url else "", config=mkcfg)
+      extra = {}
+      try:
+          with open(os.path.join(REPO_ROOT, DOCS_ROOT, ".jinja.json")) as handle:
+              extra = json.load(handle)
+      except FileNotFoundError:
+          pass
+      gh = extra.get("github", {})
+      repo_url = gh.get("repo_url")
+      wf = os.path.join(REPO_ROOT, ".github", "workflows")
+      actions = [SimpleNamespace(url="%s/actions/workflows/%s" % (repo_url, f)) for f in (sorted(os.listdir(wf)) if repo_url and os.path.isdir(wf) else []) if f.endswith((".yml", ".yaml"))]
+      github = SimpleNamespace(org_name=gh.get("org_name"), repo_name=gh.get("repo_name"), repo_url=repo_url, actions=actions)
+      return mkdocs, github, SimpleNamespace(vars=extra.get("vars", {}))
+  def build_environment():
+      mkdocs, github, jinja = _config_objects()
+      env = Environment(loader=FileSystemLoader([os.path.join(REPO_ROOT, DOCS_ROOT)]), undefined=StrictUndefined, keep_trailing_newline=True)
+      env.globals.update(bash=_bash, sh=_bash, open=open, eval=eval, str=str, map=map, filter=filter, env=os.getenv, url_quote=urllib.parse.quote_plus, mathml=convert, mkdocs=mkdocs, github=github, jinja=jinja)
+      env.globals["_"] = mkdocs.site_relative_url
+      ext = os.environ.get("DOCS_J2_GLOBALS") or os.path.join(REPO_ROOT, DOCS_ROOT, ".jinja.globals.py")
+      if os.path.isfile(ext):
+          ns = {}; exec(open(ext).read(), ns); env.globals.update(ns.get("GLOBALS", {}))
+      env.globals.update(jinja.vars)
+      return env
+  def render(template_path, env=None):
+      env = env or build_environment()
+      with open(template_path) as handle:
+          source = handle.read()
+      return env.from_string(source).render()
+  def _resolve(tpl):
+      return tpl if tpl.endswith(".md.j2") else tpl + (".j2" if tpl.endswith(".md") else ".md.j2")
+  def render_all(templates):
+      env = build_environment()
+      n = len(templates)
+      for i, tpl in enumerate(templates, 1):
+          src = _resolve(tpl)
+          dest = src[:-3]
+          with open(dest, "w") as handle:
+              handle.write(render(src, env))
+          sys.stdout.write(json.dumps({"index": i, "total": n, "output": dest, "status": "ok"}) + "\n")
+          sys.stdout.flush()
+  def main(argv=None):
+      ap = argparse.ArgumentParser(description="Render docs Jinja templates.")
+      ap.add_argument("template", nargs="?"); ap.add_argument("-o", "--output")
+      ap.add_argument("--all", action="store_true", help="render every template read newline-separated from stdin, emitting NDJSON progress events on stdout")
+      a = ap.parse_args(argv)
+      if a.all:
+          render_all([ln.strip() for ln in sys.stdin if ln.strip()])
+          return
+      tpl = _resolve(a.template)
+      out = render(tpl)
+      dest = a.output or tpl[:-3]
+      sys.stdout.write(out) if dest == "-" else open(dest, "w").write(out)
+  main()
+|)

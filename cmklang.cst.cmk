@@ -1,0 +1,68 @@
+#!/usr/bin/env -S ./compose.mk cmk run
+
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+Concrete syntax tree for cmk-lang.  comby tokenizes the banana delimiters
+(string and comment aware) into an open/close event stream; a python polyglot
+stacks the events into the nesting tree.  No hand-rolled parser.
+'''
+
+from cmk import container
+
+# comby lexes bananas to open/close events (skips strings + comments).
+cmklang.cst.lex=cmd="':[o~[\[({]\|]' '⟦:[o]' -matcher .py -stdin -stdout" ${lang.parser.cli} | cmd="':[c~\|[\])}]]' '⟧' -matcher .py -stdin -stdout" ${lang.parser.cli}
+
+# comby's native json-lines match set (flat), for the raw passthrough.
+cmklang.cst.raw=cmd="':[o~[\[({]\|]' '' -matcher .py -stdin -match-only -json-lines" ${lang.parser.cli}
+
+container cmklang.cst.py(img=python:3.12-slim entrypoint=python3)(| |)
+
+# stack machine; stdin leads with a "<mode> <file>" line, then events.
+cmklang.cst.py.polyglot cmklang.cst.render(|
+  import re, sys, json
+  P, NL = chr(124), chr(10)
+  KIND = {'(' + P: 'raw', '[' + P: 'cooked', '{' + P: 'env'}
+  CLOSE = {'(': ')', '[': ']', '{': '}'}
+  head, _, txt = sys.stdin.read().partition(NL)
+  mode, _, fname = head.partition(' ')
+  root = {'ch': []}
+  stack = [root]
+  for m in re.finditer('⟦(..)|⟧', txt):
+      if m.group(0) == '⟧':
+          if len(stack) > 1:
+              stack.pop()
+      else:
+          ls = txt.rfind(NL, 0, m.start()) + 1
+          hdr = txt[ls:m.start()].strip() or '«anon»'
+          nd = {'hdr': hdr, 'd': m.group(1), 'line': txt.count(NL, 0, m.start()) + 1, 'ch': []}
+          stack[-1]['ch'].append(nd)
+          stack.append(nd)
+  def name(nd):
+      return re.sub('[(].*', '', nd['hdr'].split()[-1])
+  def node(nd):
+      return {'ref': 'ast://%s:%d::%s' % (fname, nd['line'], name(nd)),
+              'kind': KIND[nd['d']], 'header': nd['hdr'], 'line': nd['line'],
+              'children': [node(c) for c in nd['ch']]}
+  def walk(nodes, pfx=''):
+      for i, nd in enumerate(nodes):
+          last = i == len(nodes) - 1
+          badge = nd['d'] + '…' + P + CLOSE[nd['d'][0]]
+          print(pfx + ('╰─ ' if last else '├─ ') + nd['hdr'] + '  ' + badge + ' ' + KIND[nd['d']])
+          walk(nd['ch'], pfx + ('  ' if last else '│ '))
+  if mode == 'ast':
+      print(json.dumps([node(c) for c in root['ch']], indent=2, ensure_ascii=False))
+  else:
+      print(fname)
+      walk(root['ch'])
+|)
+
+cmklang.cst.run=| ${cmklang.cst.lex} | ${make} _crun/cmklang.cst.py,cmklang.cst.render | sed 's/^  //'
+
+@cli.subcommands
+cst:
+├─tree/%:; { printf 'tree ${*}\n'; cat ${*}; } ${cmklang.cst.run}
+├─ast/%:; { printf 'ast ${*}\n'; cat ${*}; } ${cmklang.cst.run}
+╰─raw/%:; cat ${*} | ${cmklang.cst.raw} | ${jq} --arg f ${*} '.uri = $$f'
+
+__main__: cst

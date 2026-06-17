@@ -1,0 +1,150 @@
+#!/usr/bin/env -S ./compose.mk cmk run
+#
+# strategy.cmk:
+#   First-class "search regimes" + registry for goal-resolution.
+#
+# cmk_pragma ::: { "kind": "module" } :::
+#
+# This generalizes the DAG navigation of Makefile-style `<label>: <prereqs>` dependencies.
+# See also the core companion `__goals__`[0].  A goal reifies what a search explores,
+# a strategy reifies how its frontier is ordered, expanded, and pruned.
+#
+#   [0]: demos/cmk/goals.cmk -- the named-lift registry (goal NAME = <target-expr>)
+
+'''
+**strategy**: 
+  a search regime (select/push/admit/owner) over a frontier of goals.
+
+**__strategies__**: 
+  the registry object holding the collection plus the driver and the active
+  selection.  A discipline sets its slots directly, and constructing one enrolls it.  
+
+The five slots:
+  owner    the agent/coalition whose choices this discipline resolves (the ATL hook)
+  kind     or = disjunctive (search: try alts) ; and = conjunctive (build all)
+  select   ordering policy: which frontier goal to take next
+  push     how a goal prerequisites enter the frontier (prepend=stack, append=queue)
+  admit    pruning predicate (all = admit everything; posix = build-once + up-to-date)
+
+Some baked-in strategies:
+  `strategy.posix` models make's own default goal-seeking:
+    DFS over the prereq DAG (push=prepend), build-once plus timestamp-pruned (admit).  
+    A flat frontier is that DAG with no edges, so the search runs the same driver 
+    with push/admit inert, reducing to select-ordering
+
+  `strategy.step` 
+    A pure make linear walk (more typical for cmk program).
+'''
+
+# bind the constructor declaration keyword bare
+open cmk
+
+constructor strategy(umbrella=1)[|
+  '''
+  The `strategy` constructor.  Defaults every slot to the degenerate discipline (pure make on an
+  edgeless frontier -- head-select, append, admit all), splices the subkind's own overrides, and
+  enrolls it via the registry's guarded `.add`.  It also binds `.eval` (run this discipline over a
+  frontier) and the self-labeling `.log` / `.log.error`.  `umbrella=1` mints each instance
+  under `strategy.` -- so `strategy.posix`, not a bare `posix`.
+  '''
+  ${self}.owner  ?= us
+  ${self}.kind   ?= or
+  ${self}.select ?= $(firstword $1)
+  ${self}.push   ?= append
+  ${self}.admit  ?= all
+  ${self}.eval      = $(call __strategies__.eval,${self},$1)
+  ${self}.log       = $(call log,${self} ${sep} $1)
+  ${self}.log.error = $(call log.error,${self} ${sep} $1)
+  $(call lang.seed.into!,${self},${1},${body1})
+  $(call __strategies__.add,${self})
+|]
+
+class StrategyRegistry[|
+  '''
+  The registry object for strategy disciplines -- the 5th `registry`-protocol carrier,
+  encapsulated as one class body instantiated once as the object itself, so public and private
+  `_*` members reflect together via `.__dir__`.  Holds the backing list and its guarded mutation
+  (`.has` / `.add` / `.require`), the worklist-walk driver `.eval` that parameterizes a walk over
+  the prereq DAG by a discipline's slots (reducing to select-ordering on a flat frontier), and the
+  active selection (`.default` / `.active` / `.eval.active`).
+  '''
+  ${self} ?=
+  ${self}.has     = $(strip $(filter $(firstword $(1)),$(${self})))
+  ${self}.add     = $(if $(call ${self}.has,$(1)),,$(eval ${self} += $(1)))
+  ${self}.require = $(if $(call ${self}.has,$(1)),,$(error strategy $(firstword $(1)) was never constructed))
+  ${self}._prereq = $(if $(filter-out undefined,$(origin prereq.$(strip $(1)))),$(prereq.$(strip $(1))),)
+  ${self}._push   = $(if $(filter prepend,$($(1).push)),$(2) $(3),$(3) $(2))
+  ${self}._admit  = $(if $(filter unbuilt-and-stale,$($(1).admit)),$(filter-out $(3) ${up_to_date},$(2)),$(2))
+  ${self}._step   = $(if $(call ${self}._admit,$(1),$(4),$(3)),$(4) $(call ${self}._walk,$(1),$(call ${self}._push,$(1),$(call ${self}._prereq,$(4)),$(filter-out $(4),$(2))),$(3) $(4)),$(call ${self}._walk,$(1),$(filter-out $(4),$(2)),$(3)))
+  ${self}._walk   = $(if $(strip $(2)),$(call ${self}._step,$(1),$(2),$(3),$(call $(1).select,$(2))))
+  ${self}.eval    = $(strip $(call ${self}._walk,$(1),$(2),))
+  ${self}.default     = $(if $(filter-out undefined,$(origin CMK_PRAGMA_STRATEGY)),${CMK_PRAGMA_STRATEGY},strategy.step)
+  ${self}.active      = $(or ${__strategy__},$(${self}.default))
+  ${self}.active.doc  = $($(${self}.active).__doc__)
+  ${self}.eval.active = $(call $(${self}.active).eval,$(1))
+  ${self}.log         = $(call log,${self} ${sep} $(1))
+|]
+cmk.StrategyRegistry(__strategies__)
+
+# __strategy__: ( the global getter/setter for the current selection -- dynamic, no default )
+#   It holds only the current selection (unset means nothing selected, not step).  The fallback
+#   is the registry's .default (step, overridable by a strategy pragma); .active resolves
+#   __strategy__ else .default, so a read is always safe.
+export __strategy__ ?=
+
+# the disciplines: ( subkinds that set their slots directly )
+#   Each opens with a ''' docstring ''' (implicit __doc__) and sets any slot it overrides;
+#   unset slots inherit the base defaults.  portfolio reads a caller SEED, best_first a caller
+#   cost.<goal>, and posix a caller prereq.<goal> DAG plus up_to_date.
+
+strategy step(|
+  '''
+  step strategy: inherits every default, so it reproduces pure make's declaration
+  order over a flat frontier -- a linear FIFO goal-monoid.  The degenerate
+  discipline, and the default.
+  '''
+|)
+
+strategy portfolio(|
+  '''
+  portfolio strategy: the swarm racer.  Rotate the frontier by SEED before consuming,
+  so different seeds explore in different orders (swarm-search.cmk as a declaration).
+  '''
+  ${self}.select = $(word $(shell expr $(strip ${SEED}) % $(strip $(words $1)) + 1),$1)
+|)
+
+strategy best_first(|
+  '''
+  best_first strategy: greedy heuristic search.  Pick the lowest-cost goal first, cost
+  being a per-goal cost.<goal> heuristic -- greedy best-first.  (Spike shortcut:
+  single-digit costs so a lexical sort on cost:goal keys orders numerically; a real
+  impl would zero-pad or sort -n.)
+  '''
+  ${self}.select = $(word 2,$(subst :, ,$(firstword $(sort $(foreach g,$1,${cost.$g}:$g)))))
+|)
+
+strategy posix(|
+  '''
+  POSIX strategy: make's own default goal-seeking.
+  Conjunctive (build every prereq), owned by the build with no adversary;
+  DFS over the prereq DAG via push=prepend; post-order;
+  build-once + timestamp-pruned and up-to-date via admit.
+  '''
+  ${self}.owner  := build
+  ${self}.kind   := and
+  ${self}.select  = $(firstword $1)
+  ${self}.push   := prepend
+  ${self}.admit  := unbuilt-and-stale
+|)
+
+# __main__: ( run the module directly to list the strategies it provides )
+#   On import this demotes to a `strategy:` target, so it never collides with the importer's
+#   own __main__ -- ${make} strategy lists them from inside a consuming module too.
+__main__:
+  cmk.log(available strategies ${sep} ${__strategies__})
+  $(if $(filter prepend,$(strategy.posix.push)),true,$(error strategy self-test: posix push override not spliced))
+  $(if $(filter unbuilt-and-stale,$(strategy.posix.admit)),true,$(error strategy self-test: posix admit override not spliced))
+  $(if $(filter append,$(strategy.step.push)),true,$(error strategy self-test: step push default lost))
+  $(if $(filter us,$(strategy.step.owner)),true,$(error strategy self-test: step owner default lost))
+  cmk.log(self-test ${sep} ok)
+  $(foreach s,${__strategies__},cmk.log($(s) ${sep} $($(s).__doc__));)
