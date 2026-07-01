@@ -146,10 +146,12 @@ vm.ctx.receive=[ -s ${__vm__.env.file} ] \
 bind.vm.ctx.receive=eval "$$(${vm.ctx.receive})"
 
 # ── COMPILE STAGE (plugin-owned, pragma-gated) ────────────────────────────────
-# _cmk_blk_vm_hydrate: a PREPROC stage that lives HERE in the plugin (not in core).  When a program
-# sets `# cmk_pragma ::: { "vm_hydrate": true } :::`, core's `.mk.preprocess` finds this file, lifts
-# this define raw (sed, like the supervisor bootloader), and runs it over the SOURCE before the
-# `decorators` stage -- so it needs NO plugin load at compile time.  It prepends a `ᝏvm.ctx.receive`
+# _cmk_blk_vm_hydrate: a PREPROC stage that lives HERE in the plugin (not in core).  It is a GENERIC
+# lifted stage: `vm_hydrate: true` (or `compiler_pre: ["vm_hydrate"]`) makes core's `.mk.preprocess`
+# resolve the `vm_hydrate` stage by scanning CMK_PLUGINS_DIR for a `_cmk_blk_vm_hydrate` define (this one),
+# sed-lifting it, and running it over the SOURCE before the `decorators` stage -- via the general
+# `_cmk.stage.lift` mechanism, so core hard-codes NO VM concept and needs NO plugin load at compile time.
+# It prepends a `ᝏvm.ctx.receive`
 # decorator above every recipe-bearing target (skipping infra/private NAMES + prereq-only targets +
 # `define` bodies); the existing decorators + joinbody stages then lower it to the deferred
 # `$(call bind.vm.ctx.receive)` (resolved at runtime when this plugin is imported).  So every recipe
@@ -247,7 +249,7 @@ __vm__.frames=( live='' ; for f in .tmp.cmk.vmframe.* ; do [ -e "$$f" ] || conti
   step=`cat .tmp.cmk.vmstep.* 2>/dev/null | sort -n | tail -1` ; [ -n "$$step" ] || step=0 ; \
   dp=`printf '%s' "$$fr" | ${jq.run} -r '.[-1].pid // empty' 2>/dev/null` ; cmd=`{ [ -n "$$dp" ] && head -c 240 .tmp.cmk.vmcmd.*.$$dp ; } 2>/dev/null` ; \
   printf '%s' "$$fr" | ${jq.run} -c --argjson last "$$last" --argjson step "$$step" --arg cmd "$$cmd" '{step:$$step,frames:.,last:$$last,cmd:$$cmd}' ) </dev/null
-__vm__.frames.show:; @${__vm__.frames}
+__vm__.frames:; @${__vm__.frames}
 
 # `__vm__`: THE single self-model accessor -- the live machine IS its snapshot.  `${__vm__}` emits
 # the whole machine as one JSON object {chain,ip,k,e,lvl,levels} -- the canonical source for EVERY
@@ -256,13 +258,14 @@ __vm__.frames.show:; @${__vm__.frames}
 # pending cont (and, for a flat machine with no K frames, the per-level ledger's goals); `ip` = the
 # innermost goal.  Reads by GLOB because observers run in a DIFFERENT supervisor than the machine
 # (the MAKE_SUPER-keyed paths wouldn't match) -- so it assumes ONE concurrent run per cwd (same
-# caveat as the overlay).  Degrades to nulls when no VM files exist.  The chain/ip/k jq matches the
+# caveat as the overlay).  Degrades to `{}` (legal JSON, not empty) when no VM files exist -- the
+# snapshot contract is TOTAL: `${__vm__}` is always parseable.  The chain/ip/k jq matches the
 # legacy tux.repl.modeline byte-for-byte; lvl/levels are additive (unknown keys ignored downstream).
 # (uses BACKTICKS for the inner captures -- they survive the extra make-expansion that interpreted
 #  `.mk` recipes get; callers wrap with `$$( ${__vm__} )` so outer `$()` + inner backticks nest
 #  cleanly without colliding.)
 __vm__=( f=`ls .tmp.CONTROL_STACK_FRAMES.* 2>/dev/null | head -1` ; e=`ls .tmp.cmk.vmenv.* 2>/dev/null | head -1` ; g=`ls .tmp.cmk.vmlvl.* 2>/dev/null | head -1` ; \
-  [ -n "$$f$$e$$g" ] || exit 0 ; \
+  [ -n "$$f$$e$$g" ] || { echo '{}' ; exit 0 ; } ; \
   fr=`{ [ -s "$$f" ] && cat "$$f" ; } 2>/dev/null` ; [ -n "$$fr" ] || fr='[]' ; \
   ev=`{ [ -s "$$e" ] && cat "$$e" ; } 2>/dev/null` ; [ -n "$$ev" ] || ev='{}' ; \
   lv=`cat .tmp.cmk.vmlvl.* 2>/dev/null | ${jq.run.pipe} -s -c 'sort_by(.lvl)' 2>/dev/null` ; [ -n "$$lv" ] || lv='[]' ; \
@@ -284,14 +287,17 @@ __vm__.ip=${__vm__} | ${jq.run} -r '.ip // empty' 2>/dev/null
 __vm__.instruction_pointer=${__vm__.ip}
 __vm__.control=${__vm__.ip}
 
-# CLI-inspectable wrappers (live inspection during a run; empty after exit once the files are cleaned).
-__vm__.show:; @${__vm__}
-__vm__.snapshot.show:; @${__vm__.snapshot}
-__vm__.stack.show:; @${__vm__.stack}
-__vm__.kontinuation.show:; @${__vm__.kontinuation}
-__vm__.ip.show:; @${__vm__.ip}
-__vm__.instruction_pointer.show:; @${__vm__.instruction_pointer}
-__vm__.control.show:; @${__vm__.control}
+# CLI observers: each self-model NAME doubles as its own display target -- `${__vm__.x}` EMBEDS the
+# value (in a recipe/macro), `${make} __vm__.x` SHOWS it (CLI).  No `.show` suffix: make's var/target
+# namespaces already draw that line, and this is uniform with `__pragma__` / `__plugins__.paths`.
+# Live during a run; `${__vm__}` degrades to `{}` when idle/after-exit (the snapshot is always JSON).
+__vm__:; @${__vm__}
+__vm__.snapshot:; @${__vm__.snapshot}
+__vm__.stack:; @${__vm__.stack}
+__vm__.kontinuation:; @${__vm__.kontinuation}
+__vm__.ip:; @${__vm__.ip}
+__vm__.instruction_pointer:; @${__vm__.instruction_pointer}
+__vm__.control:; @${__vm__.control}
 
 # ── INTERACTIVE STEERING: drive a LIVE machine from a separate process ────────
 # A STEERABLE machine BLOCKS waiting for a command (rather than self-looping via the trampoline,
