@@ -45,6 +45,10 @@ $(call include.plugins, polyglot.golang.cmk)
 # piped stdin lines as submissions (a PRELUDE -- "as if typed"), then stays interactive.  If stdout is NOT a
 # tty (redirected / scripted / test harness), there is no display: fall back to BATCH -- stream stdin straight
 # into the eval (run + exit).  So `echo target | prog` opens the REPL in a terminal but runs headless in a pipe.
+# OPT-IN STRUCTURED BATCH: set `CMK_REPL_STRUCTURED=1` and the no-tty path instead execs the wrapper HEADLESS
+# (it self-detects the non-tty stdout), which runs eval over piped stdin and emits the JSON SIGN-OFF to stdout
+# (with the captured output in `screen.stdout_buffer`) -- the pty-free roundtrip: `echo t | prog | jq
+# .screen.stdout_buffer`.  This builds the Go wrapper on first use (docker), so plain batch stays the default.
 # eval=/print= are OPTIONAL (empty default); read= DEFAULTS to the core `tux.repl.modeline` (the
 # diagnostic + __vm__ stack-summary mode-line -- pass `read=<your.target>` to override, or `read= `
 # for none).  The wrapper degrades gracefully on a missing one: no print = no scrolling stream (the
@@ -64,7 +68,7 @@ $(call mk.unpack.kwargs, ${1}, minimap, ${space})
 $(call mk.unpack.kwargs, ${1}, events, ${space})
 $(call mk.unpack.kwargs, ${1}, complete, ${space})
 $(call mk.unpack.kwargs, ${1}, runner, ${__interpreting__})
-if ${io.tty.stdout}; then \
+if ${io.tty.stdout} || { [ -n "$${CMK_REPL_STRUCTURED}" ] && [ -n "${kwargs_eval}" ]; }; then \
   { printf '${dim}tux.repl ${sep} preparing wrapper ${sep} first run cross-builds in docker (progress below; NOT a hang)${no_ansi}\n' >/dev/tty ; } 2>/dev/null || true ; \
   $(call polyglot.golang.ensure, _tux.wrapper.main.go, _tux.wrapper.go.mod, tux-repl-wrapper, ${polyglot.golang.base}) \
   && { { printf '${dim}tux.repl ${sep} preflight ${sep} wrapper-bin ${no_ansi}%s${dim} ${sep} %s ${sep} runner ${no_ansi}%s${no_ansi}\n' "$${bin}" "$$( [ -x "$${bin}" ] && printf '${green}exists${no_ansi}' || printf '${red}MISSING${no_ansi}' )" "${kwargs_runner}" >/dev/tty ; } 2>/dev/null || true ; \
@@ -73,7 +77,7 @@ if ${io.tty.stdout}; then \
        export CMK_REPL_REGIONS="$$(printf '{"runner":"%s","read":"%s","eval":"%s","print":"%s","minimap":"%s","events":"%s","complete":"%s","exit_after":%s}' "${kwargs_runner}" "${kwargs_read}" "${kwargs_eval}" "${kwargs_print}" "${kwargs_minimap}" "${kwargs_events}" "${kwargs_complete}" "$$ea")"; \
        exec "$${bin}" "${kwargs_runner}" "${kwargs_read}" "${kwargs_eval}" "${kwargs_print}" "${kwargs_exit_after}" "${kwargs_minimap}"; } ; \
 elif [ -n "${kwargs_eval}" ]; then \
-  $(call log.io, ${dim}tux.repl ${sep} no tty ${sep} BATCH ${sep} streaming stdin into eval ${no_ansi}${kwargs_eval}${no_ansi}) ; \
+  $(call log.io, ${dim}tux.repl ${sep} no tty ${sep} BATCH ${sep} streaming stdin into eval ${no_ansi}${kwargs_eval}${dim} ${sep} set CMK_REPL_STRUCTURED=1 for a JSON signoff${no_ansi}) ; \
   CMK_REPL_TARGETS= ${kwargs_runner} ${kwargs_eval} | grep -av "^$$(printf '\036')" || true ; \
 else $(call log.io, no tty + no eval target -- nothing to stream) ; fi
 endef
@@ -105,6 +109,11 @@ declare.tux.repl=$(eval $(call _declare.tux.repl,${1}))
 tux.repl.run: export CMK_REPL_TARGETS = $(shell [ -f "$(CMK_REPL_SOURCE)" ] && awk -f <(${mk.def.read}/.awk.completion.scan) -v param=keep "$(CMK_REPL_SOURCE)" 2>/dev/null | sort -u | tr '\n' ' ')
 tux.repl.run: export __interpreting__ = $(CMK_REPL_RUNNER)
 tux.repl.run:; $(call tux.repl, ${CMK_REPL_KWARGS})
+
+# tux.repl.wrapper.bin: build the Go wrapper if needed and print its cache path on stdout (build logs go to
+# stderr).  A small introspection hook -- the black-box test harness uses it to locate/build the binary once,
+# then drives it directly (headless, fake runners) without going through the macro or a live tty.
+tux.repl.wrapper.bin:; @$(call polyglot.golang.ensure, _tux.wrapper.main.go, _tux.wrapper.go.mod, tux-repl-wrapper, ${polyglot.golang.base}) >&2 && printf '%s\n' "$${bin}"
 
 # ── BRIDGE CONTRACT + Go test-screen ─────────────────────────────────────────────────────────────
 # tux.repl.test_screen.print: emit the WHOLE metadata schema the Go TUI understands -- this target IS the
@@ -195,17 +204,10 @@ type regions struct {
 type toastT struct { text, level string; exp time.Time }
 // the structured mode-line protocol emitted by the default `read` (tux.repl.modeline): a runtime
 // fingerprint, with an optional `vm` sub-object reflecting the live __vm__ control stack.
-type vmInfo struct { Chain string `json:"chain"`; Ip string `json:"ip"`; K int `json:"k"`; E map[string]any `json:"e"` }
-type stackInfo struct { Cli string `json:"cli"`; Lvl int `json:"lvl"`; Bin string `json:"bin"`; Plugins int `json:"plugins"`; Modules int `json:"modules"`; Vm *vmInfo `json:"vm"` }
-// modeLine is the intermediate "template" snapshot the bar is rendered from (status slot + an
-// overridable LHS from `read` + the golang-owned RHS hints).
-type modeLine struct { statusSlot string; stack *stackInfo; rawLeft string; hasRead bool; rc int; done, hasPrint bool; lastKey string }
 type model struct {
 	vp viewport.Model
 	ta textarea.Model
 	content string
-	mlStack *stackInfo
-	mlRaw string
 	readErr bool
 	ready, done bool
 	w, h, rc int
@@ -218,7 +220,7 @@ type model struct {
 	readScan *bufio.Scanner
 	minimapCmd *exec.Cmd
 	minimapOut *os.File
-	minimapRaw string         // the legacy minimap CHANNEL's accumulation buffer (feeds mms["middle"])
+	minimapRaw string         // the raw minimap CHANNEL's accumulation buffer (feeds mms["middle"])
 	minimapW int              // mm_width: shared width of EVERY minimap box (default 36)
 	// ── UNIFIED metadata channel: ONE `read`/meta target emits a JSON object per line, any field omittable.
 	//    Up to THREE stacked minimaps (top/middle/bottom) on the RHS; bare `mm_*` aliases `middle_mm_*`
@@ -226,8 +228,9 @@ type model struct {
 	mms map[string]*mmState   // position ("top"/"middle"/"bottom") -> its state
 	mmConfig map[string]string// mm_config: position -> mode; empty => just the solo middle
 	unknownMeta map[string]bool // metadata keys with no handler, logged ONCE each
-	modeLhs, modeRhs string   // mode_lhs / mode_rhs : the modeline's two text segments
-	metaMode bool             // a meta line was seen -> paint the modeline from modeLhs/modeRhs, not the legacy stack render
+	modeLhs, modeRhs string   // mode_lhs / mode_rhs : a custom feeder's modeline text (left/right)
+	modeSegs []segment        // mode_segs : the DEFAULT modeline's prioritized left segments (feeder-formatted in jq)
+	metaMode bool             // a meta line was applied (drives signoff.meta_mode); the bar always paints via paintModeline
 	inN, outN int
 	evalBuf string
 	history []string
@@ -249,7 +252,7 @@ type model struct {
 	eventsCmd *exec.Cmd
 	eventsCh chan []byte            // buffered; a writer goroutine drains it to the events child (emit never blocks the UI)
 	completeTarget string          // client completion target (regions.Complete); empty => the make `cmk cli complete` default
-	// ── chrome/layout, metadata-driven (tri-state *bool: nil = legacy "visible"; so the debugger client is unchanged) ──
+	// ── chrome/layout, metadata-driven (tri-state *bool: nil = the default "visible"; so the debugger client is unchanged) ──
 	showInput, showModeline, showPanel *bool
 	customPrompt string            // `prompt` metadata: overrides the In[N]: prompt when set
 	winTitle string                // `title` metadata: desired window title
@@ -411,7 +414,7 @@ func feedPrelude(p *tea.Program, r io.Reader, ready <-chan struct{}) {
 	if ready != nil { <-ready }
 	sc := bufio.NewScanner(r); sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() { p.Send(preludeMsg(sc.Text())) } }
-// show: tri-state visibility -- a nil pointer means VISIBLE (the legacy default), so a client that sends no
+// show: tri-state visibility -- a nil pointer means VISIBLE (the default), so a client that sends no
 // chrome metadata gets the unchanged 3-region layout.
 func show(p *bool) bool { return p == nil || *p }
 // emit: write one UI event as a JSON line to the events child (NON-BLOCKING -- dropped if the buffer is full,
@@ -571,13 +574,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modeMsg:
 		meta := false
 		if s := string(msg); s != "" {
-			var si stackInfo
 			if m.applyMetaLine(s) {                   // UNIFIED metadata channel: route present fields to their sections
 				meta = true
-			} else if err := json.Unmarshal([]byte(s), &si); err == nil {
-				m.mlStack = &si; m.mlRaw = ""        // legacy: structured stack summary (the default read)
 			} else if looksLikePlain(s) {
-				m.mlStack = nil; m.mlRaw = s          // legacy: a custom read emitting plain text -> verbatim LHS
+				m.modeLhs = s; m.modeSegs = nil       // a custom read emitting plain text -> verbatim LHS
 			} else if !m.readErr {
 				m.readErr = true                       // garbage: keep the last-good bar, note it ONCE on the stream
 				m.appendStream(barErr.Render("[modeline: unparseable read line] " + oneLine(s)) + "\n") }
@@ -635,8 +635,8 @@ type tnode struct {
 	Label    string  `json:"label"`
 	Active   bool    `json:"active"`
 	Note     string  `json:"note"`  // dim annotation rendered after the label (e.g. a step number)
-	Title    string  `json:"title"` // (legacy: prefer mm_top) root-only TOP border label
-	Foot     string  `json:"foot"`  // (legacy: prefer mm_bottom) root-only BOTTOM border label
+	Title    string  `json:"title"` // (older; prefer mm_top) root-only TOP border label
+	Foot     string  `json:"foot"`  // (older; prefer mm_bottom) root-only BOTTOM border label
 	Children []tnode `json:"children"`
 }
 
@@ -686,10 +686,11 @@ func jstr(v json.RawMessage) string { var x string; _ = json.Unmarshal(v, &x); r
 var metaHandlers = map[string]metaHandler{
 	"mode_lhs":  func(m *model, v json.RawMessage) { m.modeLhs = jstr(v) },
 	"mode_rhs":  func(m *model, v json.RawMessage) { m.modeRhs = jstr(v) },
+	"mode_segs": func(m *model, v json.RawMessage) { var ss []segment; if json.Unmarshal(v, &ss) == nil { m.modeSegs = ss } },
 	"mm_width":  func(m *model, v json.RawMessage) { var n int; if json.Unmarshal(v, &n) == nil && n > 0 { m.minimapW = n } },
 	"mm_config": func(m *model, v json.RawMessage) { _ = json.Unmarshal(v, &m.mmConfig) },
 	"spinner":   func(m *model, v json.RawMessage) { var sp struct{ Kind string `json:"kind"`; Color string `json:"color"` }; if json.Unmarshal(v, &sp) == nil { m.applySpinner(sp.Kind, sp.Color) } },
-	// ── chrome / layout (tri-state bools: present=set, absent=leave at the legacy "visible" default) ──
+	// ── chrome / layout (tri-state bools: present=set, absent=leave at the default "visible") ──
 	"prompt":   func(m *model, v json.RawMessage) { m.customPrompt = jstr(v); m.applyPrompt() },
 	"input":    func(m *model, v json.RawMessage) { var b bool; if json.Unmarshal(v, &b) == nil { m.showInput = &b } },
 	"modeline": func(m *model, v json.RawMessage) { var b bool; if json.Unmarshal(v, &b) == nil { m.showModeline = &b } },
@@ -728,8 +729,8 @@ func (m *model) logUnknownMeta(k string) {
 	m.unknownMeta[k] = true
 	m.appendStream(barErr.Render("[meta: no handler for '"+k+"' -- skipped]") + "\n") }
 // applyMetaLine: parse one metadata line; if ANY key is a known handler it's a meta line -> dispatch each key
-// (unknown keys logged + skipped) and return true; else (legacy modeline JSON / plain) return false so the
-// caller falls back -- which keeps legacy stackInfo lines (none of whose keys are handlers) from being logged.
+// (unknown keys logged + skipped) and return true; else (the structured modeline JSON / plain) return false so
+// the caller falls back -- which keeps a custom feeder's plain-text line (no handler keys) from being logged.
 func (m *model) applyMetaLine(s string) bool {
 	var raw map[string]json.RawMessage
 	if json.Unmarshal([]byte(s), &raw) != nil || len(raw) == 0 { return false }
@@ -786,7 +787,7 @@ func buildTree(n tnode) any {
 	for _, c := range n.Children { t.Child(buildTree(c)) }
 	return t }
 func renderTree(n tnode) string { switch r := buildTree(n).(type) { case *tree.Tree: return r.String(); case string: return r }; return "" }
-// scanMiddleChannel: the legacy `minimap` CHANNEL feeds the MIDDLE minimap.  A complete {label,...} tree line
+// scanMiddleChannel: the raw `minimap` CHANNEL feeds the MIDDLE minimap.  A complete {label,...} tree line
 // -> tree mode; any other non-empty output -> buffer (scroll) mode.  Partial/blank lines are ignored, so a
 // flickery feeder just holds the last good content.
 func (m *model) scanMiddleChannel() {
@@ -891,21 +892,7 @@ func keepRight(s string, n int) string {
 	r := []rune(s); out := ""; budget := n - 1
 	for i := len(r) - 1; i >= 0; i-- { cs := string(r[i]); if lipgloss.Width(out)+lipgloss.Width(cs) > budget { break }; out = cs + out }
 	return "…" + out }
-// eCompact renders the __vm__ env E to a terse, quote-stripped, length-capped blob for the bar.
-func eCompact(e map[string]any) string {
-	if len(e) == 0 { return "{}" }
-	b, err := json.Marshal(e)
-	if err != nil { return "{}" }
-	s := strings.ReplaceAll(string(b), "\"", "")
-	if lipgloss.Width(s) > 18 { s = keepLeft(s, 18) }
-	return s }
-func (m model) toModeLine() modeLine {
-	ml := modeLine{stack: m.mlStack, rawLeft: m.mlRaw, hasRead: m.readScan != nil, rc: m.rc, done: m.done, hasPrint: m.printCmd != nil, lastKey: m.lastKey}
-	ml.statusSlot = m.statusSlot()   // shared constant-width, rc-colored status slot (no jitter)
-	return ml }
-func (m model) statusBar() string {
-	if m.metaMode { return m.paintModeline(m.w) }   // unified metadata channel -> paint from mode_lhs/mode_rhs
-	return m.toModeLine().render(m.w) }              // legacy structured stack render
+func (m model) statusBar() string { return m.paintModeline(m.w) }   // ONE modeline path: segments (default) or mode_lhs (custom)
 // paintModeline: the META modeline -- mode_lhs (left, dim) + mode_rhs (right, hint), bg-filled to width w,
 // with the live status glyph (spinner / done) prefixed.  lhs is truncated first if the two don't fit.
 // statusSlot: a CONSTANT-WIDTH (spinner-glyph-width + 1) status cell so the modeline doesn't JITTER when the
@@ -919,82 +906,58 @@ func (m model) statusSlot() string {
 	case m.haveRc && m.lastRc == 0: return barOK.Render("✓") + pad                 // idle: last op succeeded (green)
 	case m.haveRc: return barBad.Render("✗") + pad                                 // idle: last op failed (red)
 	default: return barBG.Render(strings.Repeat(" ", gw+1)) } }                    // nothing has run yet
-func (m model) paintModeline(w int) string {
-	if w < 1 { return "" }
-	left := m.statusSlot() + barDim.Render(m.modeLhs); right := barHint.Render(m.modeRhs)
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 0 { left = lipgloss.NewStyle().MaxWidth(max(0, w-lipgloss.Width(right))).Render(left); gap = max(0, w-lipgloss.Width(left)-lipgloss.Width(right)) }
-	return left + barBG.Render(strings.Repeat(" ", gap)) + right }
-// renderLeft builds the LHS (compose.mk-owned, overridable) as styled, bg-filled segments within a
-// plain-cell budget, and returns it with its measured plain width.  Truncation happens in plain space
-// so the bold instruction pointer + K/E + diagnostics survive; the dim chain/cli context is dropped first.
-func (ml modeLine) renderLeft(budget int) (string, int) {
-	if budget <= 0 { return "", 0 }
-	st := ml.stack
-	if st == nil {                                  // no structured data: plain fallback or a default label
-		s := ml.rawLeft
-		if s == "" { if ml.hasRead { s = "(waiting for the read target...)" } else { s = "tux.repl" } }
-		s = keepLeft(s, budget)
-		return barDim.Render(s), lipgloss.Width(s) }
-	diag := fmt.Sprintf("L%d ⚙%d ⌗%d %s", st.Lvl, st.Plugins, st.Modules, st.Bin)
-	if st.Vm == nil {                               // __vm__ absent: diagnostics · program CLI
-		full := diag
-		if st.Cli != "" { full = diag + " · " + st.Cli }
-		if lipgloss.Width(full) <= budget { return barDim.Render(full), lipgloss.Width(full) }
-		room := budget - lipgloss.Width(diag) - 3
-		if st.Cli == "" || room < 2 { s := keepLeft(diag, budget); return barDim.Render(s), lipgloss.Width(s) }
-		s := diag + " · " + keepRight(st.Cli, room) // keep the goal TAIL of the CLI, drop the binary/flags head
-		return barDim.Render(s), lipgloss.Width(s) }
-	vm := st.Vm                                     // __vm__ present: [prefix] IP [suffix]  K.. E.. ·diag
-	chain := strings.Fields(vm.Chain)
-	ipIdx := -1                                     // bold the LAST occurrence of the IP goal in the chain
-	for i := len(chain) - 1; i >= 0; i-- { if chain[i] == vm.Ip { ipIdx = i; break } }
-	ipTok, prefix, suffix := "", "", ""             // prefix = call stack (older), suffix = pending continuation
-	if ipIdx >= 0 {
-		ipTok = chain[ipIdx]
-		if ipIdx > 0 { prefix = strings.Join(chain[:ipIdx], " ") }
-		if ipIdx+1 < len(chain) { suffix = strings.Join(chain[ipIdx+1:], " ") }
-	} else if len(chain) > 0 { prefix = strings.Join(chain, " ") }
-	tail := fmt.Sprintf("K%d E%s ·%s", vm.K, eCompact(vm.E), diag)
-	mustW := lipgloss.Width(tail)                   // must-keep = IP + K/E + diag; chain context fills what's left
-	if ipTok != "" { mustW += lipgloss.Width(ipTok) + 1 }
-	if mustW >= budget {                            // too narrow even for the core: degrade to a dim tail
-		core := tail
-		if ipTok != "" { core = ipTok + " " + tail }
-		s := keepRight(core, budget)
-		return barDim.Render(s), lipgloss.Width(s) }
-	remaining := budget - mustW
-	if suffix != "" && remaining > 2 { suffix = keepLeft(suffix, remaining-1); remaining -= lipgloss.Width(suffix) + 1 } else { suffix = "" }
-	if prefix != "" && remaining > 2 { prefix = keepRight(prefix, remaining-1); remaining -= lipgloss.Width(prefix) + 1 } else { prefix = "" }
-	var b strings.Builder
-	plainW := 0
-	if prefix != "" { b.WriteString(barDim.Render(prefix + " ")); plainW += lipgloss.Width(prefix) + 1 }
-	if ipTok != "" { b.WriteString(barIP.Render(ipTok)); b.WriteString(barDim.Render(" ")); plainW += lipgloss.Width(ipTok) + 1 }
-	if suffix != "" { b.WriteString(barDim.Render(suffix + " ")); plainW += lipgloss.Width(suffix) + 1 }
-	b.WriteString(barDim.Render(tail)); plainW += lipgloss.Width(tail)
-	return b.String(), plainW }
-// render composes the one-line bar: [edge][status][LHS][gap][RHS], never wrapping, never overflowing,
-// panic-safe (a failure yields a minimal bar rather than a blanked View).
-func (ml modeLine) render(w int) (out string) {
+// paintModeline: the ONE modeline composer -- [status][left][gap][right], bg-filled to width w, panic-safe.
+// LEFT is either the DEFAULT modeline's feeder-supplied prioritized segments (mode_segs, width-elided HERE
+// since the terminal width is unknown to the feeder) or a custom feeder's plain mode_lhs.  RIGHT is a STATIC
+// "^D quit" hint the WRAPPER owns -- ctrl-d is the built-in, non-optional quit, so the bar always documents it
+// (a feeder can neither supply nor suppress it); the feeder's optional mode_rhs is shown BEFORE it, and dropped
+// first when the bar is too narrow (the quit hint is kept).  statusSlot is constant-width -> no jitter.
+func (m model) paintModeline(w int) (out string) {
 	defer func() { if r := recover(); r != nil { out = barBG.Render(" tux.repl") } }()
-	if w <= 0 { w = 80 }
-	edge := 1
-	statusStyled := ml.statusSlot; sw := lipgloss.Width(statusStyled)   // pre-rendered, constant-width, rc-colored
-	avail := w - edge - sw
+	if w < 1 { return "" }
+	status := m.statusSlot(); sw := lipgloss.Width(status)
+	avail := w - sw
 	if avail < 1 { return barBG.Render(strings.Repeat(" ", w)) }
-	rights := []string{}                            // RHS: optional tokens are droppable from the FRONT; "^D quit" is kept
-	if ml.done && ml.hasPrint { rights = append(rights, fmt.Sprintf("[done rc=%d]", ml.rc)) }
-	if ml.lastKey != "" { rights = append(rights, "key="+ml.lastKey) }
-	rights = append(rights, "^D quit")
-	rjoin := strings.Join(rights, "  ")
-	rightCap := avail - 4; if rightCap < 0 { rightCap = 0 }
-	for len(rights) > 1 && lipgloss.Width(rjoin) > rightCap { rights = rights[1:]; rjoin = strings.Join(rights, "  ") }
-	if lipgloss.Width(rjoin) > avail { rjoin = keepRight(rjoin, avail) }
-	rw := lipgloss.Width(rjoin)
-	leftBudget := avail - rw - 1; if leftBudget < 0 { leftBudget = 0 }
-	lStyled, lw := ml.renderLeft(leftBudget)
-	gap := w - edge - sw - lw - rw; if gap < 0 { gap = 0 }
-	return barBG.Render(strings.Repeat(" ", edge)) + statusStyled + lStyled + barBG.Render(strings.Repeat(" ", gap)) + barHint.Render(rjoin) }
+	right := "^D quit"                              // wrapper-owned, always shown
+	if m.modeRhs != "" { right = m.modeRhs + "  ^D quit" }
+	if lipgloss.Width(right) > avail { right = "^D quit"; if lipgloss.Width(right) > avail { right = keepRight(right, avail) } }   // narrow: drop mode_rhs, keep the quit hint
+	rw := lipgloss.Width(right)
+	budget := avail - rw - 1; if budget < 0 { budget = 0 }
+	var left string; var lw int
+	if len(m.modeSegs) > 0 {
+		left, lw = elideSegs(m.modeSegs, budget)
+	} else {
+		s := m.modeLhs
+		if s == "" && !m.metaMode { if m.readScan != nil { s = "(waiting for the read target...)" } else { s = "tux.repl" } }
+		s = keepLeft(s, budget); left, lw = barDim.Render(s), lipgloss.Width(s) }
+	gap := w - sw - lw - rw; if gap < 0 { gap = 0 }
+	return status + left + barBG.Render(strings.Repeat(" ", gap)) + barHint.Render(right) }
+// segment: one styled, prioritized piece of the DEFAULT modeline's left side.  The feeder builds these in jq,
+// so ALL the fingerprint formatting (diag / IP / chain / K-E) lives cmk-side, not in Go.  s = dim|ip|hint;
+// p = drop-priority (0 = never dropped, only trimmed; higher dropped first); k = trim side (R keeps the tail).
+type segment struct { T string `json:"t"`; S string `json:"s"`; P int `json:"p"`; K string `json:"k"` }
+func styleFor(s string) lipgloss.Style { switch s { case "ip": return barIP; case "hint": return barHint; default: return barDim } }
+// elideSegs fits segments into `budget` plain cells: drop the highest-priority segments until the rest fit,
+// then trim the survivors per keep-side.  The feeder bakes any separators into the text; Go just concatenates.
+func elideSegs(segs []segment, budget int) (string, int) {
+	if budget <= 0 || len(segs) == 0 { return "", 0 }
+	keep := make([]bool, len(segs)); for i := range segs { keep[i] = true }
+	sum := func() int { w := 0; for i, s := range segs { if keep[i] { w += lipgloss.Width(s.T) } }; return w }
+	for sum() > budget {
+		v, mp := -1, 0
+		for i, s := range segs { if keep[i] && s.P > mp { mp, v = s.P, i } }
+		if v < 0 { break }
+		keep[v] = false }
+	over := sum() - budget
+	var b strings.Builder; plain := 0
+	for i, s := range segs {
+		if !keep[i] { continue }
+		t := s.T
+		if over > 0 {
+			w := lipgloss.Width(t); cut := over; if cut > w-1 { cut = w - 1 }
+			if cut > 0 { if s.K == "R" { t = keepRight(t, w-cut) } else { t = keepLeft(t, w-cut) }; over -= cut } }
+		b.WriteString(styleFor(s.S).Render(t)); plain += lipgloss.Width(t) }
+	return b.String(), plain }
 func (m model) View() string {
 	if !m.ready { return "\n  initializing..." }
 	parts := []string{}
@@ -1013,6 +976,44 @@ func (m model) View() string {
 // r/e/p(/minimap) targets, and how each subproc ended: "reaped" (we SIGKILLed it at teardown = the normal
 // case) vs "exited(n)" (it returned ON ITS OWN before teardown).  An early self-exit of a region meant to run
 // the whole session -- esp. the minimap, which must loop -- or any non-zero exit is flagged as abnormal.
+// stripANSI drops SGR escape sequences so the signoff's buffer-tails are plain, assertable text.
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && !((s[j] >= '@' && s[j] <= '~')) { j++ }
+			if j < len(s) { j++ }
+			i = j
+			continue }
+		b.WriteByte(s[i]); i++ }
+	return b.String() }
+// tailLines returns up to the last n non-blank lines of s, ANSI-stripped -- the "recent part" of a buffer.
+func tailLines(s string, n int) []string {
+	out := []string{}
+	for _, l := range strings.Split(strings.ReplaceAll(stripANSI(s), "\r", ""), "\n") {
+		if strings.TrimSpace(l) != "" { out = append(out, l) } }
+	if len(out) > n { out = out[len(out)-n:] }
+	return out }
+// minimapsSnapshot: the recent state of every active RHS minimap, for the signoff screen dump.
+func minimapsSnapshot(m model) map[string]any {
+	out := map[string]any{}
+	for _, pos := range mmOrder {
+		s := m.mms[pos]
+		if s == nil { continue }
+		e := map[string]any{"mode": s.mode, "err": s.err}
+		if s.top != "" { e["top"] = stripANSI(s.top) }
+		if s.bottom != "" { e["bottom"] = stripANSI(s.bottom) }
+		if len(s.lines) > 0 {
+			t := make([]string, 0, len(s.lines))
+			for _, l := range s.lines { t = append(t, stripANSI(l)) }
+			if len(t) > 20 { t = t[len(t)-20:] }
+			e["tail"] = t
+		} else if s.buffer != "" { e["tail"] = tailLines(s.buffer, 20) }
+		if s.tree != nil { e["tree_label"] = s.tree.Label }
+		out[pos] = e }
+	if len(out) == 0 { return nil }
+	return out }
 func signoff(w io.Writer, runner, rT, eT, pT, mT string, m model) {
 	nz := func(s string) any { if s == "" { return nil }; return s }
 	var abnormal []string
@@ -1028,18 +1029,88 @@ func signoff(w io.Writer, runner, rT, eT, pT, mT string, m model) {
 			return map[string]any{"status": "exited", "code": ps.ExitCode(), "abnormal": ab}
 		default:            // signalled by our teardown kill -- the expected ending for a long-running region
 			return map[string]any{"status": "reaped"} } }
-	mErr := false; if s := m.mms["middle"]; s != nil { mErr = s.err }   // the (legacy channel) middle minimap exited?
+	mErr := false; if s := m.mms["middle"]; s != nil { mErr = s.err }   // the (raw channel) middle minimap exited?
 	subprocs := map[string]any{
 		"read": sub("read", m.readCmd, false), "eval": sub("eval", m.evalCmd, false),
 		"print": sub("print", m.printCmd, false), "minimap": sub("minimap", m.minimapCmd, mErr)}
 	if abnormal == nil { abnormal = []string{} }
+	// screen: the recent state of every region's buffer -- lets a caller read WHAT the REPL showed from
+	// structured JSON instead of scraping the altscreen framebuffer.  `stdout_buffer` is the full (ANSI-stripped)
+	// panel text (print + eval output), the load-bearing field for the `... | jq .screen.stdout_buffer` roundtrip;
+	// `panel_tail` is its last lines for cheap eyeballing.
+	screen := map[string]any{
+		"stdout_buffer": stripANSI(m.content),
+		"panel_tail":    tailLines(m.content, 60),
+		"panel_bytes":   len(m.content),
+		"modeline":      map[string]any{"lhs": nz(stripANSI(m.modeLhs)), "rhs": nz(stripANSI(m.modeRhs)), "segs": len(m.modeSegs), "rendered": nz(strings.TrimRight(stripANSI(m.paintModeline(m.w)), " "))},
+		"counts":        map[string]any{"in": m.inN, "out": m.outN},
+		"last_rc":       m.lastRc,
+		"have_rc":       m.haveRc,
+		"meta_mode":     m.metaMode}
+	if mm := minimapsSnapshot(m); mm != nil { screen["minimaps"] = mm }
 	out := map[string]any{
 		"rc":        m.rc,
 		"bootstrap": map[string]any{"runner": nz(runner), "wrapper_bin": nz(os.Getenv("CMK_REPL_WRAPPER_BIN")), "read": nz(rT), "eval": nz(eT), "print": nz(pT), "minimap": nz(mT)},
 		"subprocs":  subprocs,
-		"abnormal":  abnormal}
-	if b, err := json.MarshalIndent(out, "", "  "); err == nil { fmt.Fprintf(w, "%s\n", b) }
+		"abnormal":  abnormal,
+		"screen":    screen}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil { return }
+	fmt.Fprintf(w, "%s\n", b)
+	// also persist to a file when asked -- a clean capture channel for e2e (no altscreen byte-noise on the tty).
+	if p := os.Getenv("CMK_REPL_SIGNOFF"); p != "" { _ = os.WriteFile(p, append(append([]byte{}, b...), '\n'), 0o644) }
 }
+
+// runHeadless runs the eval region non-interactively over piped stdin (no bubbletea, no tty) and prints the
+// signoff JSON -- with the captured output in screen.stdout_buffer -- to STDOUT.  This is the pty-free roundtrip
+// channel:  echo flux.ok | <prog> | jq -r .screen.stdout_buffer  (each piped line is submitted as if typed).
+func runHeadless(rg regions, runner string, childEnv []string) int {
+	m := model{inN: 1, runner: runner}
+	rc := 0
+	if rg.Eval != "" {
+		c := exec.Command(runner, rg.Eval)
+		c.Env = append(append([]string{}, childEnv...), "CLICOLOR_FORCE=1", "FORCE_COLOR=1", "CMK_REPL_TARGETS=")
+		stdin, _ := c.StdinPipe()
+		var buf strings.Builder
+		c.Stdout = &buf; c.Stderr = &buf
+		if err := c.Start(); err == nil {
+			m.evalCmd = c
+			sc := bufio.NewScanner(os.Stdin); sc.Buffer(make([]byte, 1<<20), 1<<23)   // feed every piped line as a submission
+			for sc.Scan() { _, _ = io.WriteString(stdin, sc.Text()+"\n") }
+			_ = stdin.Close()
+			_ = c.Wait()
+			// strip the \x1e<rc> markers the kernel emits after each command; the LAST rc is the session rc.
+			var out strings.Builder
+			for _, line := range strings.Split(strings.ReplaceAll(buf.String(), "\r\n", "\n"), "\n") {
+				if i := strings.IndexByte(line, '\x1e'); i >= 0 {
+					if n, err := strconv.Atoi(strings.TrimSpace(line[i+1:])); err == nil { m.lastRc = n; m.haveRc = true; rc = n }
+					line = line[:i]; if line == "" { continue } }
+				out.WriteString(line + "\n") }
+			m.content = out.String(); m.outN = m.inN }
+	}
+	if rg.Read != "" { sampleRead(&m, runner, rg.Read, childEnv) }   // populate the model's meta fields for the signoff
+	m.w = 120; if c := os.Getenv("COLUMNS"); c != "" { if n, e := strconv.Atoi(c); e == nil && n > 0 { m.w = n } }   // a width so screen.modeline.rendered reflects the elide
+	m.rc = rc
+	signoff(os.Stdout, runner, rg.Read, rg.Eval, rg.Print, rg.Minimap, m)
+	return rc }
+
+// sampleRead grabs a snapshot of the read (metadata) channel and applies it through the SAME applyMetaLine the
+// TUI uses, so the headless sign-off's `screen` reflects the parsed model -- the config-JSON -> model mapping
+// layer becomes observable (and pytest-pinnable) without any rendering.  Bounded: stops at the first metadata
+// line (a feeder emits a complete object per line) or after CMK_REPL_READ_SAMPLE_MS (default 500) / EOF.
+func sampleRead(m *model, runner, target string, childEnv []string) {
+	c := exec.Command(runner, target); c.Env = childEnv
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ro, err := c.StdoutPipe()
+	if err != nil || c.Start() != nil { return }
+	dur := 500 * time.Millisecond
+	if ms := os.Getenv("CMK_REPL_READ_SAMPLE_MS"); ms != "" { if n, e := strconv.Atoi(ms); e == nil && n >= 0 { dur = time.Duration(n) * time.Millisecond } }
+	t := time.AfterFunc(dur, func() { if c.Process != nil { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) } })
+	sc := bufio.NewScanner(ro); sc.Buffer(make([]byte, 1<<20), 1<<23)
+	for sc.Scan() { if m.applyMetaLine(sc.Text()) { break } }   // first parsed metadata snapshot is enough
+	t.Stop()
+	if c.Process != nil { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	_ = c.Wait() }
 
 const helpText = `tux-repl-wrapper -- compose.mk's metadata-driven terminal REPL / TUI host.
 
@@ -1073,7 +1144,7 @@ CONFIG (preferred) -- CMK_REPL_REGIONS, a JSON object:
                      "minimap":"","events":"","complete":"","exit_after":false}'
   Empty/omitted keys disable that region.  New regions add KEYS -- arg positions never shift.
 
-LEGACY positional form (used only when CMK_REPL_REGIONS is unset):
+POSITIONAL FALLBACK (used only when CMK_REPL_REGIONS is unset):
   tux-repl-wrapper <runner> <read> <eval> <print> [exit_after] [minimap]
 
 ENV:
@@ -1084,13 +1155,19 @@ ENV:
   CMK_REPL_SPINNER_COLOR  spinner color (a lipgloss color)
   CMK_REPL_WRAPPER_BIN  path to this binary (echoed in the exit sign-off)
   CMK_REPL_DEBUG        verbose teardown logging to the controlling terminal
+  CMK_REPL_SIGNOFF      path: also write the exit sign-off JSON to this file (a clean capture channel)
   CMK_BIN               host for the default 'cmk cli complete'
+
+  When stdout is NOT a tty, the wrapper runs HEADLESS: it feeds piped stdin into the eval region, captures
+  the output, and prints the sign-off JSON (with screen.stdout_buffer = the captured output) to stdout.
+  This is the pty-free roundtrip:  echo <target> | <prog> | jq -r .screen.stdout_buffer
 
 KEYS: enter=submit  alt+enter/ctrl+j=newline  ctrl+r=reverse-history-search  up/down=history
       tab=complete  pgup/pgdn=scroll  ctrl+l=clear  ctrl+c=interrupt eval  ctrl+d=quit
 
-On exit it writes a JSON SIGN-OFF (bootstrap targets incl. wrapper_bin, and how each region ended)
-to the controlling terminal.
+On exit it writes a JSON SIGN-OFF: the bootstrap targets (incl. wrapper_bin), how each region ended, AND a
+screen object with the recent state of every buffer (stdout_buffer/panel_tail, modeline, minimaps, counts).
+It goes to the controlling terminal (and to CMK_REPL_SIGNOFF / stdout in the headless case).
 
 EXAMPLE (the usual path -- a compose.mk program with a repl pragma launches this automatically):
   # cmk_pragma ::: { "repl": { "read":"my.read", "eval":"my.eval", "print":"my.print" } } :::
@@ -1101,7 +1178,7 @@ func main() {
 	for _, a := range os.Args[1:] {   // explicit help: the wrapper is normally exec'd with region args, but `--help` is useful directly
 		if a == "-h" || a == "--help" || a == "help" { fmt.Print(helpText); return } }
 	// REGION MAP (freeze-proof): a CMK_REPL_REGIONS JSON map supersedes the positional args.  Falls back to the
-	// legacy positional contract <runner> <read> <eval> <print> [exit_after] [minimap] when the env is unset.
+	// positional contract <runner> <read> <eval> <print> [exit_after] [minimap] when the env is unset.
 	var rg regions
 	if env := os.Getenv("CMK_REPL_REGIONS"); env != "" {
 		if err := json.Unmarshal([]byte(env), &rg); err != nil { fmt.Fprintln(os.Stderr, "tux-repl: bad CMK_REPL_REGIONS:", err); os.Exit(2) }
@@ -1113,6 +1190,9 @@ func main() {
 	runner := rg.Runner; if runner == "" { runner = os.Getenv("CMK_REPL_RUNNER") }
 	childEnv := os.Environ()  // children inherit the exported __plugins__ registry, so a `require`-imported tux-repl plugin self-skips the re-import -> no staging race
 	cmkBin := os.Getenv("CMK_BIN"); if cmkBin == "" { cmkBin = runner }  // `cmk cli complete` host for Tab completion (falls back to the runner, which also carries the cmk target)
+	// HEADLESS: stdout not a tty (piped/redirected/test) -> no display to draw.  Run eval over piped stdin and
+	// emit the signoff JSON (screen.stdout_buffer = captured output) to stdout, instead of launching the TUI.
+	if !isTTY(os.Stdout) { os.Exit(runHeadless(rg, runner, childEnv)) }
 	m := model{ta: newTA(80), inN: 1, spin: newSpin(),
 		done: rg.Print == "", spinning: rg.Print != "", exitAfter: rg.ExitAfter,
 		cmkBin: cmkBin, cmkEnv: childEnv, runner: runner, completeTarget: rg.Complete}  // no print stream -> nothing to wait for
