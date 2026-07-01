@@ -1,0 +1,82 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# tux.repl.debugger.cmk: a live VM debugger front-end for the tux.repl TUI.
+#   A LIBRARY (no __main__), so the shebang COMPILES it as a parse check; import it to use it.
+#
+#   THIS IS THE COMPOSITION LAYER.  Two sibling plugins are deliberately kept agnostic of each other:
+#     * virtual-machine.cmk -- the VM self-model (`__vm__.frames`: a real per-recipe-shell call stack).
+#                              Knows NOTHING about how anything is displayed.
+#     * tux.repl.cmk        -- the generic Bubbletea TUI host (the unified metadata schema: mode_lhs,
+#                              mm_config, the per-position minimaps).  Knows NOTHING about the VM.
+#   This plugin is the one place they meet: it TRANSLATES `__vm__.frames` into the tux.repl metadata
+#   schema, so a `vm_trace`-instrumented program gets a debugger view (IP + clock modeline, a Command
+#   Log, a Call-Stack tree, and an Environment snapshot) with zero code in the program being debugged.
+#   Keeping this in its own file preserves both siblings' independence -- neither gains a dependency on
+#   the other; the coupling lives here, on top of both.  (Was hand-written inline in the demo
+#   demos/cmk/repl-frame-tree.cmk; promoted so any program can reuse it.)
+#
+#   USAGE: in the program's repl manifest, point the read channel at the feed, keep your own print/eval,
+#     and enable vm_trace so every recipe becomes a frame.  The manifest keys are:
+#       repl.read = tux.repl.debugger.feed ,  repl.print = my.program ,  repl.eval = tux.repl.kernel ,
+#       vm_trace = true   (see demos/cmk/repl-frame-tree.cmk for the exact pragma line)
+#     then import the plugin:  $(call include.plugins, tux.repl.debugger.cmk)
+#
+#   The feed reads `__vm__.frames`, so the program must be frame-instrumented: either the `vm_trace`
+#   pragma (auto-injects `${__vm__.frame.enter}` per recipe) or manual `${__vm__.frame.enter}` calls.
+#   The feed itself never needs instrumenting: its `tux.repl.debugger.*` name is caught by the default
+#   CMK_VM_TRACE_SKIP (`...|tux[.]|...`), so the tracer never traces the debugger.
+$(call include.plugins, virtual-machine.cmk)
+$(call __plugins__.require, tux.repl.cmk)
+
+# tux.repl.debugger.view.jq: the TRANSLATION -- massage `__vm__.frames`
+# {step,frames:[{step,goal,lvl,pid}..],cmd,last:{goal,rc,locals}} into the tux.repl unified metadata
+# schema.  Pretty-printed via \-continuation: make collapses the backslash-newlines back into a single
+# -line value, so the value stays one jq filter (and the recipe stays one command) while the SOURCE
+# reads top-to-bottom.  The IP and the LAST COMMAND are DISTINCT:
+#   mode_lhs   = the IP  -- the deepest live frame's TARGET (the current ${@})   mode_rhs = clock
+#   top    minimap (buffer mode = SCROLL)   = COMMAND LOG -- each distinct NON-target step run (.cmd)
+#   middle minimap (tree mode)              = the CALL STACK spine (deepest = active)
+#   bottom minimap (mode  mode = OVERWRITE) = ENVIRONMENT snapshot (ip/depth/step/last/locals)
+# (No `#` inside the value below -- make would treat it as a comment.)
+tux.repl.debugger.view.jq= .frames as $$f \
+  | .last  as $$last \
+  | .step  as $$step \
+  | ($$f[-1].goal // ($$last.goal // "idle")) as $$ip \
+  | ( (.cmd // "") ) as $$cmd0 \
+  | ( if ($$cmd0 | startswith("make ")) \
+      then ( $$cmd0 | gsub(" --[a-z][a-z-]*"; "") | gsub(" -[sSf][^ ]*"; "") | gsub("^make +"; "") ) \
+      else $$cmd0 end ) as $$cmd \
+  | ($$f | reverse) as $$r \
+  | ( reduce $$r[] as $$x (null; \
+        { label:    $$x.goal, \
+          note:     ("·" + ($$x.step | tostring)), \
+          active:   (. == null), \
+          children: (if . == null then [] else [.] end) } ) ) as $$stack \
+  | { mode_lhs: $$ip, \
+      mode_rhs: $$now, \
+      mm_config: { top: "buffer", middle: "tree", bottom: "mode" }, \
+      top_mm_top:    "(Command Log)", \
+      top_mm_buffer: (if ($$cmd | length) > 0 then $$cmd else "(idle)" end), \
+      mm_top:  "(Call Stack)", \
+      mm_tree: (if $$stack == null then {label:"vm",children:[]} else {label:"vm",children:[$$stack]} end), \
+      mm_bottom: (if $$last then ( $$last.goal + " rc=" + ($$last.rc | tostring)) else "" end), \
+      bottom_mm_top:    "(Environment)", \
+      bottom_mm_bottom: ("step " + ($$step | tostring)), \
+      bottom_mm_buffer: ( [ ("ip     " + $$ip), \
+                            ("depth  " + (($$f | length) | tostring)), \
+                            ("step   " + ($$step | tostring)), \
+                            (if $$last then ("last   " + $$last.goal + " rc=" + ($$last.rc | tostring)) else "last   -" end), \
+                            (if ($$last.locals | length) > 0 then ("locals " + ($$last.locals | join(", "))) else "locals -" end) \
+                          ] | join("\n") ) }
+
+# tux.repl.debugger.feed: the read/metadata channel -- poll `__vm__.frames`, translate via the view
+# filter, emit one JSON line per tick.  Long-lived (the tux.repl `read` region loops it).  This is the
+# OBSERVER, so it is doubly exempt from vm_trace (name matches CMK_VM_TRACE_SKIP AND it reads
+# __vm__.frames).  A while-loop must stay ONE shell command, so it is \-continued (joinbody leaves
+# \-terminated lines alone).  Poll interval: CMK_REPL_DEBUGGER_WAIT, else CMK_FRAME_WAIT
+# (the debuggee's own loop bound -- sharing it makes the feed and the debuggee tick together), else 1s.
+tux.repl.debugger.feed:
+	@while true; do \
+	   now=`date +%H:%M:%S` ; \
+	   this.__vm__.frames 2>/dev/null </dev/null | ${jq.run} -c --arg now "$$now" '${tux.repl.debugger.view.jq}' 2>/dev/null ; \
+	   sleep $${CMK_REPL_DEBUGGER_WAIT:-$${CMK_FRAME_WAIT:-1}} ; \
+	 done
