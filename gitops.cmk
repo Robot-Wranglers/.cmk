@@ -17,6 +17,12 @@
 #   `gitops.rerelease` OVERWRITES an existing tag (force) -- intentionally a separate, explicit
 #   verb because tags should be immutable; reach for it only to recover a botched release.
 #
+#   Also provides `gitops.hooks.*`, a generic repo-hook installer.  Like the release side it is
+#   registry-free: the CONTENTS of the hook source dir (default `hooks/`) ARE the registry, so
+#   every file found there is installed into the repo's real git-hooks dir (resolved via
+#   `git rev-parse --git-path hooks`, so it works in worktrees too) as a symlink back to the
+#   tracked source.  Uninstall only removes symlinks we own, never a foreign/hand-written hook.
+#
 #   A LIBRARY (no __main__): the shebang COMPILES it as a parse check; import it to use it:
 #       $(call include.plugins, gitops.cmk)
 #
@@ -27,12 +33,16 @@
 #   gitops.watch.attempts  poll attempts for a run to register          (default: 12)
 #   gitops.version_check   0 disables the semver sanity check           (default: 1)
 #   gitops.force           1 overwrites an existing tag (set by rerelease)
+#   gitops.hooks.src       dir of hook scripts to install               (default: hooks)
 #
 # USAGE (VERSION= and version= are both accepted):
 #   version=1.2.3 make gitops.release                  # cut a release (LIVE: tags + pushes)
 #   version=1.2.3 make gitops.rerelease                # re-tag + force-push an existing version
 #   make mk.namespace.filter/gitops.release.           # list the discovered helper steps
 #   version=1.2.3 make _gitops.release.preflight       # just the checks (non-destructive)
+#   make gitops.hooks.install                          # symlink every hooks/* into .git/hooks
+#   make gitops.hooks.uninstall                        # remove the managed hook symlinks
+#   make gitops.hooks.list                             # show discovered hooks + install state
 
 # Accept either `VERSION=` or `version=`; export so the prereq assertion, the recipe shells,
 # and the dispatched `gitops.release.*` helpers all see one normalized value.
@@ -46,6 +56,7 @@ gitops.watch ?=
 gitops.watch.attempts ?= 12
 gitops.version_check ?= 1
 gitops.force ?= 0
+gitops.hooks.src ?= hooks
 
 gitops.release: assert.env/VERSION
 	@# Cut a release: preflight, run every `gitops.release.*` helper (lexical order), tag +
@@ -72,7 +83,7 @@ _gitops.release.preflight: assert.tool.required/git assert.env/VERSION
 	@# -- the tag is not already taken.
 	if [ "${gitops.version_check}" != 0 ] && ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+([.-].+)?$$'; then $(call log.io, ${red}Error:${no_ansi_dim} VERSION should look like X.Y.Z (got ${no_ansi}${VERSION}${no_ansi_dim})); exit 1; fi \
 	&& if [ -n "`git status --porcelain`" ]; then $(call log.io, ${red}Error:${no_ansi_dim} working tree is not clean); exit 1; fi \
-	&& b ⇐ git branch --show-current \
+	&& b <- git branch --show-current \
 	&& if git rev-parse --abbrev-ref "$${b}@{upstream}" >/dev/null 2>&1; then git fetch -q ${gitops.remote} "$${b}" && { git merge-base --is-ancestor ${gitops.remote}/"$${b}" HEAD || { $(call log.io, ${red}Error:${no_ansi_dim} local ${no_ansi}$${b}${no_ansi_dim} has diverged from ${gitops.remote} (pull/rebase first)); exit 1; }; }; else $(call log.io, ${yellow}note:${no_ansi_dim} no upstream for ${no_ansi}$${b}${no_ansi_dim}, skipping divergence check); fi \
 	&& if [ "${gitops.force}" != 1 ]; then \
 		if git rev-parse "${gitops.tag}" >/dev/null 2>&1; then $(call log.io, ${red}Error:${no_ansi_dim} tag ${no_ansi}${gitops.tag}${no_ansi_dim} already exists locally (use ${no_ansi}gitops.rerelease${no_ansi_dim} to overwrite)); exit 1; fi; \
@@ -83,7 +94,7 @@ _gitops.release.preflight: assert.tool.required/git assert.env/VERSION
 _gitops.release.tag:
 	@# Create the annotated release tag and push the current branch + tag.  DESTRUCTIVE.
 	@# With gitops.force=1 (gitops.rerelease) the tag is MOVED (`-f`) and force-pushed.
-	b ⇐ git branch --show-current \
+	b <- git branch --show-current \
 	&& $(call log.target, ${dim}tagging ${sep} ${no_ansi}${gitops.tag} ${dim}on ${no_ansi}$${b}) \
 	&& git tag $(if $(filter 1,${gitops.force}),-f) -a "${gitops.tag}" -m "Release ${gitops.tag}" \
 	&& git push ${gitops.remote} "$${b}" \
@@ -114,3 +125,59 @@ _gitops.release.watch/%: assert.tool.required/gh
 	&& if [ -z "$${rid}" ]; then $(call log.io, ${red}Error:${no_ansi_dim} no ${no_ansi}$${wf}${no_ansi_dim} run found for ${gitops.tag}); exit 1; fi \
 	&& $(call log.target, ${dim}streaming run ${no_ansi}$${rid}) \
 	&& gh run watch "$${rid}" --exit-status
+
+gitops.hooks.install: assert.tool.required/git
+	@# Install every hook found in `${gitops.hooks.src}` into the repo's git-hooks dir as a
+	@# symlink back to the tracked source.  Registry-free: whatever lives in the source dir is
+	@# a hook.  Re-runnable (symlinks are refreshed).  No-op when the source dir is absent.
+	@#
+	@# USAGE:  make gitops.hooks.install   (or gitops.hooks.src=<dir> make gitops.hooks.install)
+	$(call log.target, ${dim}hooks.install ${sep} ${no_ansi}${gitops.hooks.src})
+	if [ ! -d "${gitops.hooks.src}" ]; then $(call log.io, ${yellow}note:${no_ansi_dim} no hooks dir at ${no_ansi}${gitops.hooks.src}${no_ansi_dim}, nothing to install); exit 0; fi \
+	&& ls -1 "${gitops.hooks.src}" | ${make} flux.each/_gitops.hooks.install
+
+gitops.hooks.uninstall: assert.tool.required/git
+	@# Remove the hook symlinks this plugin installed.  Only symlinks are removed; a foreign or
+	@# hand-written hook of the same name is left in place.  No-op when the source dir is absent.
+	@#
+	@# USAGE:  make gitops.hooks.uninstall
+	$(call log.target, ${dim}hooks.uninstall ${sep} ${no_ansi}${gitops.hooks.src})
+	if [ ! -d "${gitops.hooks.src}" ]; then $(call log.io, ${yellow}note:${no_ansi_dim} no hooks dir at ${no_ansi}${gitops.hooks.src}${no_ansi_dim}, nothing to uninstall); exit 0; fi \
+	&& ls -1 "${gitops.hooks.src}" | ${make} flux.each/_gitops.hooks.uninstall
+
+gitops.hooks.list: assert.tool.required/git
+	@# List hooks discovered in `${gitops.hooks.src}` and whether each is installed (linked),
+	@# occupied by an unmanaged file, or missing from the git-hooks dir.
+	hd <- git rev-parse --git-path hooks \
+	&& $(call log.target, ${dim}hooks ${sep} ${no_ansi}${gitops.hooks.src} ${dim}-> ${no_ansi}$${hd}) \
+	&& if [ ! -d "${gitops.hooks.src}" ]; then $(call log.io, ${yellow}note:${no_ansi_dim} no hooks dir at ${no_ansi}${gitops.hooks.src}); exit 0; fi \
+	&& for hook in `ls -1 "${gitops.hooks.src}"`; do \
+		tgt="$${hd}/$${hook}"; \
+		if [ -L "$${tgt}" ]; then st="${green}linked${no_ansi}"; \
+		elif [ -e "$${tgt}" ]; then st="${yellow}unmanaged${no_ansi}"; \
+		else st="${dim}absent${no_ansi}"; fi; \
+		$(call log.io, ${bold}$${hook}${no_ansi} ${sep} $${st}); \
+	done
+
+_gitops.hooks.install/%:
+	@# Install ONE hook (named `${*}`) from `${gitops.hooks.src}` into the git-hooks dir.  The
+	@# source file is made executable and symlinked (absolute, so it survives worktrees).
+	hook="${*}" \
+	&& src="${gitops.hooks.src}/$${hook}" \
+	&& if [ ! -f "$${src}" ]; then $(call log.io, ${red}Error:${no_ansi_dim} no such hook ${no_ansi}$${src}); exit 1; fi \
+	&& hd <- git rev-parse --git-path hooks \
+	&& srcdir="`cd "${gitops.hooks.src}" && pwd`" \
+	&& mkdir -p "$${hd}" \
+	&& chmod +x "$${src}" \
+	&& ln -sf "$${srcdir}/$${hook}" "$${hd}/$${hook}" \
+	&& $(call log.target, ${green}installed ${sep} ${no_ansi}$${hook} ${dim}-> ${no_ansi}$${hd}/$${hook})
+
+_gitops.hooks.uninstall/%:
+	@# Uninstall ONE hook (named `${*}`): remove it from the git-hooks dir only if it is a
+	@# symlink (i.e. one we own).  A real file left there by something else is not touched.
+	hook="${*}" \
+	&& hd <- git rev-parse --git-path hooks \
+	&& tgt="$${hd}/$${hook}" \
+	&& if [ -L "$${tgt}" ]; then rm -f "$${tgt}" && $(call log.target, ${green}removed ${sep} ${no_ansi}$${tgt}); \
+	elif [ -e "$${tgt}" ]; then $(call log.io, ${yellow}note:${no_ansi_dim} ${no_ansi}$${tgt}${no_ansi_dim} is not a managed symlink, leaving it); \
+	else $(call log.io, ${dim}not installed ${sep} $${hook}); fi

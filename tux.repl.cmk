@@ -1124,7 +1124,7 @@ HOW A REGION BECOMES A COMMAND:
   This is NOT the docker entrypoint=/cmd= mechanism: those are 'docker.run.sh' kwargs used by the
   polyglot.golang CONTAINER BUILD (a separate layer); this wrapper never uses them.
 
-  Concrete (the repl-frame-tree demo, runner = the compiled program):
+  Concrete (the debugger-example demo, runner = the compiled program):
       print  ->  <runner> frame.demo       its stdout (a pty) streams into the panel
       read   ->  <runner> frame.meta       its stdout lines drive the metadata channel
       eval   ->  <runner> tux.repl.kernel   submitted lines go to its stdin; its stdout -> the panel

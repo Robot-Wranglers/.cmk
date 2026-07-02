@@ -32,7 +32,7 @@
 ## OPT-IN REFLECTIVE E: `$(call declare.cmk.virtual_machine, prefix=_cmk__)` (allowlist) or
 ## `... exclude=MAKE CMK MFLAGS` (env minus a parse-time baseline) makes E mirror the live shell env --
 ## `export <var>` is snapshotted at each transfer and re-hydrated by `vm.ctx.receive` (auto-injected by
-## the compiler into every recipe; or the explicit `ᝏvm.ctx.receive` decorator / `@${bind.vm.ctx.receive}`
+## the compiler into every recipe; or the explicit `@vm.ctx.receive` decorator / `@${bind.vm.ctx.receive}`
 ## in plain make) for first-class `$var` reads.  DORMANT (zero cost, nothing created) unless declared.
 ##
 ## Every transfer needs the supervisor (a `mk.interpret` / `cmk run` invocation): the supervisor's
@@ -140,18 +140,18 @@ vm.ctx.receive=[ -s ${__vm__.env.file} ] \
        [ -z "$$__names" ] || { $(call log.target.part1, ${yellow}receiving context from ${bold}$$__from${no_ansi}) ; $(call log.target.part2, ${dim}$$__names${no_ansi}) ; } ; \
        printf '%s' "$$__ctx" | ${jq.run} -r 'to_entries[] | "export \(.key)=\(.value|@sh)"' ; } \
   || true
-# `ᝏvm.ctx.receive` (CMK bind-decorator, PREFIX): prepend the re-hydration to a goal's recipe so it
+# `@vm.ctx.receive` (CMK bind-decorator, PREFIX): prepend the re-hydration to a goal's recipe so it
 # reads its bindings as first-class `$var`s.  The compiler now auto-injects the (guarded) receive into
 # every recipe, so this explicit decorator is the LEGACY/manual form (see compose.mk recipe-joiner).
 bind.vm.ctx.receive=eval "$$(${vm.ctx.receive})"
 
 # ── COMPILE STAGE (plugin-owned, pragma-gated) ────────────────────────────────
 # _cmk_blk_vm_hydrate: a PREPROC stage that lives HERE in the plugin (not in core).  It is a GENERIC
-# lifted stage: `vm_hydrate: true` (or `compiler_pre: ["vm_hydrate"]`) makes core's `.mk.preprocess`
+# lifted stage: `compiler_pre: ["vm_hydrate"]` makes core's `.mk.preprocess`
 # resolve the `vm_hydrate` stage by scanning CMK_PLUGINS_DIR for a `_cmk_blk_vm_hydrate` define (this one),
 # sed-lifting it, and running it over the SOURCE before the `decorators` stage -- via the general
 # `_cmk.stage.lift` mechanism, so core hard-codes NO VM concept and needs NO plugin load at compile time.
-# It prepends a `ᝏvm.ctx.receive`
+# It prepends a `@vm.ctx.receive`
 # decorator above every recipe-bearing target (skipping infra/private NAMES + prereq-only targets +
 # `define` bodies); the existing decorators + joinbody stages then lower it to the deferred
 # `$(call bind.vm.ctx.receive)` (resolved at runtime when this plugin is imported).  So every recipe
@@ -164,12 +164,12 @@ define _cmk_blk_vm_hydrate
   /^[ ]*endef[ ]*$/ { emit(); if (depth > 0) depth--; print; next }
   depth > 0 { emit(); print; next }
   have {
-    if ($0 ~ /^\t/) { print "ᝏvm.ctx.receive"; print held; have = 0; print; next }
+    if ($0 ~ /^\t/) { print "@vm.ctx.receive"; print held; have = 0; print; next }
     emit() }
   /^[^\t#][^=]*:([^=]|$)/ {
     name = $0; sub(/:.*/, "", name); sub(/^[ \t]+/, "", name); sub(/[ \t].*/, "", name)
     if (name ~ SKIP) { print; next }
-    if ($0 ~ /;[ \t]*[^ \t;]/) { print "ᝏvm.ctx.receive"; print; next }
+    if ($0 ~ /;[ \t]*[^ \t;]/) { print "@vm.ctx.receive"; print; next }
     held = $0; have = 1; next }
   { print }
   END { emit() }
@@ -205,6 +205,47 @@ vm.ctx.send=${vm.yield}
 # reflection only -- branch EXECUTION stays with flux.pipeline (not the trampoline), and a
 # backtrace inside a branch shows the fork frame with its sibling branches.
 vm.fork=br="$(strip ${1})" && fr="$$( printf '%s\n' $$br | ${jq.run} -R . | ${jq.run} -sc --arg g "$$br" '{goal:($$g|gsub(" ";",")),kind:"fork",branches:.}' )" && printf '%s' "$$fr" | ${control_stack.frame.push} && ( ${make} flux.pipeline/$$( echo $$br | tr ' ' ',' ) ; rc=$$? ; ${control_stack.frame.pop} >/dev/null 2>&1 ; exit $$rc )
+
+# ── CHOICE / BACKTRACK (Icon-style goal-directed evaluation) ──────────────────
+# vm.choose is vm.fork made SEQUENTIAL and RESUMABLE: it records the untried
+# alternatives as a `kind:"choice"` frame (the same {cont,env,alts} shape the fork
+# frame uses, minus parallel exec) and runs only the FIRST branch, keeping the rest on
+# K.  A later FAILURE unwinds to this frame and takes the next alt -- classic DFS
+# backtracking.  `vm.choose "a b c"` = Icon alternation `a | b | c`.  Branches are
+# SPACE-separated (one `$(call)` arg).  The choice frame's `cont` is the continuation to
+# resume with each alternative; the env snapshot is the trail (restored on backtrack).
+vm.choose=${__vm__.env.capture}set -- $(strip ${1}) && _first="$$1" && shift && _alts="$$*" \
+	&& fr="$$( ${__vm__.env.read} | ${jq.run} -c --arg c "$$( ${__vm__.read} | ${stream.nl.to.space} )" --arg a "$$_alts" '{cont:$$c,env:.,kind:"choice",alts:($$a|split(" ")|map(select(length>0)))}' )" \
+	&& printf '%s' "$$fr" | ${control_stack.frame.push} \
+	&& cont="$$_first" && ${vm.fire}
+# __vm__.backtrack.next: pop K to the nearest choice-frame that still has an untried
+# alt, restore its env (the CEK trail-undo), consume one alt, push the frame back with
+# the remaining alts, and PRINT "alt <cont>" (the goals to run next).  EMPTY output ==
+# no choice frame left == search exhausted.  Non-choice frames above the choice point
+# are discarded (their branch failed, so their work is undone -- correct for DFS).  The
+# SINGLE source of truth, shared by the synchronous `vm.backtrack` verb AND the
+# supervisor trampoline's failure safety-net (see `_mk.super.tramp`).
+__vm__.backtrack.next:; @${__vm__.backtrack.compute}
+__vm__.backtrack.compute=fr="$$( ${control_stack.frame.pop} )" ; last_cont="" ; \
+	while [ -n "$$fr" ] && [ "$$fr" != null ] ; do \
+	  k="`printf '%s' "$$fr" | ${jq.run} -r '.kind//""' 2>/dev/null`" ; \
+	  n="`printf '%s' "$$fr" | ${jq.run} -r '(.alts|length)//0' 2>/dev/null`" ; \
+	  [ "$$k" = choice ] && last_cont="`printf '%s' "$$fr" | ${jq.run} -r '.cont//""'`" ; \
+	  { [ "$$k" = choice ] && [ "$${n:-0}" -ge 1 ] ; } && break ; \
+	  fr="$$( ${control_stack.frame.pop} )" ; \
+	done ; \
+	{ [ -z "$$fr" ] || [ "$$fr" = null ] ; } && { printf '%s' "$$last_cont" ; exit 0 ; } ; \
+	printf '%s' "$$fr" | ${jq.run} -c '.env//{}' | ${__vm__.env.write} ; \
+	alt="`printf '%s' "$$fr" | ${jq.run} -r '.alts[0]'`" ; \
+	printf '%s' "$$fr" | ${jq.run} -c '.alts|=.[1:]' | ${control_stack.frame.push} ; \
+	printf '%s' "$$alt"
+# vm.backtrack: the SYNCHRONOUS unwind (Icon expression failure).  Ask for the next alt
+# and tail-transfer to it; empty == the whole search failed (log + fall through, so the
+# recipe ends and the trampoline terminates).  For UNGUARDED failures the trampoline
+# catches it instead (the `total` path) -- this verb is the ergonomic, noise-free one.
+vm.backtrack=cont="$$( ${make} __vm__.backtrack.next 2>/dev/null )" ; \
+	case "$$cont" in *[![:space:]]*) ${vm.fire} ;; \
+	  *) $(call log.target, ${yellow}✗ search exhausted ${sep} ${dim}no more alternatives) ; true ;; esac
 
 # BACKTRACE: the control-stack tree (K frames, outermost first) + the live continuation.
 __vm__.backtrace:

@@ -12,12 +12,12 @@
 #   Log, a Call-Stack tree, and an Environment snapshot) with zero code in the program being debugged.
 #   Keeping this in its own file preserves both siblings' independence -- neither gains a dependency on
 #   the other; the coupling lives here, on top of both.  (Was hand-written inline in the demo
-#   demos/cmk/repl-frame-tree.cmk; promoted so any program can reuse it.)
+#   demos/cmk/debugger-example.cmk; promoted so any program can reuse it.)
 #
 #   USAGE: in the program's repl manifest, point the read channel at the feed, keep your own print/eval,
 #     and enable vm_trace so every recipe becomes a frame.  The manifest keys are:
 #       repl.read = tux.repl.debugger.feed ,  repl.print = my.program ,  repl.eval = tux.repl.kernel ,
-#       vm_trace = true   (see demos/cmk/repl-frame-tree.cmk for the exact pragma line)
+#       vm_trace = true   (see demos/cmk/debugger-example.cmk for the exact pragma line)
 #     then import the plugin:  $(call include.plugins, tux.repl.debugger.cmk)
 #
 #   The feed reads `__vm__.frames`, so the program must be frame-instrumented: either the `vm_trace`

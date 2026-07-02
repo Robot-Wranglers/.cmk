@@ -11,7 +11,7 @@
 #
 # Surface:
 #   fault.throw(<Type>[,<k=v meta>])   raise a typed fault (emit + fail)
-#   fault.guarded / ᝏfault.guarded     inline catch -> re-throw SubprocessFault
+#   fault.guarded / @fault.guarded     inline catch -> re-throw SubprocessFault
 #   fault/<Type>:                      register a handler (beats this plugin's fault/%:)
 #
 # Promotion notes vs the exceptions.cmk demo:
@@ -24,7 +24,7 @@
 # Defer dispatch to AT-EXIT: `at_exit=dispatch.by_type` registers the drain before the
 # auto-`fault.purge`, so the stack is dispatched/routed before it is removed.  (An
 # ordinary channel is synchronous; faults are the deferred-dispatch case.)
-$(call declare.channel,namespace=fault at_exit=dispatch.by_type)
+cmk.declare.channel(namespace=fault at_exit=dispatch.by_type)
 
 # fault.log: red structured logger (a red replacement-character glyph).
 fault.log=$(call log, ${yellow}${bold}¿${no_ansi}${red} $(1))
@@ -39,7 +39,7 @@ fault.throw=$(call fault.log,${bold}$(strip $(1))) \
 # fault.guarded -- the INLINE catch (synchronous, runs at the failure site).
 # Exposed as a plain MACRO so vanilla Makefiles can append it after a command:
 #     risky-cmd || { $(fault.guarded) }
-# ...and bound to bind.fault.guarded so CMK consumers get the `ᝏ` decorator form.
+# ...and bound to bind.fault.guarded so CMK consumers get the `@` decorator form.
 # WARNING: keep the body a brace group -- `&&`/`||` are equal-precedence, else the
 # catch would leak onto the success path.
 fault.guarded={ rc=$$? ; $(call log.target,${dim}${yellow}caught abnormal exit ${sep} ${dim}code=$${rc} ${sep} ${dim}throw=SubprocessFault) ; $(call fault.throw,SubprocessFault,kind=external code=$${rc}) ; }
@@ -52,11 +52,11 @@ fault.show=$(call log.trace, ${@}) ; $(call fault.log,Exception ${sep} ${bold}`e
 
 # ── default routes: THIS module owns `fault/%:` ; consumers add specific types ──
 fault/SubprocessFault:
-	$(call fault.show)
+	cmk.fault.show()
 	cmk.log.target(${yellow}SubprocessFault ${sep} unexpected tool exit)
 
 fault/%:
 	@# fallback: no handler for this type.  NB: no `exit` -- a handler running at
 	@# supervisor-exit can't change the process code (the throw already set it).
-	$(call fault.show)
+	cmk.fault.show()
 	cmk.fault.log(${bold}UNHANDLED ${sep} ${*} ${sep} no handler registered)
