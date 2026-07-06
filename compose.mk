@@ -644,6 +644,107 @@ endif
 MKPARSE_IMG?=ghcr.io/mattvonrocketstein/mk.parse:latest
 mkparse=$(trace_maybe) && ${docker.run.base} ${MKPARSE_IMG} $${subcommand:-targets} $${mkparse_args:-}
 
+# USAGE: $(call mk.kwargs.get, <args>, <key>)  ->  the bare value, or empty.
+# The fork-free, pure-make counterpart to `mk.unpack.kwargs`: it RETURNS the
+# value instead of setting `kwargs_<key>`, and handles only bare `k=v` (no
+# quotes, defaults, or dupe-check -- use mk.unpack.kwargs for those).  Factors
+# out the `$(patsubst K=%,%,$(filter K=%,..))` idiom (io.stack / io.channel / ..).
+mk.kwargs.get=$(patsubst $(strip ${2})=%,%,$(filter $(strip ${2})=%,${1}))
+
+# ══ __future__: PROVISIONAL sugar (opt-in, may change) ══════════════════════
+# The `declare.*` family (declare.channel, declare.module, declare.target, ..)
+# is ONE pattern, hand-rolled many times: a `define _declare.X .. endef` code
+# TEMPLATE + a self-evaling `declare.X = $(eval $(call _declare.X,$(1)))`
+# wrapper, so `$(call declare.X, args)` DECLARES an X -- it injects that X's
+# definitions via $(eval).  (Injecting bindings is a DECLARATION, not a macro's
+# in-place substitution -- hence the family's name.)  `__future__.declare` is
+# the declaration-form FACTORY that abstracts the boilerplate:
+#   $(call __future__.declare, NAME, TMPL)  ==  `NAME = $(eval $(call TMPL,$(strip $(1))))`
+# Given a `define TMPL` template over $(1), it mints NAME as a self-instantiating
+# declaration form.  The minted form is SINGLE-ARG -- the whole call-string reaches
+# TMPL as `$(1)` (a `k=v ..` kwargs list or space-list, parsed inside TMPL) -- and
+# that arg is $(strip)ped, so `$(call NAME, x)` hands TMPL a clean `x`, not the
+# ` x` the comma leaves (else a naive `$(1).on:` template would emit ` x.on`).
+# Provisional -- namespaced `__future__`.
+__future__.declare=$(eval $(strip $(1)) = $$(eval $$(call $(strip $(2)),$$(strip $$(1)))))
+
+# `__future__.class`: a SPECIALIZED declaration form, built ON TOP of
+# `__future__.declare`, whose template is a linear mixin CHAIN.  `class(Name,
+# M1 M2 ..)` generates a per-class chain template (`Name.__tmpl`) that binds
+# `${self}` = the instance identity (the `namespace=` kwarg else the bare first
+# word), then runs each mixin's template in order (a linear MRO), stamping every
+# mixin's methods onto the instance -- then `__future__.declare`s `Name` from
+# it.  Mixins are self-evaling constructors keyed on `${self}`.  Bakes `${self}`
+# at instantiation (single `${self}`, not `$$`).  See demos/cmk/banana-oop.cmk +
+# demos/cmk/actor.cmk.
+define __future__._class
+$(strip $(1)).__tmpl = $$(eval self := $$(or $$(call mk.kwargs.get,$$(1),namespace),$$(firstword $$(1))))$(foreach _b,$(2),$$(eval $$(call $(strip $(_b)),$$(1))))
+$$(call __future__.declare,$(strip $(1)),$(strip $(1)).__tmpl)
+endef
+__future__.class=$(eval $(call __future__._class,${1},${2}))
+
+# `_constructor`: the CONSTRUCTOR form -- IN-PLACE, single-arg.  PRIVATE (leading
+# `_`): the sole intended caller is the public `constructor` keyword just below;
+# it is the guts, not a user-facing verb (which is why it stays out of the
+# provisional-public `__future__.*` namespace even though it is built on
+# `__future__.declare`).  Give it the NAME of a template (a `define` or a cooked
+# `:=` banana) and it rewrites that SAME name into a self-evaling banana
+# constructor.  It first STASHES the template into `NAME.__body` via a `define`
+# copy (`$(value NAME)` between `${nl}`s -- keeps `$`/newlines AND preserves
+# RECURSIVE flavor, so `$(call NAME.__body,..)` re-expands `${self}` at
+# instantiation; a `:=` copy would go simply-expanded and bake nothing).  The
+# copy runs BEFORE the re-declare clobbers NAME.  Then it re-declares NAME to, at
+# instantiation, AUTO-BIND the banana bodies and run the stashed template.
+# Bindings: `${self}` = body1's name (the `def=` value / artifact identity),
+# `${body2}`,`${body3}`,.. = the extra payload names.  So a constructor is ONE
+# name, no `mk.unpack.kwargs` prologue, no `${kwargs_def}` accessors:
+#   declare.container.job := (| ${self}:; ${make} mk.def.read/${body2} .. |)
+#   $(call _constructor, declare.container.job)   # normally via `constructor`
+# Where `class` builds an instance from a mixin CHAIN (OOP), `_constructor` builds
+# an ARTIFACT from block PAYLOADS -- no `${self}`-keyed methods, no MRO.  (Binds
+# every `def%` body; a stray `using default=..` kwarg is the lone collision; a
+# literal `endef` line in the template would close the copy early.)  `⬥NAME`
+# can't appear in the template -- it lowers at compile time, before the ctor's
+# eval; read bodies at recipe time with `mk.def.read`.
+define _constructor.build
+$(strip $(1)).__tmpl = $$(eval self := $$(call mk.kwargs.get,$$(1),def))$$(foreach _kv,$$(filter def%,$$(1)),$$(eval body$$(patsubst def%,%,$$(word 1,$$(subst =, ,$$(_kv)))) := $$(word 2,$$(subst =, ,$$(_kv)))))$$(eval $$(call $(strip $(1)).__body,$$(1)))
+$$(call __future__.declare,$(strip $(1)),$(strip $(1)).__tmpl)
+endef
+_constructor=$(eval define $(strip ${1}).__body$(nl)$(value $(strip ${1}))$(nl)endef)$(eval $(call _constructor.build,${1}))
+
+# `constructor NAME(| template |)`: the PUBLIC banana-facing keyword -- the only
+# intended entry to the in-place `_constructor` form above.  ONE block declares a
+# constructor (no separate `:=`/define + `ctor(..)` line).  The banana lowers to
+# `define NAME .. endef` + `$(call constructor, def=NAME)`; this forwards NAME to
+# `_constructor`, which rewrites NAME into the self-evaling constructor.  For a
+# template that uses `this.X(..)` callforms, cook the body with a `cooked` postfix:
+#   constructor declare.container.job(|
+#   ${self}:; this.mk.def.read(${body2}) | cmd=sh this.docker.lambda(${self})
+#   |) cooked
+# A bare `constructor NAME(|..|)` leaves the body raw (write `${make} X/..`).
+constructor=$(call _constructor,$(call mk.kwargs.get,${1},def))
+
+
+# mk.memoize: factory for a run-once, lazily-resolved variable -- the shared
+# shape behind jq.run/yq.run/jq.run.pipe/yq.run.pipe/jb.run/docker.compose/
+# _gum.present.  A self-evaling DECLARATION form: `$(call mk.memoize,NAME)`
+# injects NAME's cache + accessor (no caller-side `$(eval $(call ..))`).  It is
+# minted BY `__future__.declare` (defined just above) over the `_mk.memoize`
+# template -- the first cross-subsystem use of that factory outside the OOP forms.
+# Given a base NAME with a companion `_NAME.detect` (recursive `=`, holding the
+# expensive probe), the accessor resolves that probe at most once per process --
+# on first expansion, never on the compile/interpret hot path -- caching the
+# result in `_NAME.cached` (simple `:=`, pre-declared empty so `--warn-undefined-
+# variables` stays quiet).  Later reads short-circuit via `$(or ..)` before the
+# detect branch is ever expanded, so the cached value is byte-identical to an
+# eager `:=` on any host where the probe succeeds.
+#   Usage:  _foo.detect = $(shell probe) ;  $(call mk.memoize,foo)
+define _mk.memoize
+_$(1).cached :=
+$(1) = $$(or $${_$(1).cached},$$(eval _$(1).cached := $${_$(1).detect})$${_$(1).cached})
+endef
+$(call __future__.declare, mk.memoize, _mk.memoize)
+
 # Macros for use with jq/yq/jb, using local tools if available and falling back to dockerized versions
 jq.docker=${docker.run.base} -e key=$${key:-} ghcr.io/jqlang/jq:$${JQ_VERSION:-1.7.1}
 yq.docker=${docker.run.base} -e key=$${key:-} mikefarah/yq:$${YQ_VERSION:-4.43.1}
@@ -658,23 +759,18 @@ _yq.run.detect=$(shell which yq 2>/dev/null || echo "${yq.docker}")
 _jq.run.detect=$(shell which jq 2>/dev/null || echo "${jq.docker}")
 _jq.run.pipe.detect=$(shell which jq 2>/dev/null || echo "${docker.run.base} -i -e key=$${key:-} ghcr.io/jqlang/jq:$${JQ_VERSION:-1.7.1}")
 _yq.run.pipe.detect=$(shell which yq 2>/dev/null || echo "${docker.run.base} -i -e key=$${key:-} mikefarah/yq:$${YQ_VERSION:-4.43.1}")
-_yq.run.cached:=
-_jq.run.cached:=
-_jq.run.pipe.cached:=
-_yq.run.pipe.cached:=
-yq.run=$(or ${_yq.run.cached},$(eval _yq.run.cached:=${_yq.run.detect})${_yq.run.cached})
-jq.run=$(or ${_jq.run.cached},$(eval _jq.run.cached:=${_jq.run.detect})${_jq.run.cached})
-jq.run.pipe=$(or ${_jq.run.pipe.cached},$(eval _jq.run.pipe.cached:=${_jq.run.pipe.detect})${_jq.run.pipe.cached})
-yq.run.pipe=$(or ${_yq.run.pipe.cached},$(eval _yq.run.pipe.cached:=${_yq.run.pipe.detect})${_yq.run.pipe.cached})
+$(call mk.memoize,yq.run)
+$(call mk.memoize,jq.run)
+$(call mk.memoize,jq.run.pipe)
+$(call mk.memoize,yq.run.pipe)
 jb.docker:=docker container run $${docker_extra:-} --rm  ghcr.io/h4l/json.bash/jb:$${JB_CLI_VERSION:-0.2.2}
 jb.array=docker_extra="$${docker_extra:-} --entrypoint jb-array"; ${jb.docker}
 # jb resolution: prefer a local `jb` (json.bash) on PATH; else the dockerized fallback -- a container per
-# call, which is slow, so emit a ONE-TIME warning to stderr (the detect runs once via the `_jb.cached` eval,
+# call, which is slow, so emit a ONE-TIME warning to stderr (the detect runs once via mk.memoize's cache,
 # mirroring jq.run/yq.run).  DOUBLE-quote the fallback so the detect-shell BAKES $${JB_CLI_VERSION} now --
 # else the cached value's `$${...}` (single-`$` after this expansion) gets eaten as a make var on re-use.
-_jb.detect=$(shell which jb 2>/dev/null || { printf '%b' '${yellow}⚠ cmk: jb (json.bash) is not on PATH -- using the dockerized fallback (a container per call; slower).  Run: ${CMK_BIN} jb.init  (installs json.bash into the XDG bin on PATH).${no_ansi}\n' >&2 ; echo "${jb.docker}" ; })
-_jb.cached:=
-jb.run=$(or ${_jb.cached},$(eval _jb.cached:=${_jb.detect})${_jb.cached})
+_jb.run.detect=$(shell which jb 2>/dev/null || { printf '%b' '${yellow}⚠ cmk: jb (json.bash) is not on PATH -- using the dockerized fallback (a container per call; slower).  Run: ${CMK_BIN} jb.init  (installs json.bash into the XDG bin on PATH).${no_ansi}\n' >&2 ; echo "${jb.docker}" ; })
+$(call mk.memoize,jb.run)
 # The jb command.  Bare `${jb}` is the plain invocation (callers append their own
 # args); the call-form `$(call jb, k=v ..)` / `cmk.jb(k=v ..)` appends the kwargs,
 # yielding a ready-to-run command that emits the JSON object.  The $(origin) guard
@@ -931,10 +1027,7 @@ jq.column.zipper=${jq} -R 'split(" ")' \
 # re-parses this file ~20x and used to pay this probe on every parse. The cached
 # value is byte-identical to the old `:=` result (availability is process-stable).
 _docker.compose.detect=$(shell docker compose >/dev/null 2>/dev/null && echo docker compose || echo echo DOCKER-COMPOSE-MISSING)
-# Pre-declared empty so the first `$(or ...)` read is of a *defined* var (keeps
-# `--warn-undefined-variables` quiet); the eval below rewrites it on first use.
-_docker.compose.cached:=
-docker.compose=$(or ${_docker.compose.cached},$(eval _docker.compose.cached:=${_docker.compose.detect})${_docker.compose.cached})
+$(call mk.memoize,docker.compose)
 
 docker.containers.all:=docker ps --format json
 
@@ -1758,8 +1851,8 @@ endef
 # `io.gum.run`/`io.get.choice` then branch at call-time via `.$(_gum.present)`
 # indirection ("1" -> on PATH, "0" -> dockerized), byte-identical to the old
 # ifeq selection (verified against both branches), but no probe unless used.
-_gum.present.cached :=
-_gum.present = $(or ${_gum.present.cached},$(eval _gum.present.cached := $(shell which gum >/dev/null 2>/dev/null && echo 1 || echo 0))${_gum.present.cached})
+__gum.present.detect = $(shell which gum >/dev/null 2>/dev/null && echo 1 || echo 0)
+$(call mk.memoize,_gum.present)
 io.gum.run=${io.gum.run.$(_gum.present)}
 io.gum.run.1=`which gum`
 io.gum.run.0=${io.gum.docker}
@@ -3203,7 +3296,7 @@ define .awk.zip.linefeeds
   # custom `cmk_sugar` with embedded col-0 `#` is the one uncovered edge.  The trailing
   # `/^#/{next}` does the top-level comment-strip that used to be a separate `grep -v '^#'`
   # (which wrongly stripped INSIDE these blocks -- the bug this guard fixes).
-  inbanana == 1 { print; if ($0 ~ /^[ \t]*\|\)/) inbanana = 0; next }
+  inbanana == 1 { print; if ($0 ~ /^[ \t]*\|[)\]}]/) inbanana = 0; next }
   sclose != "" { print; if (index($0, sclose)) sclose = ""; next }
   /^define / { def_depth++; print; next }
   /^endef[ \t]*$/ { if (def_depth > 0) def_depth--; print; next }
@@ -3214,7 +3307,7 @@ define .awk.zip.linefeeds
   /^[ \t]*🞹/ { print; sclose = "🞹"; next }
   /^[ \t]*⫻/  { print; sclose = "⫻"; next }
   /^[ \t]*⨖/  { print; sclose = "⨖"; next }
-  /^[ \t]*([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+\(\|/ { print; if ($0 !~ /\|\)/) inbanana = 1; next }
+  /^[ \t]*([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+[([{]\|/ { print; if ($0 !~ /\|[)\]}]/) inbanana = 1; next }
   /^#/ { next }
   {   if (length(continuation_line) > 0) {
           gsub(/^[ \t]+/, "", $0)
@@ -3279,9 +3372,9 @@ define .awk.cmk.dedent
   }
   # not in a block: detect an opener (banana `NAME(|` or assignment-form `NAME <op> (|`
   # first, then verbatim-skip, then dedentable set)
-  { if (($0 ~ /^[ \t]*([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+\(\|/ || $0 ~ /^[ \t]*[A-Za-z0-9._-]+[ \t]*(:=|=|<-)[ \t]*\(\|/) && $0 !~ /\|\)/) {
-        sclose = "\\|\\)"
-        name = $0; sub(/\(\|.*$/, "", name); sub(/^[ \t]*/, "", name)
+  { if (($0 ~ /^[ \t]*([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+[([{]\|/ || $0 ~ /^[ \t]*[A-Za-z0-9._-]+[ \t]*(:=|=|<-)[ \t]*[([{]\|/) && $0 !~ /\|[)\]}]/) {
+        sclose = "\\|[)\\]}]"
+        name = $0; sub(/[([{]\|.*$/, "", name); sub(/^[ \t]*/, "", name)
         if (name ~ /(:=|=|<-)[ \t]*$/) sub(/[ \t]*(:=|=|<-)[ \t]*$/, "", name)   # assignment form: LHS is the name
         else sub(/^.*[ \t]/, "", name)                                            # named form: last word before `(|`
         inblk = 1; n = 0; havep = 0; prefix = ""; ok = 1; buf[++n] = $0; next
@@ -3382,18 +3475,41 @@ mk.preprocess: flux.timer/.mk.preprocess
 .cmk.capture=awk "$${_cmk_blk_capture}"
 .cmk.unsentinel=awk "$${_cmk_blk_unsentinel}"
 .cmk.receivers=awk -v RECEIVERS="$${RECEIVERS}" -v DIVERGENT="${mk.twin.divergent}" -v SHADOW_STRICT="$${CMK_SHADOW_STRICT:-0}" -v NS_LINT="$${CMK_NS_LINT:-1}" "$${_cmk_blk_receivers}"
-# Pre-scan: extract receiver names from the source's `declare.*`/`*.import` calls + sugar blocks --
-# the namespaces that scaffold a `<name>.<method>` target family.  Emits a deduped space-list for the
-# receivers stage's -v RECEIVERS.  Per kind:
-#   channel / agent / module / def / target import -- `namespace=NAME` (the one standard
-#                 declaration kwarg), and the `⦖ .. ⦕ as NAME` sugar (as-clause)
-#   polyglot / single-image container -- `def=NAME` (block-name namespace; anchored to
-#                 polyglot/container tokens so a module's *source* `def=` never leaks in)
-#   sugar blocks -- `⟦ NAME` (polyglot), `🞹 NAME` (code), `⫻ Dockerfile.NAME` (image; prefix stripped)
-# Over-registration is harmless: the receivers stage only fires on `NAME.method<call-suffix>` in recipe
-# content.  Multi-service compose keeps the `ᐉ`/`.dispatch` send -- its service names are dynamic (from
-# the compose file), so a compile-time scan cannot know them.
-.cmk.scan.receivers=( grep -aoE 'namespace=[A-Za-z0-9._-]+|(declare\.polyglots?|polyglots?\.import|declare\.container|docker\.import)[^)]*def=[A-Za-z0-9._-]+|⦕[ \t]*as[ \t]+[A-Za-z0-9._-]+|(⟦|🞹|⫻)[ \t]*[A-Za-z0-9._-]+|^[ \t]*import[ \t]+.*[ \t]+as[ \t]+[A-Za-z0-9._-]+([ \t]*,[ \t]*[A-Za-z0-9._-]+)*|^[ \t]*(open|import)[ \t]+[A-Za-z0-9._-]+([ \t]*,[ \t]*[A-Za-z0-9._-]+)*|[A-Za-z0-9._-]+\(\|' || true ) | sed -E 's/.*[ \t]as[ \t]+//; s/.*(namespace=|def=)//; s/^[ \t]*(open|import)[ \t]+//; s/[ \t]*,[ \t]*/ /g; s/^(⟦|🞹|⫻)[ \t]*//; s/\(\|$$//; s/^Dockerfile\.//' | sort -u | tr '\n' ' '
+# --- DECLARATION / BINDING-FORM GRAMMAR (living spec; keep in sync) -------------------
+# `.cmk.scan.receivers` is the single place that enumerates every cmk-lang form which
+# INTRODUCES a bindable name -- a receiver namespace scaffolding a `<name>.<method>`
+# target family.  It is a compile-time pre-scan of RAW source, not a pipeline stage:
+# the `receivers` stage runs early (before `imports`, and before imported files are
+# pulled in), so only an upfront source scan sees every namespace before sends are
+# rewritten.  That independence makes it a THIRD hand-synced copy of the declaration
+# grammar (compiler stages + this scanner + prism-cmk.js/cmk.tmLanguage.json).
+#   SYNC RULE: a new binding form => add a `_recv.*` row below, AND teach the stage that
+#   lowers it, AND (if lexically visible) both highlighter grammars.  Over-registration
+#   is harmless (receivers only fires on `NAME.method<call-suffix>` in recipe content);
+#   under-registration silently drops a family.  Multi-service compose keeps the
+#   `ᐉ`/`.dispatch` send -- its service names are dynamic (from the compose file), so a
+#   compile-time scan cannot know them.
+#
+#   One ROW per form (grep pattern -> the `sed` extractor that yields the bare name):
+#     _recv.banana    `NAME(|`/`[|`/`{|`       banana block name    strip open digraph
+#     _recv.kwarg     `namespace=NAME`         declare.*/*.import    strip `namespace=`
+#     _recv.def       `..def=NAME` (polyglot/  container/image      strip `def=`,`Dockerfile.`
+#                     container/docker tokens)
+#     _recv.asclause  `⦕ as NAME`              module sugar close    strip `.. as `
+#     _recv.glyph     `⟦|🞹|⫻ NAME`            polyglot/code/docker  strip leading glyph
+#     _recv.importas  `import .. as NAME[,..]` aliased import        strip `.. as `, split `,`
+#     _recv.openlist  `open|import NAME[,..]`  open/import list      strip kw, split `,`
+# -------------------------------------------------------------------------------------
+_recv.banana   = [A-Za-z0-9._-]+[([{]\|
+_recv.kwarg    = namespace=[A-Za-z0-9._-]+
+_recv.def      = (declare\.polyglots?|polyglots?\.import|declare\.container|docker\.import)[^)]*def=[A-Za-z0-9._-]+
+_recv.asclause = ⦕[ \t]*as[ \t]+[A-Za-z0-9._-]+
+_recv.glyph    = (⟦|🞹|⫻)[ \t]*[A-Za-z0-9._-]+
+_recv.importas = ^[ \t]*import[ \t]+.*[ \t]+as[ \t]+[A-Za-z0-9._-]+([ \t]*,[ \t]*[A-Za-z0-9._-]+)*
+_recv.openlist = ^[ \t]*(open|import)[ \t]+[A-Za-z0-9._-]+([ \t]*,[ \t]*[A-Za-z0-9._-]+)*
+# grep the alternation (row order matters -- the sed extractors assume it), then reduce
+# each match to its bare name(s) and dedupe.  Each `s///` serves the row(s) noted above.
+.cmk.scan.receivers=( grep -aoE '$(_recv.kwarg)|$(_recv.def)|$(_recv.asclause)|$(_recv.glyph)|$(_recv.importas)|$(_recv.openlist)|$(_recv.banana)' || true ) | sed -E 's/.*[ \t]as[ \t]+//; s/.*(namespace=|def=)//; s/^[ \t]*(open|import)[ \t]+//; s/[ \t]*,[ \t]*/ /g; s/^(⟦|🞹|⫻)[ \t]*//; s/[([{]\|$$//; s/^Dockerfile\.//' | sort -u | tr '\n' ' '
 .cmk.decorators=awk "$${_cmk_blk_dec}"
 # Dialect/sugar as pipe-stage macros (verbatim transcription of the target bodies
 # below; only `${@}` -> literal name and `#` -> `\#` for the make-variable comment
@@ -5022,6 +5138,30 @@ mk.stat:
 		--argjson pragma '${__pragma__}' \
 		'${_mk.stat.jq}'
 
+mk.compiler.stats:
+	@# Size metrics for the cmk compiler, i.e. the `define .awk.*` blocks
+	@# embedded in core.  `compiler_sloc` counts the non-blank / non-comment
+	@# lines inside those blocks; `compiler_ratio` is the ratio of non-comment
+	@# core source *characters* to non-comment awk *characters* (how much core
+	@# there is per character of compiler).  The `define`/`endef` boundary lines
+	@# and all comment / blank lines are excluded from every figure.  Output is
+	@# JSON on stdout (logs go to stderr) so it composes with jq and feeds the
+	@# docs/stats renderer.  This is the ad-hoc entrypoint for the same numbers
+	@# published on the stats page.
+	@#
+	@# USAGE: ./compose.mk mk.compiler.stats
+	$(call log.compiler, ${@} ${sep}${dim} awk-block metrics for ${no_ansi}${CMK_SRC})
+	LC_ALL=C awk ' \
+		{ raw=$$0; t=raw; sub(/^[[:space:]]+/,"",t); \
+		  is_c=(t ~ /^#/ || t ~ /^@#/); is_b=(t==""); } \
+		/^define \.awk\./ { inb=1; next } \
+		inb && /^endef/   { inb=0; next } \
+		{ if (!is_c && !is_b) cc+=length(raw); \
+		  if (inb && !is_c && !is_b) { sloc++; ac+=length(raw); } } \
+		END { r = ac>0 ? cc/ac : 0; \
+		  printf "{\"compiler_sloc\":%d,\"core_chars\":%d,\"awk_chars\":%d,\"compiler_ratio\":%.2f}\n", sloc, cc, ac, r }' \
+		${CMK_SRC} | ${jq} .
+
 mk.super.interrupt mk.interrupt: mk.interrupt/SIGINT
 	@# The default interrupt.  This is shorthand for mk.interrupt/SIGINT
 
@@ -5437,80 +5577,6 @@ $(eval $(if ! $(or $(strip $(_kwargs_value)),$(filter undefined,$(origin 3)),,${
 	export kwargs_$(strip ${2})=$(_kwargs_value),
 	$(error `mk.unpack.kwargs` expected parameter '$(strip ${2})', extracted `$(_kwargs_value)` and no default value was provided.  Input: `$(strip ${1})`)))
 endef
-
-# USAGE: $(call mk.kwargs.get, <args>, <key>)  ->  the bare value, or empty.
-# The fork-free, pure-make counterpart to `mk.unpack.kwargs`: it RETURNS the
-# value instead of setting `kwargs_<key>`, and handles only bare `k=v` (no
-# quotes, defaults, or dupe-check -- use mk.unpack.kwargs for those).  Factors
-# out the `$(patsubst K=%,%,$(filter K=%,..))` idiom (io.stack / io.channel / ..).
-mk.kwargs.get=$(patsubst $(strip ${2})=%,%,$(filter $(strip ${2})=%,${1}))
-
-# ══ __future__: PROVISIONAL sugar (opt-in, may change) ══════════════════════
-# The `declare.*` family (declare.channel, declare.module, declare.target, ..)
-# is ONE pattern, hand-rolled many times: a `define _declare.X .. endef` code
-# TEMPLATE + a self-evaling `declare.X = $(eval $(call _declare.X,$(1)))`
-# wrapper, so `$(call declare.X, args)` DECLARES an X -- it injects that X's
-# definitions via $(eval).  (Injecting bindings is a DECLARATION, not a macro's
-# in-place substitution -- hence the family's name.)  `__future__.declare` is
-# the declaration-form FACTORY that abstracts the boilerplate:
-#   $(call __future__.declare, NAME, TMPL)  ==  `NAME = $(eval $(call TMPL,$(1)))`
-# Given a `define TMPL` template over $(1), it mints NAME as a self-
-# instantiating declaration form.  Provisional -- namespaced `__future__`.
-__future__.declare=$(eval $(strip $(1)) = $$(eval $$(call $(strip $(2)),$$(1))))
-
-# `__future__.class`: a SPECIALIZED declaration form, built ON TOP of
-# `__future__.declare`, whose template is a linear mixin CHAIN.  `class(Name,
-# M1 M2 ..)` generates a per-class chain template (`Name.__tmpl`) that binds
-# `${self}` = the instance identity (the `namespace=` kwarg else the bare first
-# word), then runs each mixin's template in order (a linear MRO), stamping every
-# mixin's methods onto the instance -- then `__future__.declare`s `Name` from
-# it.  Mixins are self-evaling constructors keyed on `${self}`.  Bakes `${self}`
-# at instantiation (single `${self}`, not `$$`).  See demos/cmk/banana-oop.cmk +
-# demos/cmk/actor.cmk.
-define __future__._class
-$(strip $(1)).__tmpl = $$(eval self := $$(or $$(call mk.kwargs.get,$$(1),namespace),$$(firstword $$(1))))$(foreach _b,$(2),$$(eval $$(call $(strip $(_b)),$$(1))))
-$$(call __future__.declare,$(strip $(1)),$(strip $(1)).__tmpl)
-endef
-__future__.class=$(eval $(call __future__._class,${1},${2}))
-
-# `__future__.ctor`: the CONSTRUCTOR form -- IN-PLACE, single-arg.  Give it the
-# NAME of a template (a `define` or a cooked `:=` banana) and it rewrites that
-# SAME name into a self-evaling banana constructor.  It first STASHES the
-# template into `NAME.__body` via a `define` copy (`$(value NAME)` between
-# `${nl}`s -- keeps `$`/newlines AND preserves RECURSIVE flavor, so `$(call
-# NAME.__body,..)` re-expands `${self}` at instantiation; a `:=` copy would go
-# simply-expanded and bake nothing).  The copy runs BEFORE the re-declare
-# clobbers NAME.  Then it re-declares NAME to, at instantiation, AUTO-BIND the
-# banana bodies and run the stashed template.  Bindings: `${self}` = body1's
-# name (the `def=` value / artifact identity), `${body2}`,`${body3}`,.. = the
-# extra payload names.  So a constructor is ONE name, no `mk.unpack.kwargs`
-# prologue, no `${kwargs_def}` accessors:
-#   declare.container.job := (| ${self}:; ${make} mk.def.read/${body2} .. |)
-#   $(call __future__.ctor, declare.container.job)
-# Where `class` builds an instance from a mixin CHAIN (OOP), `ctor` builds an
-# ARTIFACT from block PAYLOADS -- no `${self}`-keyed methods, no MRO.  (Binds
-# every `def%` body; a stray `using default=..` kwarg is the lone collision; a
-# literal `endef` line in the template would close the copy early.)  `⬥NAME`
-# can't appear in the template -- it lowers at compile time, before the ctor's
-# eval; read bodies at recipe time with `mk.def.read`.  This is the
-# `__future__.macro` one reaches for -- named `ctor` for the banana it serves.
-define __future__._ctor
-$(strip $(1)).__tmpl = $$(eval self := $$(call mk.kwargs.get,$$(1),def))$$(foreach _kv,$$(filter def%,$$(1)),$$(eval body$$(patsubst def%,%,$$(word 1,$$(subst =, ,$$(_kv)))) := $$(word 2,$$(subst =, ,$$(_kv)))))$$(eval $$(call $(strip $(1)).__body,$$(1)))
-$$(call __future__.declare,$(strip $(1)),$(strip $(1)).__tmpl)
-endef
-__future__.ctor=$(eval define $(strip ${1}).__body$(nl)$(value $(strip ${1}))$(nl)endef)$(eval $(call __future__._ctor,${1}))
-
-# `constructor NAME(| template |)`: the banana-facing keyword for the in-place
-# `__future__.ctor` -- ONE block declares a constructor (no separate `:=`/define
-# + `ctor(..)` line).  The banana lowers to `define NAME .. endef` + `$(call
-# constructor, def=NAME)`; this forwards NAME to `__future__.ctor`, which
-# rewrites NAME into the self-evaling constructor.  For a template that uses
-# `this.X(..)` callforms, cook the body with a `cooked` postfix:
-#   constructor declare.container.job(|
-#   ${self}:; this.mk.def.read(${body2}) | cmd=sh this.docker.lambda(${self})
-#   |) cooked
-# A bare `constructor NAME(|..|)` leaves the body raw (write `${make} X/..`).
-constructor=$(call __future__.ctor,$(call mk.kwargs.get,${1},def))
 
 define _mk.unpack.kwargs
 export _kwargs_value="$(shell \
@@ -8893,6 +8959,18 @@ define .awk.sugar
       spec_runtime = (_T[2] == "r"); spec_ctor = _T[3]; spec_kw = ""
       for (_i = 4; _i <= _n; _i++) spec_kw = (spec_kw == "" ? _T[_i] : spec_kw " " _T[_i])
    }
+   # BANANA-BRACKET FAMILIES.  `(|` is raw (no treatment); `[|` deep-cooks (built in); extra
+   # opens (e.g. `{|`) map to a treatment from the `block_brackets` pragma
+   # (env CMK_PRAGMA_BLOCK_BRACKETS, entries `<open><close>=<treatment>`, e.g. `{}=stream.echo`).
+   # A frame records BTREAT[<its open char>] as fcook[]; frame_emit feeds it through the SAME
+   # postfix-treatment path a trailing `cooked`/`cooked_deeply`/<target> word takes -- so a
+   # bracket is a first-class block delimiter, never a synthesized trailer.
+   BTREAT["["] = "cooked_deeply"
+   _n = split(ENVIRON["CMK_PRAGMA_BLOCK_BRACKETS"], _BB, /[ \t]+/)
+   for (_i = 1; _i <= _n; _i++) {
+      if (_BB[_i] == "") continue
+      _eq = index(_BB[_i], "="); if (_eq < 3) continue
+      BTREAT[substr(_BB[_i], 1, 1)] = substr(_BB[_i], _eq + 1) }
   }
   # Build one lowered call line.  decl: `$(call CTOR, def=NAME KW)`; runtime: `NAME:; $(call CTOR,KW)`.
   function build_call(name, ctor, kw, runtime) {
@@ -8903,16 +8981,31 @@ define .awk.sugar
   # NESTED (d>1), else to stdout.  This is what makes nesting work -- a closed inner
   # banana's `define`/sentinel lines land inside the outer banana's (still-buffering) body.
   function out(s, d) { if (d > 1) fbody[(d - 1), ++fbn[d - 1]] = s; else print s }
+  # Banana-bracket digraphs (any family): `bopen` returns the position of the first OPEN
+  # (`(|`/`[|`/`{|`) in s and stashes its bracket char in `_bch`; `bclose` the first CLOSE
+  # (`|)`/`|]`/`|}`).  These let one delimiter scanner serve every family (see BTREAT above).
+  function bopen(s) { if (match(s, /[([{]\|/)) { _bch = substr(s, RSTART, 1); return RSTART } _bch = ""; return 0 }
+  function bclose(s) { if (match(s, /\|[)\]}]/)) return RSTART; return 0 }
+  # Emit frame D's buffered PRIMARY body as `define NAME`/`⟅NAME⟆` per its bracket cook flag
+  # (fcook[d]): `cooked_deeply` deep-cooks (rewrite nested define/endef too), `cooked` shallow.
+  # Shared by the multi-body flush sites so a `[| A |][| B |]` cooks every body, not just via
+  # frame_emit's single-body path.
+  function fdef(nm, d,   _j, _line, _ck, _rc) {
+   _ck = (fcook[d] == "cooked" || fcook[d] == "cooked_deeply"); _rc = (fcook[d] == "cooked_deeply")
+   out(_ck ? "⟅" nm : "define " nm, d)
+   for (_j = 1; _j <= fbn[d]; _j++) { _line = fbody[d, _j]; if (_rc) { sub(/^define /, "⟅", _line); sub(/^endef[ \t]*$/, "⟆", _line) } out(_line, d) }
+   out(_ck ? "⟆" : "endef", d) }
   # MULTI-BODY `(| A |)(| B |)..`: peel leading COMPLETE one-liner blocks off `s`, emit each
   # as `define <base>__<k>` (k from the frame's fMBIDX), and append `def<k>=..` to fMBN[d].
   # Returns the leftover (real trailer, or a lone `(|` = a multi-line next body).
-  function mb_peel(s, base, d,   ci, b) {
-   while (substr(s, 1, 2) == "(|") {
-      ci = index(substr(s, 3), "|)")
+  function mb_peel(s, base, d,   ci, b, _ck) {
+   _ck = (fcook[d] == "cooked" || fcook[d] == "cooked_deeply")   # extra bodies inherit the frame's cook
+   while (bopen(s) == 1) {
+      ci = bclose(substr(s, 3))
       if (ci == 0) break
       b = substr(s, 3, ci - 1); sub(/^[ \t]+/, "", b); sub(/[ \t]+$/, "", b)
       fMBIDX[d]++
-      out("define " base "__" fMBIDX[d], d); if (b != "") out(b, d); out("endef", d)
+      out(_ck ? "⟅" base "__" fMBIDX[d] : "define " base "__" fMBIDX[d], d); if (b != "") out(b, d); out(_ck ? "⟆" : "endef", d)
       fMBN[d] = fMBN[d] (fMBN[d] == "" ? "" : " ") "def" fMBIDX[d] "=" base "__" fMBIDX[d]
       s = substr(s, 3 + ci + 1); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s) }
    return s }
@@ -8939,6 +9032,9 @@ define .awk.sugar
   # piped through it (shell_treat) before it is emitted.
   function frame_emit(d,   _ck, _rc, _nt, TT, _bd, _nn, _BL, _err, _bi, np, PF, cap, _line, ctor) {
    parse_trailer(pending_remainder)
+   # A `[|`/`{|` frame carries its treatment (fcook[d]) as the leading POSTFIX word, so a bracket
+   # composes with any trailing `with`/`,`-postfixes and reuses the cook / shell_treat path below.
+   if (fcook[d] != "") t_postfix = (t_postfix == "" ? fcook[d] : fcook[d] ", " t_postfix)
    _ck = 0; _rc = 0; _nt = 0
    ctor = fc[d]
    if (t_using != "" && ctor == "") out("$(error cmk: block " fn[d] ": `using` args with no PREFIX constructor)", d)
@@ -8977,9 +9073,14 @@ define .awk.sugar
    femit[d] = 0; fbn[d] = 0
    if (_err != "") return   # postfix treatment failed -- error emitted, skip ctor / value form
    # assignment-form `<-`: RUN the (raw) block + capture stdout into the LHS, reusing the
-   # `[stream]` producer path (`$(shell bash ⬥NAME)`).  Raw, not cooked: `⬥` blockref runs
-   # BEFORE the `⟅`->`define` unsentinel, so a cooked (sentinel) body can't be blockref'd.
-   if (fop[d] == "<-") { out(fl[d] " := $(shell bash ⬥" fn[d] ")", d); return }
+   # `[stream]` producer path (`$(shell bash ⬥NAME)`).  Raw ONLY: `⬥` blockref runs BEFORE
+   # the `⟅`->`define` unsentinel, so a cooked body can't be blockref'd -- and a module-level
+   # `:=` `$(shell ..)` runs at PARSE time, so shelling a cooked (`${make} ..`) body would
+   # recurse (re-parse -> re-shell) into a fork storm.  A COOKED module capture is therefore a
+   # hard error; cooked capture is a RECIPE-level form (runs at recipe time via `$(NAME)`).
+   if (fop[d] == "<-") {
+      if (_ck) { out("$(error cmk: block " fn[d] ": module-level cooked capture `" fl[d] " <- [| .. |]` shells a cooked body at parse time (recurses); use a recipe-level capture, or `<- (| .. |)` for a raw shell body)", d); return }
+      out(fl[d] " := $(shell bash ⬥" fn[d] ")", d); return }
    if (fMBN[d] != "") {
       if (ctor == "") out("$(error cmk: block " fn[d] ": multi-body (| .. |)(| .. |) needs a PREFIX constructor)", d)
       else out(build_call(fn[d], ctor, fMBN[d] (t_using != "" ? " " t_using : ""), 0), d)
@@ -9006,7 +9107,7 @@ define .awk.sugar
    if (match(rem, /^\[[ \t]*(.*)\][ \t]*$/, m)) { t_stream = m[1]; sub(/[ \t]+$/, "", t_stream); bracket_seen = 1; return }
    if (match(rem, /^\((.*)\)[ \t]*$/, m)) { t_args = m[1]; paren_seen = 1; return }
    # Trailer word-walk (order-free clauses).  Leading bare words = the POSTFIX treatment
-   # list (comma-separated, e.g. `cooked, minified`), applied left-to-right; `with <k=v..>`
+   # list (comma-separated, e.g. `cooked, stream.echo`), applied left-to-right; `with <k=v..>`
    # = postfix args (EVERY postfix gets them, each kwarg-parses what it needs -- builtins
    # like `cooked` ignore them); `using <k=v..>` = PREFIX/constructor args.  `as`/`as!`
    # survives only for the LEGACY glyph rows (callmode -> __AS__/__WITH__); a named banana
@@ -9141,6 +9242,14 @@ define .awk.sugar
    if (awstr == "") next   # blank line terminates + is consumed
    # else FALL THROUGH: reprocess this line (sibling open / parent body / parent close)
   }
+  # A hand-written `define .. endef` in the SOURCE is VERBATIM -- a banana (any bracket
+  # family) written inside it is inert data, not a construct (the inertness the docs promise,
+  # alongside comments -- which minify already strips).  Track it only at STATEMENT position
+  # (depth 0); a `define` while BUFFERING a banana body (depth>0) is a nested body line and is
+  # handled by the body-buffer rule, not here.
+  generic && depth == 0 && /^define / { def_depth++; print; next }
+  generic && depth == 0 && def_depth > 0 && /^endef[ \t]*$/ { def_depth--; print; next }
+  generic && depth == 0 && def_depth > 0 { print; next }
   # --- generic banana ASSIGNMENT forms: `NAME = (|`, `NAME := (|`, `NAME <- (|` ---
   # A bare anonymous block (no name-word, no trailer) bound via an assignment operator; the
   # LHS names the block and the OPERATOR picks the treatment (see frame_emit's fop[] branch):
@@ -9148,13 +9257,15 @@ define .awk.sugar
   #   `:=` -> COOKED `define NAME`               (interior lowered through the cmk compiler)
   #   `<-` -> RUN the block + capture stdout      (`NAME := $(shell bash ⬥__cap_N)`)
   # Disjoint from the named open below (no name touches `(|`) and from lambda-lift (no trailer).
-  generic && (depth == 0 || !fverb[depth]) && $0 ~ /^[ \t]*[A-Za-z0-9._-]+[ \t]*(:=|=|<-)[ \t]*\(\|/ {
-   line = $0; idx = index(line, "(|")
+  # A tab-indented `LHS <- (| .. |)` is a RECIPE-level capture, not a module assignment;
+  # skip it here so lambda-lift lifts the block + emits a shell capture (`LHS=`bash ⬥..``).
+  generic && (depth == 0 || !fverb[depth]) && $0 ~ /^[ \t]*[A-Za-z0-9._-]+[ \t]*(:=|=|<-)[ \t]*[([{]\|/ && $0 !~ /^\t[ \t]*[A-Za-z0-9._-]+[ \t]*<-[ \t]*[([{]\|/ {
+   line = $0; idx = bopen(line)
    match(substr(line, 1, idx - 1), /^[ \t]*([A-Za-z0-9._-]+)[ \t]*(:=|=|<-)[ \t]*$/, om)
    olhs = om[1]; oop = om[2]
-   depth++; fc[depth] = ""; fl[depth] = ""; fbn[depth] = 0; fmb[depth] = 0; fMBN[depth] = ""; fMBIDX[depth] = 1; femit[depth] = 0; fverb[depth] = 0; fop[depth] = oop
+   depth++; fc[depth] = ""; fl[depth] = ""; fbn[depth] = 0; fmb[depth] = 0; fMBN[depth] = ""; fMBIDX[depth] = 1; femit[depth] = 0; fverb[depth] = 0; fop[depth] = oop; fcook[depth] = BTREAT[_bch]
    if (oop == "<-") { fn[depth] = "__cap_" NR; fl[depth] = olhs } else { fn[depth] = olhs }
-   after = substr(line, idx + 2); cidx = index(after, "|)")
+   after = substr(line, idx + 2); cidx = bclose(after)
    if (cidx > 0) {                                  # one-liner: open + close on one line
       body = substr(after, 1, cidx - 1); sub(/^[ \t]+/, "", body); sub(/[ \t]+$/, "", body)
       rem = substr(after, cidx + 2); sub(/^[ \t]+/, "", rem); sub(/[ \t]+$/, "", rem)
@@ -9168,8 +9279,8 @@ define .awk.sugar
   # into LHS); without it the block is at STATEMENT position (see finalize_trailer).
   # GUARD: don't parse nested opens inside a VERBATIM frame (a foreign-body importer --
   # Dockerfile / shell / polyglot), so a literal `NAME(|` in that body stays verbatim.
-  generic && (depth == 0 || !fverb[depth]) && $0 ~ /^[ \t]*([A-Za-z0-9._-]+[ \t]*:?=[ \t]*)?([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+\(\|/ {
-   line = $0; idx = index(line, "(|")
+  generic && (depth == 0 || !fverb[depth]) && $0 ~ /^[ \t]*([A-Za-z0-9._-]+[ \t]*:?=[ \t]*)?([A-Za-z0-9._-]+[ \t]+)*[A-Za-z0-9._-]+[([{]\|/ {
+   line = $0; idx = bopen(line)
    pre = substr(line, 1, idx - 1); sub(/^[ \t]+/, "", pre); sub(/[ \t]+$/, "", pre)
    lhs = ""
    if (match(pre, /^([A-Za-z0-9._-]+)[ \t]*:?=[ \t]*/, lm)) { lhs = lm[1]; pre = substr(pre, RLENGTH + 1) }
@@ -9179,9 +9290,9 @@ define .awk.sugar
    # PUSH a frame.  A nested open (depth>0, inside a buffering body) pushes deeper; the
    # close pops + emits into the PARENT frame's body, so an inner banana becomes a nested
    # `define` inside the outer.  Body is BUFFERED so the trailer (at close) picks cook vs raw.
-   depth++; fn[depth] = nm; fc[depth] = ctor; fl[depth] = lhs; fbn[depth] = 0; fmb[depth] = 0; fMBN[depth] = ""; fMBIDX[depth] = 1; femit[depth] = 0; fop[depth] = ""
+   depth++; fn[depth] = nm; fc[depth] = ctor; fl[depth] = lhs; fbn[depth] = 0; fmb[depth] = 0; fMBN[depth] = ""; fMBIDX[depth] = 1; femit[depth] = 0; fop[depth] = ""; fcook[depth] = BTREAT[_bch]
    fverb[depth] = (ctor ~ /(^|\.)(import|docker|polyglot)/) ? 1 : 0   # foreign-body importer -> verbatim
-   after = substr(line, idx + 2); cidx = index(after, "|)")
+   after = substr(line, idx + 2); cidx = bclose(after)
    if (cidx > 0) {                                  # one-liner: open + close on one line
       body = substr(after, 1, cidx - 1); sub(/^[ \t]+/, "", body); sub(/[ \t]+$/, "", body)
       rem = substr(after, cidx + 2); sub(/^[ \t]+/, "", rem); sub(/[ \t]+$/, "", rem)
@@ -9192,21 +9303,22 @@ define .awk.sugar
    next
   }
   # generic body line: buffer into the current frame (or stream, once flipped to multi-body).
-  generic && depth > 0 && $0 !~ /^[ \t]*\|\)/ { if (fmb[depth]) out($0, depth); else fbody[depth, ++fbn[depth]] = $0; next }
-  # generic close `|)`: finalize the INNERMOST frame (inline trailer) and pop to its parent.
-  generic && depth > 0 && $0 ~ /^[ \t]*\|\)/ {
-   rem = $0; sub(/^[ \t]*\|\)[ \t]*/, "", rem); sub(/[ \t]+$/, "", rem)
+  generic && depth > 0 && $0 !~ /^[ \t]*\|[)\]}]/ { if (fmb[depth]) out($0, depth); else fbody[depth, ++fbn[depth]] = $0; next }
+  # generic close `|)`/`|]`/`|}`: finalize the INNERMOST frame (inline trailer) and pop to its parent.
+  generic && depth > 0 && $0 ~ /^[ \t]*\|[)\]}]/ {
+   rem = $0; sub(/^[ \t]*\|[)\]}][ \t]*/, "", rem); sub(/[ \t]+$/, "", rem)
+   _fck = (fcook[depth] == "cooked" || fcook[depth] == "cooked_deeply")   # frame's bracket cook flag
    rem = mb_peel(rem, fn[depth], depth)          # multi-body: peel complete one-liner extras
-   if (substr(rem, 1, 2) == "(|") {              # a lone `(|` opens the NEXT body -> MULTI-BODY
-      if (!fmb[depth]) { out("define " fn[depth], depth); for (_j = 1; _j <= fbn[depth]; _j++) out(fbody[depth, _j], depth); out("endef", depth); fbn[depth] = 0; fmb[depth] = 1; femit[depth] = 1 }
-      else out("endef", depth)                   # close the previous extra body
+   if (bopen(rem) == 1) {                        # a lone `(|`/`[|` opens the NEXT body -> MULTI-BODY
+      if (!fmb[depth]) { fdef(fn[depth], depth); fbn[depth] = 0; fmb[depth] = 1; femit[depth] = 1 }
+      else out(_fck ? "⟆" : "endef", depth)      # close the previous extra body
       fMBIDX[depth]++
-      out("define " fn[depth] "__" fMBIDX[depth], depth)
+      out(_fck ? "⟅" fn[depth] "__" fMBIDX[depth] : "define " fn[depth] "__" fMBIDX[depth], depth)
       fMBN[depth] = fMBN[depth] (fMBN[depth] == "" ? "" : " ") "def" fMBIDX[depth] "=" fn[depth] "__" fMBIDX[depth]
       b = substr(rem, 3); sub(/^[ \t]+/, "", b); sub(/[ \t]+$/, "", b); if (b != "") out(b, depth)
       next }                                      # stay in this frame, filling the new body
-   if (fmb[depth]) out("endef", depth)           # close the final streamed extra body
-   else if (fMBN[depth] != "") { out("define " fn[depth], depth); for (_j = 1; _j <= fbn[depth]; _j++) out(fbody[depth, _j], depth); out("endef", depth); fbn[depth] = 0; femit[depth] = 1 }  # one-liner extras: flush main raw
+   if (fmb[depth]) out(_fck ? "⟆" : "endef", depth)   # close the final streamed extra body
+   else if (fMBN[depth] != "") { fdef(fn[depth], depth); fbn[depth] = 0; femit[depth] = 1 }  # one-liner extras: flush main
    # DEFER finalize: park the frame (awaitd) so a trailer may continue on FOLLOWING
    # lines (`with`/`using`/`,`-postfixes); the await rule below finalizes on the next
    # non-continuation line (or at END).  Keep `depth` until finalize so the inner
@@ -9319,18 +9431,57 @@ endef
 # inside a user `define` are never lifted.  This is the biphasic-anomaly escape hatch: the
 # declaration hoists to module scope, the recipe keeps a reference -- not the block itself.
 define .awk.lambdalift
+  # RECIPE-level banana CAPTURE: `LHS <- (| body |)` (tab-indented, routed here from sugar).
+  # Hoist the body to a module define and replace in place with a runtime shell capture, so
+  # the block runs at recipe time and its stdout lands in the shell var.  Two flavors, keyed
+  # on a `cooked`/`cooked_deeply` treatment left by the `[| .. |]` bracket:
+  #   RAW   `<- (| body |)`  -> `define __cap_N`; capture = `LHS=`bash ⬥__cap_N`` (body is
+  #                            materialized to a tmpfile via `⬥` and run as shell).
+  #   COOKED `<- [| body |]` -> `⟅__cap_N⟆` (interior lowered to make); capture =
+  #                            `LHS=`$(__cap_N)`` -- make expands the cooked define (so
+  #                            `${make}`/`$(call ..)` resolve), then the shell runs the result.
+  # The module-level `X <- (| .. |)` counterpart is `X := $(shell ..)` (parse-time).
+  /^[ \t]*[A-Za-z0-9._-]+[ \t]*<-[ \t]*[([{]\|.*\|[)\]}]/ {
+   match($0, /^[ \t]*/); clw = RLENGTH
+   cpi = index($0, "<-"); clhs = substr($0, clw + 1, cpi - clw - 1); sub(/[ \t]+$/, "", clhs)
+   crhs = substr($0, cpi + 2)
+   match(crhs, /[([{]\|/); cco = RSTART; cbch = substr(crhs, cco, 1)          # open pos + bracket char
+   match(substr(crhs, cco + 2), /\|[)\]}]/); ccc = cco + 1 + RSTART           # matching close pos
+   cbody = substr(crhs, cco + 2, ccc - cco - 2); sub(/^[ \t]+/, "", cbody); sub(/[ \t]+$/, "", cbody)
+   crest = substr(crhs, ccc + 2); sub(/^[ \t]+/, "", crest)
+   # a `[|`/`{|` bracket cooks the capture directly; a bare `cooked` word still works too.
+   ccook = (cbch != "(") || (crest ~ /^cooked(_deeply)?([ \t,]|$)/); cg = "__cap_" NR
+   if (ccook) {
+      LIFT[++NL] = "⟅" cg "\n" (cbody == "" ? "" : cbody "\n") "⟆"
+      print substr($0, 1, clw) clhs "=`$(" cg ")`"
+   } else {
+      LIFT[++NL] = "define " cg "\n" (cbody == "" ? "" : cbody "\n") "endef"
+      print substr($0, 1, clw) clhs "=`bash ⬥" cg "`"
+   }
+   next }
   {
-   line = $0; p = 0; s = 1
-   while ((q = index(substr(line, s), "(|")) > 0) {
-      at = s + q - 1
+   line = $0; p = 0; s = 1; pbch = ""
+   while (match(substr(line, s), /[([{]\|/) > 0) {
+      at = s + RSTART - 1
       before = (at == 1) ? "" : substr(line, at - 1, 1)
-      if (before == "" || before == " " || before == "\t") { p = at; break }
+      if (before == "" || before == " " || before == "\t") { p = at; pbch = substr(line, at, 1); break }
       s = at + 2 }
    if (p == 0) { print; next }
-   aft = substr(line, p + 2); c = index(aft, "|)")
-   if (c == 0) { print; next }
+   aft = substr(line, p + 2)
+   if (!match(aft, /\|[)\]}]/)) { print; next }
+   c = RSTART
    body = substr(aft, 1, c - 1); sub(/^[ \t]+/, "", body); sub(/[ \t]+$/, "", body)
    tail = substr(aft, c + 2); lead = substr(line, 1, p - 1)
+   # A `[|`/`{|` open cooks the lifted define directly (docook, from the bracket char) --
+   # emitted as `⟅NAME⟆` sentinels so the interior COOKS through every later stage.  Also PEEL
+   # any leading bare `cooked`/`cooked_deeply` word an author wrote explicitly off the tail
+   # before the {env}/(args) walk (other words are ignored on a lambda -- only cook is
+   # supported here in v1).  A normal `(|..|){e}`/`(a,b)` (trailer right after the close) is untouched.
+   docook = (pbch == "[" || pbch == "{"); sub(/^[ \t]+/, "", tail)
+   while (tail ~ /^[A-Za-z_]/) {
+      tw = tail; sub(/[^A-Za-z0-9_].*$/, "", tw)
+      if (tw == "cooked" || tw == "cooked_deeply") docook = 1
+      tail = substr(tail, length(tw) + 1); sub(/^[ \t]*,?[ \t]*/, "", tail) }
    # DISTINCT trailer brackets, order-free (no collision -- `{` after `)` is never `${`):
    #   `{e=v ..}` = ENVIRONMENT channel   |   `(a,b)` = positional ARGS channel
    env = ""; args = ""; seen = 0
@@ -9345,7 +9496,10 @@ define .awk.lambdalift
       else          args = (args == "" ? inner : args " " inner) }
    if (!seen) { print; next }
    g = "__lambda_" NR
-   LIFT[++NL] = "define " g "\n" (body == "" ? "" : body "\n") "endef"
+   # cook the hoisted define via `⟅NAME⟆` sentinels when the block was deep-cooked -- they
+   # flow through the remaining stages (callform/../unsentinel) and seal into a cooked define.
+   if (docook) LIFT[++NL] = "⟅" g "\n" (body == "" ? "" : body "\n") "⟆"
+   else        LIFT[++NL] = "define " g "\n" (body == "" ? "" : body "\n") "endef"
    # `{k=v}` -> `k='v'` env prefix ; `(a,b)` -> trailing make args (comma -> space)
    envp = ""; n = split(env, KV, /[ \t]+/)
    for (i = 1; i <= n; i++) if (KV[i] ~ /=/) { key = KV[i]; sub(/=.*/, "", key); val = KV[i]; sub(/^[^=]*=/, "", val); envp = envp (envp == "" ? "" : " ") key "='" val "'" }
