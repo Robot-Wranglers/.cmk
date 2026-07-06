@@ -44,10 +44,17 @@
 #   make gitops.hooks.uninstall                        # remove the managed hook symlinks
 #   make gitops.hooks.list                             # show discovered hooks + install state
 
-# Accept either `VERSION=` or `version=`; export so the prereq assertion, the recipe shells,
-# and the dispatched `gitops.release.*` helpers all see one normalized value.
+# Accept `VERSION=` or `version=` interchangeably (a case-insensitive alias for the release
+# version), and export the normalized value so the prereq assertion, the recipe shells, and the
+# dispatched `gitops.release.*` helpers all see one value. Prefer a non-empty VERSION, else fall
+# back to version. The `:=` fallback (not `?=`) is deliberate: `?=` is a no-op when a consuming
+# Makefile has already declared `VERSION ?=` (empty), which would silently drop a lowercase
+# `version=`; `:=` re-derives it. A command-line `VERSION=` still wins (command-line origin
+# overrides makefile assignment). Both names are pre-declared so the `$(or ...)` reference stays
+# clean under `--warn-undefined-variables`.
 version ?=
-export VERSION ?= ${version}
+VERSION ?=
+export VERSION := $(or $(strip ${VERSION}),$(strip ${version}))
 
 gitops.remote ?= origin
 gitops.tag_prefix ?= v
