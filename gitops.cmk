@@ -65,6 +65,15 @@ gitops.version_check ?= 1
 gitops.force ?= 0
 gitops.hooks.src ?= hooks
 
+# Optional dotenv sourced by recipes that shell out to `gh` (whose auth the plugin does not
+# manage). A project pointing at a private repo typically keeps a scoped `GH_TOKEN` in a
+# gitignored .env; without it `gh` falls back to the host keyring account, which may lack repo
+# access and make a live CI run look absent ("no run found"). Unset by default (a `:` no-op);
+# a project opts in with `gitops.env_file := .env`. Sourced INSIDE the recipe shell (`set -a`
+# exports each assignment) so the token never enters make's variable space (no `make -p` leak).
+gitops.env_file ?=
+gitops.load_env = $(if $(strip ${gitops.env_file}),if [ -f ${gitops.env_file} ]; then set -a; . ${gitops.env_file}; set +a; fi;,:;)
+
 gitops.release: assert.env/VERSION
 	@# Cut a release: preflight, run every `gitops.release.*` helper (lexical order), tag +
 	@# push, then watch the configured CI.  FULLY LIVE -- pushes `${gitops.tag}`.
@@ -119,6 +128,7 @@ _gitops.release.watch:
 _gitops.release.watch/%: assert.tool.required/gh
 	@# Poll for the CI run of workflow `${*}` on tag `${gitops.tag}`, then stream it to
 	@# completion (non-zero if the run fails).
+	$(gitops.load_env) \
 	wf="${*}" \
 	&& $(call log.target, ${dim}watch ${sep} ${no_ansi}$${wf} ${dim}@ ${no_ansi}${gitops.tag}) \
 	&& rid="" && i=0 && n=${gitops.watch.attempts} \
