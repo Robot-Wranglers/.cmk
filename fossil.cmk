@@ -1,0 +1,297 @@
+#!/usr/bin/env -S ./compose.mk cmk run
+
+# cmk_pragma ::: { "kind": "plugin" } :::
+
+'''
+fossil.cmk: a ticket tracker over fossil, with a mutable body.
+
+The schema adds two replace-mode fields.  Fossil appends to a field only when its name
+carries a leading plus, so `description` and `tags` are rewritten in place by an ordinary
+set, while `icomment` stays the append-only comment log.  No verb shuns an artifact or
+rebuilds the repository, so none of them can destroy history.
+'''
+
+import log
+from cmk import namespace
+
+define _fossil_schema
+CREATE TABLE ticket(
+  tkt_id INTEGER PRIMARY KEY,
+  tkt_uuid TEXT UNIQUE,
+  tkt_mtime DATE,
+  tkt_ctime DATE,
+  type TEXT,
+  status TEXT,
+  subsystem TEXT,
+  priority TEXT,
+  severity TEXT,
+  foundin TEXT,
+  private_contact TEXT,
+  resolution TEXT,
+  title TEXT,
+  tags TEXT,
+  blockers TEXT,
+  description TEXT,
+  comment TEXT
+);
+CREATE TABLE ticketchng(
+  tkt_id INTEGER REFERENCES ticket,
+  tkt_rid INTEGER REFERENCES blob,
+  tkt_mtime DATE,
+  login TEXT,
+  username TEXT,
+  mimetype TEXT,
+  icomment TEXT
+);
+CREATE INDEX ticketchng_idx1 ON ticketchng(tkt_id, tkt_mtime);
+endef
+
+define _fossil_view
+<th1>
+html "<h2>[htmlize $title]</h2>\n"
+</th1>
+<table class="label-value">
+<tr><td class="tktDspLabel">Ticket:</td><td class="tktDspValue">$<tkt_uuid></td></tr>
+<tr><td class="tktDspLabel">State:</td><td class="tktDspValue">$<status> &middot; $<type> &middot; $<severity></td></tr>
+<tr><td class="tktDspLabel">Subsystem:</td><td class="tktDspValue">$<subsystem></td></tr>
+<tr><td class="tktDspLabel">Tags:</td><td class="tktDspValue">$<tags></td></tr>
+<tr><td class="tktDspLabel">Blocked by:</td><td class="tktDspValue">$<blockers></td></tr>
+<tr><td class="tktDspLabel">Found in:</td><td class="tktDspValue">$<foundin></td></tr>
+<tr><td class="tktDspLabel">Resolution:</td><td class="tktDspValue">$<resolution></td></tr>
+</table>
+<th1>
+if {[info exists description] && [string length $description] > 0} {
+  html "<div class=\"section\">Description</div>\n"
+  html "<div class=\"tktDspValue\">\n"
+  html [lindex [markdown $description] 1]
+  html "</div>\n"
+}
+query {SELECT datetime(tkt_mtime) AS xdate, coalesce(login,'') AS xwho,
+              coalesce(icomment,'') AS xcmt
+         FROM ticketchng
+        WHERE tkt_id=$tkt_id AND length(coalesce(icomment,'')) > 0
+        ORDER BY tkt_mtime} {
+  html "<div class=\"section\">Comment by $xwho on $xdate</div>\n"
+  html "<div class=\"tktDspValue\">\n"
+  html [lindex [markdown $xcmt] 1]
+  html "</div>\n"
+}
+</th1>
+endef
+
+# the dot-head keeps these off the public roster; the name stays clear of any mount namespace
+namespace .tracker(|
+  db ?= .fossil.db
+  user ?= $(call m5|,USER,fossil)
+  root = $(shell git rev-parse --show-toplevel)
+  repo = ${.tracker.root}/${.tracker.db}
+  port ?= 9080
+  exec = fossil ${1} -R "${.tracker.repo}"
+  # the columns this plugin adds beyond the fossil defaults
+  fields = tags blockers description
+  # an older tracker predates a field, and fossil would only report it as an unknown name
+  fresh = have=`printf '%s\n' ".mode list" ".headers off" "select group_concat(name,' ') from pragma_table_info('ticket');" | $(call .tracker.exec,sql)`; for f in ${.tracker.fields}; do case " $${have} " in *" $${f} "*) ;; *) printf 'tkt: tracker schema predates the %s field, run: make tkt.init\n' "$${f}" >&2; exit 1;; esac; done
+  # every verb but help and init runs behind this
+  need = set -o pipefail; test -f "${.tracker.repo}" || { printf 'tkt: no tracker at %s, run the init verb first\n' "${.tracker.repo}" >&2; exit 1; }; ${.tracker.fresh}
+  # a bracketed hash renders flat under markdown; this is link format 8, where the url becomes the display text
+  xref = sed -E 's/\[([0-9a-f]{6,40})\]/[](\1)/g'
+  slurp = body=''; if [ -p ${stdin} ] || [ -f ${stdin} ]; then body=`${stream.stdin} | ${.tracker.xref}`; fi
+  # the web ui is a whole vcs by default; this keeps only what a tracker needs
+  menu = Home /home * {} Tickets /ticket r {} Admin /setup {a s} desktoponly Logout /logout L desktoponly Login /login !L desktoponly
+  guest = hjr
+  filter = want="$${status:-Open}"; if [ "$${want}" = all ]; then filter=''; elif [ "$${want}" = Open ]; then filter="where status in ('Open','WIP')"; else filter="where status='$${want}'"; fi
+  cols = substr(tkt_uuid,1,10) || ' | ' || coalesce(nullif(status,''),'-') || ' | ' || coalesce(nullif(severity,''),'-') || ' | ' || coalesce(nullif(tags,''),'-') || ' | ' || coalesce(nullif(title,''),'(untitled)')
+  # a misspelled var would otherwise drop in silence, so name the one it resembles
+  vet = known=" ${1} "; have=" `env | sed -n 's/^\([a-z][a-z0-9_]*\)=.*/\1/p' | tr '\n' ' '` "; for v in $${have}; do case "$${known}" in *" $${v} "*) continue;; esac; for k in ${1}; do case "$${have}" in *" $${k} "*) continue;; esac; test "`printf %.3s "$${v}"`" = "`printf %.3s "$${k}"`" && printf 'tkt: ignoring %s, did you mean %s?\n' "$${v}" "$${k}" >&2; done; done; true
+  # the canonical ten-char id behind a prefix, empty when it matches nothing
+  oneid = printf '%s\n' ".mode list" ".headers off" "select substr(tkt_uuid,1,10) from ticket where tkt_uuid like '${1}%';" | $(call .tracker.exec,sql)
+  # one blocker id per line, formatted like a list row
+  xrefcols = '- ' || substr(${1}.tkt_uuid,1,10) || ' | ' || coalesce(nullif(${1}.status,''),'-') || ' | ' || coalesce(nullif(${1}.title,''),'(untitled)')
+  # blockers hold canonical ten-char ids, so the edge is an exact token match
+  edge = ' ' || coalesce(${1}.blockers,'') || ' ' like '% ' || substr(${2}.tkt_uuid,1,10) || ' %'
+  # fossil indexes every prose reference itself; targets vary in length, so match by prefix
+  backref = join backlink b on ${1}.tkt_uuid like b.target || '%' join ticketchng c on c.tkt_rid=b.srcid join ticket s on s.tkt_id=c.tkt_id and s.tkt_id != ${1}.tkt_id
+  subs = init new show list search edit comment tag block set close serve stop run
+|)
+
+__main__:
+  '''
+  A ticket tracker over fossil.  USAGE:  ./fossil.cmk
+  '''
+  cmk.cli.subcommands.enter(namespace=$(basename ${@}) subs='${.tracker.subs}')
+
+help:
+  '''
+  Print the verb menu.  USAGE:  make tkt.help
+  '''
+  cmk.cli.subcommands.enter(namespace=$(basename ${@}) subs='${.tracker.subs}')
+
+init:
+  '''
+  Create the tracker at the git root and install its schema and view page.  Idempotent,
+  and a no-op under GITHUB_ACTIONS.  USAGE:  make tkt.init
+  '''
+  if [ "$${GITHUB_ACTIONS:-false}" = true ]; then log.io(${dim}skip ${sep} no tracker in ci); exit 0; fi
+  cmk.assert.tool.required(fossil,see https://fossil-scm.org for install instructions)
+  test -f "${.tracker.repo}" || fossil init --admin-user "${.tracker.user}" --project-name "$$(basename ${.tracker.root})" "${.tracker.repo}" | ${stream.as.log}
+  cmk.mk.def.to.file(_fossil_schema,${.tracker.root}/.tmp.tracker.schema)
+  cmk.mk.def.to.file(_fossil_view,${.tracker.root}/.tmp.tracker.view)
+  .tracker.exec(sql "replace into config(name,value,mtime) values('ticket-table',readfile('${.tracker.root}/.tmp.tracker.schema'),strftime('%s','now'));")
+  .tracker.exec(sql "replace into config(name,value,mtime) values('ticket-viewpage',readfile('${.tracker.root}/.tmp.tracker.view'),strftime('%s','now'));")
+  .tracker.exec(sql "replace into config(name,value,mtime) values('mainmenu','${.tracker.menu}',strftime('%s','now'));")
+  fossil user capabilities nobody "${.tracker.guest}" -R "${.tracker.repo}" | ${stream.as.log}
+  fossil user capabilities anonymous "${.tracker.guest}" -R "${.tracker.repo}" | ${stream.as.log}
+  fossil rebuild "${.tracker.repo}" | ${stream.as.log}
+  cmk.io.safe_rm(${.tracker.root}/.tmp.tracker.schema)
+  cmk.io.safe_rm(${.tracker.root}/.tmp.tracker.view)
+  log.io(${green}ready ${sep} ${no_ansi}${.tracker.repo})
+
+new:
+  '''
+  File a ticket.  A title is required and stdin becomes the markdown description.
+  Optional vars: type, status, severity, priority, subsystem, tags, foundin.
+  USAGE:  cat body.md | title='foo explodes' tags='compiler oop' make tkt.new
+  '''
+  ${.tracker.need}
+  .tracker.vet(title type status severity priority subsystem tags foundin)
+  test -n "$${title:-}" || { printf 'tkt: title is required\n' >&2; exit 1; }
+  ${.tracker.slurp}
+  version <- git rev-parse HEAD
+  .tracker.exec(ticket add title "$${title}" type "$${type:-Code_Defect}" status "$${status:-Open}" severity "$${severity:-Important}" priority "$${priority:-Medium}" subsystem "$${subsystem:-}" tags "$${tags:-}" foundin "$${foundin:-$${version}}" mimetype text/x-markdown description "$${body}") | ${stream.as.log}
+  log.io(${green}filed ${sep} ${no_ansi}$${title})
+
+edit/%:
+  '''
+  Replace a ticket description from stdin.  The old text is superseded rather than
+  appended, and stays in the artifact history.
+  USAGE:  cat body.md | make tkt.edit/<uuid>
+  '''
+  ${.tracker.need}
+  ${.tracker.slurp}
+  test -n "$${body}" || { printf 'tkt: nothing on stdin\n' >&2; exit 1; }
+  .tracker.exec(ticket set ${*} description "$${body}" mimetype text/x-markdown) | ${stream.as.log}
+  log.io(${green}edited ${sep} ${no_ansi}${*})
+
+comment/%:
+  '''
+  Add a comment from stdin, leaving the description alone.
+  USAGE:  cat note.md | make tkt.comment/<uuid>
+  '''
+  ${.tracker.need}
+  ${.tracker.slurp}
+  test -n "$${body}" || { printf 'tkt: nothing on stdin\n' >&2; exit 1; }
+  .tracker.exec(ticket set ${*} +icomment "$${body}" mimetype text/x-markdown) | ${stream.as.log}
+  log.io(${green}commented ${sep} ${no_ansi}${*})
+
+tag/%:
+  '''
+  Replace a ticket's tags with the space-delimited tags var or stdin.
+  USAGE:  echo 'compiler oop' | make tkt.tag/<uuid>
+  '''
+  ${.tracker.need}
+  .tracker.vet(tags)
+  ${.tracker.slurp}
+  .tracker.exec(ticket set ${*} tags "$${tags:-$${body}}") | ${stream.as.log}
+  log.io(${green}tagged ${sep} ${no_ansi}${*})
+
+block/%:
+  '''
+  Replace what a ticket waits on, from the space-delimited blockers var or stdin.  Each
+  id is resolved to its canonical form, so an unknown or ambiguous one fails here rather
+  than becoming a dead reference.  Empty input clears the set, and the reverse direction
+  is derived by the show verb rather than stored.  Fossil drops an empty field value, so
+  clearing writes a space.
+  USAGE:  echo 'a39d7663e6 0991582b19' | make tkt.block/<uuid>
+  '''
+  ${.tracker.need}
+  .tracker.vet(blockers)
+  ${.tracker.slurp}
+  self=`.tracker.oneid(${*})`; test `printf '%s' "$${self}" | wc -w` -eq 1 || { printf 'tkt: %s matches no single ticket\n' "${*}" >&2; exit 1; }
+  ids=''; for tok in $${blockers:-$${body}}; do hit=`.tracker.oneid($${tok})`; test `printf '%s' "$${hit}" | wc -w` -eq 1 || { printf 'tkt: %s matches no single ticket\n' "$${tok}" >&2; exit 1; }; test "$${hit}" != "$${self}" || { printf 'tkt: a ticket cannot block itself\n' >&2; exit 1; }; ids="$${ids} $${hit}"; done; ids=`echo $${ids}`
+  .tracker.exec(ticket set ${*} blockers "$${ids:- }") | ${stream.as.log}
+  log.io(${green}blocked ${sep} ${no_ansi}${*}${dim} $${ids:-(nothing)})
+
+set/%:
+  '''
+  Write one field, named by the field var, with stdin as the value.
+  USAGE:  echo Severe | field=severity make tkt.set/<uuid>
+  '''
+  ${.tracker.need}
+  .tracker.vet(field)
+  ${.tracker.slurp}
+  test -n "$${field:-}" || { printf 'tkt: field is required\n' >&2; exit 1; }
+  case "$${field}" in icomment|comment) printf 'tkt: use the comment verb\n' >&2; exit 1;; esac
+  .tracker.exec(ticket set ${*} "$${field}" "$${body}") | ${stream.as.log}
+  log.io(${green}set ${sep} ${no_ansi}${*}${dim} $${field})
+
+close/%:
+  '''
+  Close a ticket, with stdin as the closing comment.  Resolution defaults to Fixed.
+  USAGE:  printf 'Fixed in abc1234.\n' | make tkt.close/<uuid>
+  '''
+  ${.tracker.need}
+  .tracker.vet(resolution)
+  ${.tracker.slurp}
+  .tracker.exec(ticket set ${*} status Closed resolution "$${resolution:-Fixed}") | ${stream.as.log}
+  test -z "$${body}" || .tracker.exec(ticket set ${*} +icomment "$${body}" mimetype text/x-markdown) | ${stream.as.log}
+  log.io(${green}closed ${sep} ${no_ansi}${*})
+
+show/%:
+  '''
+  Print one ticket as markdown: title, fields, what it waits on and what waits on it,
+  description, then comments in time order.
+  A uuid prefix is enough.  USAGE:  make tkt.show/<uuid>
+  '''
+  ${.tracker.need}
+  printf '%s\n' ".mode list" ".headers off" "select '# ' || coalesce(nullif(title,''),'(untitled)') || char(10) || char(10) || ${.tracker.cols} || char(10) || char(10) || coalesce(nullif(description,''),'(no description)') || coalesce((select group_concat(char(10) || char(10) || '---' || char(10) || char(10) || c.icomment, '') from ticketchng c where c.tkt_id=ticket.tkt_id and coalesce(c.icomment,'')!=''),'') from ticket where tkt_uuid like '${*}%';" "select char(10) || '## Blocked by' || char(10) || char(10) || group_concat($(call .tracker.xrefcols,b), char(10)) from ticket t join ticket b on $(call .tracker.edge,t,b) where t.tkt_uuid like '${*}%' having count(b.tkt_id) > 0;" "select char(10) || '## Blocks' || char(10) || char(10) || group_concat($(call .tracker.xrefcols,b), char(10)) from ticket t join ticket b on $(call .tracker.edge,b,t) where t.tkt_uuid like '${*}%' having count(b.tkt_id) > 0;" "select char(10) || '## Referenced by' || char(10) || char(10) || group_concat(row, char(10)) from (select distinct $(call .tracker.xrefcols,s) as row from ticket t $(call .tracker.backref,t) where b.srctype=1 and t.tkt_uuid like '${*}%') having count(*) > 0;" | .tracker.exec(sql)
+
+list:
+  '''
+  List tickets as a markdown table.  Filter with status=Closed or status=all, and with
+  tag=<word> for one tag.  USAGE:  status=all tag=compiler make tkt.list
+  '''
+  ${.tracker.need}
+  .tracker.vet(status tag)
+  ${.tracker.filter}
+  test -z "$${tag:-}" || filter="$${filter:-where 1=1} and ' '||coalesce(tags,'')||' ' like '% $${tag} %'"
+  printf '%s\n' ".mode list" ".headers off" "select ${.tracker.cols} from ticket $${filter} order by tkt_mtime desc;" | .tracker.exec(sql)
+
+search/%:
+  '''
+  Search titles, descriptions, and comments for a substring, case-insensitively.
+  USAGE:  make tkt.search/pidfile
+  '''
+  ${.tracker.need}
+  printf '%s\n' ".mode list" ".headers off" "select ${.tracker.cols} from ticket where lower(coalesce(title,'') || ' ' || coalesce(description,'')) like lower('%${*}%') or tkt_id in (select tkt_id from ticketchng where lower(coalesce(icomment,'')) like lower('%${*}%')) order by tkt_mtime desc;" | .tracker.exec(sql)
+
+serve:
+  '''
+  Serve the tracker over http, 9080 by default, in the foreground.
+  USAGE:  port=9000 make tkt.serve
+  '''
+  ${.tracker.need}
+  at="$${port:-${.tracker.port}}"
+  log.io(${dim}serving ${sep} ${no_ansi}http://localhost:$${at}/ticket)
+  fossil server "${.tracker.repo}" --port "$${at}" --localauth
+
+stop:
+  '''
+  Stop a tracker server started by the serve verb, matched on its port.
+  USAGE:  port=9000 make tkt.stop
+  '''
+  at="$${port:-${.tracker.port}}"
+  pids=`pgrep -f "fossil server .*--port $${at}" 2>${devnull} || true`
+  test -n "$${pids}" || { log.io(${dim}nothing serving ${sep} ${no_ansi}port $${at}); exit 0; }
+  kill $${pids}
+  log.io(${green}stopped ${sep} ${no_ansi}port $${at})
+
+run/%:
+  '''
+  Run any fossil command against the tracker; the comma-delimited stem is argv, and the
+  args var carries a single value holding spaces.  Values pass through literally: this
+  verb never evaluates them, so a backtick or a dollar reaches fossil intact.
+  USAGE:  make tkt.run/ticket,history,<uuid>
+  '''
+  ${.tracker.need}
+  set --; test -z "$${args:-}" || set -- "$${args}"
+  .tracker.exec(`echo '${*}' | ${stream.comma.to.space}` "$$@")

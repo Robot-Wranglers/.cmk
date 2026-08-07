@@ -11,16 +11,23 @@
 from cmk import Dockerfile
 
 export GRIP_PORT?=6419
-Dockerfile grip(|
+Dockerfile grip(bases=lifecycle.container, docker_args="-p ${GRIP_PORT}:${GRIP_PORT}")(|
   FROM python:3.11-bookworm
   RUN pip3 install --break-system-packages grip==4.6.2
   ENTRYPOINT grip
 |)
 
-docs.grip.serve/%: grip.build
-	trace=1 docker_args="-p $${GRIP_PORT}:$${GRIP_PORT}" entrypoint=grip cmd="${*} 0.0.0.0:$${GRIP_PORT}" img=${grip.img} ${make} docker.run.sh
-docs.grip docs.grip.serve:
-	@# Serve rendered version of README.md (defaults to port 6419)
-	ls README.md >/dev/null 2>/dev/null \
-	&& ${make} docs.grip.serve/README.md \
-	|| $(call log, ${red}README.md is missing!) 
+docs.grip.serve/%:
+	${make} grip.serve/${*}
+
+docs.grip.%:; ${make} grip.${*}
+
+docs.grip: grip.serve
+
+grip.serve/%:
+	grip(${*} 0.0.0.0:${GRIP_PORT})
+
+# the blocking verb is a member of the lifecycle mixin, so the rule below only adds a guard
+grip.__serve__ = ${make} grip.serve/README.md
+
+grip.serve: assert.file/README.md

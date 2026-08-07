@@ -34,10 +34,10 @@
 #       $(call __plugins__.require, tux.repl.cmk)
 # (No __main__: this is a library -- import it; do not run it directly.  See demos/repl.mk for a plain-
 # Makefile REPL via the `tux.repl/%` helper; the `.cmk` paths use the `repl` pragma / `cmk repl`.)
-# The Go-build/cache pipeline is factored into the dsl.golang.cmk plugin: dsl.golang.ensure(..)
+# The Go-build/cache pipeline is the code.compiled base that dsl.golang.cmk builds on: code.compiled.ensure
 # sets `bin` to the per-host cache path (keyed by a hash of the Go block-refs below, so editing the
 # source busts it), cross-building it on a miss.  tux.repl is thus a client of the same build-if-needed
-# block dsl.golang.lambda uses -- it just adds a tty gate and execs with its own arg list.  Import
+# block code.compiled.lambda uses -- it just adds a tty gate and execs with its own arg list.  Import
 # unguarded -- tux.repl.cmk is itself guarded by its importers for the concurrent-children case, so
 # polyglot is never re-imported by racing children.
 cmk.include.plugins(dsl.golang.cmk)

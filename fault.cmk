@@ -28,7 +28,7 @@ bootstrap-safe: the structured emit (jb runs as a docker coprocess) is
 best-effort, so a missing toolchain never masks the real fault; it still
 logs and exits.  That is what lets the core stdlib adopt the idiom without
 gaining a hard docker / json.bash dependency on its error paths.  Second,
-the exit routes through mk.exit.code, for supervisor exit-code fidelity.
+the exit routes through mk.super.status, for supervisor exit-code fidelity.
 '''
 
 # Defer dispatch to at-exit: at_exit=dispatch.by_type registers the drain
@@ -45,8 +45,8 @@ fault.log=$(call log, ${yellow}${bold}¿${no_ansi}${red} $(1))
 # Bootstrap-safe: the emit is wrapped so its own failure can never replace
 # the real fault; we always log and exit.
 fault.throw=$(call fault.log,${bold}$(strip $(1))) \
-	; { $(call fault.emit, type=$(strip $(1)) target=$(@) file=${__file__} $(if $(filter-out undefined,$(origin 2)),$(strip $(2)))) ; } 2>${devnull} || true \
-	; $(call mk.exit.code,1)
+	; { $(call fault.xpush, type=$(strip $(1)) target=$(@) file=${__file__} $(if $(filter-out undefined,$(origin 2)),$(strip $(2)))) ; } 2>${devnull} || true \
+	; $(call mk.super.status,1)
 
 # fault.guarded: the inline catch (synchronous, runs at the failure site).
 # Exposed as a plain macro so vanilla Makefiles can append it after a
@@ -55,10 +55,10 @@ fault.throw=$(call fault.log,${bold}$(strip $(1))) \
 # single brace group -- && / || are equal-precedence, else the catch would
 # leak onto the success path.
 fault.guarded={ rc=$$? ; $(call log,${dim}${yellow}caught abnormal exit ${sep} ${dim}code=$${rc} ${sep} ${dim}throw=SubprocessFault) ; $(call fault.throw,SubprocessFault,kind=external code=$${rc}) ; }
-fault.guarded.postfix_mode := ||
+fault.guarded.advice := after_throw
 
 # errno -> fault Type: the module half of the join.
-$(call m5.table, fault.type, ENVVAR_UNSET=EnvVarUnset MODULE_MISSING=ModuleNotFound REGISTRY_ASSERT=RegistryFault NOT_IMPLEMENTED=NotImplementedError, SubprocessFault)
+$(call m5.table, fault.type, ENVVAR_UNSET=EnvVarUnset MODULE_MISSING=ModuleNotFound REGISTRY_ASSERT=RegistryFault NOT_IMPLEMENTED=NotImplementedError NOT_DISPATCHABLE=NotDispatchable TOOL_MISSING=ToolMissing, SubprocessFault)
 # override mk.die to dispatch a typed fault, keyed on errno.
 mk.die = $(call fault.throw,$(call fault.type.resolve,$(patsubst errno=%,%,$(strip $(m5[2]?)))),$(strip $(m5[3]?) $(m5[4]?) $(m5[5]?)))
 # classify override: map a carried errno symbol to its fault Type.

@@ -1,0 +1,1269 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "plugin" } :::
+
+'''
+fmake: GNU Make with resident dispatch, built as a portable artifact.
+
+A zygote parses a makefile once and forks a child per request arriving on a unix
+socket, so a dispatched goal skips the parse.  The patch is embedded here and the
+image builds on demand; nothing else in cmk depends on this module, and a consumer
+acquires the binary by copying it out of the built image.
+
+The image body is raw, so the pinned version and digest ride as docker build args
+rather than make variables, and docker expands them.
+
+The embedded patch is the same text as tests/experimental/resident/socket-mode.patch,
+which the harness builds from; test_fmake_module_cmk.py pins them equal.
+'''
+
+from cmk import Dockerfile, dockerfs
+import log
+
+# Per-execution names a shared parse would freeze; the pid list takes the child's own.
+rearm ?= _mk.run.id CMK_IO_STACK CMK_BRF_PREFIX CMK_SCRATCH
+rearm.pid ?= _cmk.pid
+
+# A stale zygote answers a later run with the wrong program, so liveness is caller-facing status.
+zygotes:
+	'''Live zygotes, one per line, as pid and the program each is parked on.
+	'''
+	ps -axo pid=,args= \
+	  | grep -E -- '--serve[[:space:]]' | grep -v grep \
+	  | sed -e 's/ *\([0-9]*\) .*-f *\([^ ]*\).*/\1 \2/' || true
+
+reap:
+	'''Stop every zygote and drop the sockets they left, including stale ones.
+	'''
+	log(${@} ${sep} reaping zygotes)
+	pkill -f -- '--serve /tmp/cmk-zygote' 2>/dev/null || true
+	rm -f /tmp/cmk-zygote.*.sock 2>/dev/null || true
+	rmdir /tmp/cmk-zygote.*.sock.lock 2>/dev/null || true
+
+# Elixir's own base, so the binary is glibc-compatible with any consumer built on it.
+Dockerfile fmake(|
+  FROM debian:trixie AS build
+  ARG MAKE_VERSION=4.4.1
+  ARG MAKE_SHA256=dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3
+  ARG MAKE_URL=https://ftp.gnu.org/gnu/make
+  RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl ca-certificates
+  RUN curl -fsSL ${MAKE_URL}/make-${MAKE_VERSION}.tar.gz -o /tmp/make.tar.gz \
+   && echo "${MAKE_SHA256}  /tmp/make.tar.gz" | sha256sum -c - \
+   && tar xzf /tmp/make.tar.gz -C /tmp \
+   && cd /tmp/make-${MAKE_VERSION} \
+   && patch -p1 -l < /tmp/socket-mode.patch \
+   && ./configure --disable-dependency-tracking CFLAGS="-O2" \
+   && make -j`nproc` \
+   && install -m 0755 make /usr/local/bin/fmake
+  FROM debian:trixie-slim
+  COPY --from=build /usr/local/bin/fmake /usr/local/bin/fmake
+  ENTRYPOINT ["fmake", "--resident"]
+|)
+
+# The patch rides into the build context, so the image body stays free of copy lines.
+dockerfs fmake.diff(bind=fmake, path=/tmp/socket-mode.patch, mode=0644)(|
+Resident dispatch (socket mode) for GNU Make 4.4.1.
+
+Parse once in a zygote, then fork a child per request arriving on a unix
+socket. The parent never executes a goal, so it stays pristine and needs no
+state reset; each child is an ordinary make from the hook point onward.
+
+Two roles, both argv flags, so nothing in the environment triggers either:
+
+  fmake --serve  /tmp/prog.sock -f twin.mk    parse once, listen, fork per request
+  fmake --client /tmp/prog.sock -- make -f twin.mk V=1 target
+
+Everything after -- is the caller's own cold command. The client sends it
+without the program name, since the zygote already is that program, and keeps
+the whole form to exec if no zygote can serve the request. Goals may also be
+given bare, with FMAKE_COLD naming the make to prepend on fallback.
+
+The child decides what it can serve, so all routing policy lives here rather
+than at the call site. A zygote's options are its argv plus MAKEFLAGS as it
+stands after the parse, which is what a recursive call site expands to, so a
+zygote started with no flags at all still matches its own call sites. Short
+flags compare letter by letter, since MAKEFLAGS spells a cluster as one word
+and a request may ask for less than the zygote carries. Any option the zygote
+lacks, a different makefile included, is answered with status 75 and the client
+execs the cold command it is already holding. A missing socket and a refused
+connection answer the same way.
+
+A request carries the client's working directory, its argv, its environment,
+and its three standard descriptors, passed as ancillary data. The child adopts
+all of them, so pipelines, command substitution and concurrent requests work
+with no routing convention. A reply is two lines on the same connection: the
+child's pid, then its exit status. Pid zero means the parent answered without
+forking.
+
+The parent forks before it reads, so a client that stalls blocks only its own
+child. It never blocks on a child either, so a recipe may dispatch back into
+the zygote. The child reports its own status from inside die(), the only point
+that catches both a normal return and a failing goal.
+
+A zygote does not watch its inputs by default, because cmk names its artifacts
+by content: a changed program is a different path, so the parse a zygote holds
+cannot go stale under it, and watching there misfires when a warm cache touches
+a file it read. FMAKE_WATCH arms the check for a makefile nothing else
+version-stamps.
+
+Applies to make-4.4.1.tar.gz, sha256
+dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3.
+Apply with -l, since blank context lines carry no trailing space.
+
+Four behaviours worth knowing. A child must not run remove_intermediates, since
+it shares intermediate files with its parent, and a failing goal reaches die()
+rather than returning, so that guard is required rather than defensive. Client
+mode is settled at the top of main, before output is initialized, so its
+failures report through a plain write to stderr instead of make's own path. The
+client ignores a broken pipe for its own lifetime, because make installs a fatal
+handler for it and a zygote may answer and close while the request is still in
+flight; the default disposition is restored before the cold exec. And a signal
+the client inherited as ignored stays ignored, as it does in make, so a zygote
+started as a background job passes an ignored interrupt to its children.
+
+Design notes and hazards are in scratch/SPIKE-resident-cmk.md.
+
+--- a/src/file.c
++++ b/src/file.c
+@@ -364,8 +364,10 @@
+   struct file **file_end;
+   int doneany = 0;
+ 
+-  /* If there's no way we will ever remove anything anyway, punt early.  */
+-  if (question_flag || touch_flag || all_secondary || no_intermediates)
++  /* If there's no way we will ever remove anything anyway, punt early.
++     A resident dispatch child shares these files with its parent.  */
++  if (question_flag || touch_flag || all_secondary || no_intermediates
++      || fmake_child)
+     return;
+ 
+   if (sig && just_print_flag)
+--- a/src/main.c
++++ b/src/main.c
+@@ -46,6 +46,13 @@
+ # include <fcntl.h>
+ #endif
+ 
++#ifndef WINDOWS32
++# include <sys/socket.h>
++# include <sys/un.h>
++# include <sys/wait.h>
++# include <poll.h>
++#endif
++
+ #ifdef _AMIGA
+ int __stack = 20000; /* Make sure we have 20K of stack space */
+ #endif
+@@ -100,6 +107,11 @@
+ #endif
+ 
+ static void clean_jobserver (int status);
++static void fmake_serve (const char *sockpath,
++                         struct goaldep *deps) NORETURN;
++static void fmake_client (const char *sockpath, int argc,
++                          char **argv) NORETURN;
++static int fmake_resident (int argc, char **argv);
+ static void print_data_base (void);
+ static void print_version (void);
+ static void decode_switches (int argc, const char **argv,
+@@ -301,6 +313,19 @@
+ /* Whether or not .NOTINTERMEDIATE with no prerequisites was given.  */
+ unsigned int no_intermediates;
+ 
++/* Nonzero in a resident dispatch child, which shares state with its parent.  */
++unsigned int fmake_child;
++
++/* Socket named by --serve, parked on once the makefiles are read.  */
++static const char *fmake_serve_path;
++
++/* The zygote's own argv, whose options a request may repeat and have dropped.  */
++static int fmake_serve_argc;
++static char **fmake_serve_argv;
++
++/* A dispatch child's connection back to its client, answered from die().  */
++static int fmake_conn = -1;
++
+ /* Count the number of commands we've invoked, that might change something in
+    the filesystem.  Start with 1 so calloc'd memory never matches.  */
+ 
+@@ -1193,6 +1218,33 @@
+ 
+   /* Useful for attaching debuggers, etc.  */
+   SPIN ("main-entry");
++
++#ifndef WINDOWS32
++  /* Settle the resident role before any option decoding, since a client hands
++     its own argv over untouched and never reads a makefile.  */
++  if (argc >= 3 && strcmp (argv[1], "--client") == 0)
++    fmake_client (argv[2], argc - 3, argv + 3);
++  if (argc >= 3 && strcmp (argv[1], "--serve") == 0) {
++    int i;
++    fmake_serve_path = argv[2];
++    for (i = 3; i <= argc; ++i) argv[i - 2] = argv[i];
++    argc -= 2;
++    fmake_serve_argc = argc;
++    fmake_serve_argv = argv;
++  }
++  /* Resident is the two roles run against each other for one command: the
++     child parks on this same argv, so its options match the request exactly,
++     and the parent hands the command over and reaps on the way out.  */
++  if (argc >= 2 && strcmp (argv[1], "--resident") == 0) {
++    int i;
++    for (i = 2; i <= argc; ++i) argv[i - 1] = argv[i];
++    argc -= 1;
++    if (fmake_resident (argc, argv)) {
++      fmake_serve_argc = argc;
++      fmake_serve_argv = argv;
++    }
++  }
++#endif
+ 
+ #ifdef HAVE_ATEXIT
+   if (ANY_SET (check_io_state (), IO_STDOUT_OK))
+@@ -2906,6 +2958,12 @@
+       O (fatal, NILF, _("No targets specified and no makefile found"));
+     }
+ 
++#ifndef WINDOWS32
++  /* Resident mode parks here and serves goals instead of running one.  */
++  if (fmake_serve_path != 0)
++    fmake_serve (fmake_serve_path, read_files);
++#endif
++
+   /* Shuffle prerequisites to catch makefiles with incomplete depends. */
+ 
+   shuffle_goaldeps_recursive (goals);
+@@ -3759,9 +3817,1010 @@
+ 
+   when = time ((time_t *) 0);
+   printf (_("\n# Finished Make data base on %s\n"), ctime (&when));
++}
++
++#ifndef WINDOWS32
++
++/* Resident dispatch.  A zygote reads the makefiles, parks on a unix socket at
++   the point where make would start updating goals, and forks a child per
++   request.  The request carries the client's cwd, argv, environment and three
++   standard descriptors, so the child runs as an ordinary make from there on
++   while the parent, which never executes a goal, stays pristine and reusable.
++
++   Two roles on one binary, both selected by argv so nothing in the environment
++   can trigger either:
++
++     fmake --serve <socket> -f <program> [goal]
++     fmake --client <socket> [-- <cold command>] <args>
++
++   A reply is two lines on the same connection: the child's pid, then its exit
++   status.  Pid zero means the parent answered without forking.  Status 75 says
++   the zygote declined, and the client then runs its own cold command, so a
++   refusal costs a fallback rather than a wrong answer.  A child declines when
++   the request carries any option the zygote does not already hold.  */
++
++#define FMAKE_STALE     75
++#define FMAKE_MAXREQ    (4 * 1024 * 1024)
++#define FMAKE_MAXCONN   1024
++#define FMAKE_NFD       3
++
++/* Client mode runs before make is initialized, so its failures cannot go
++   through the usual reporting.  */
++
++static void fmake_die (const char *what, const char *why) NORETURN;
++
++static void
++fmake_die (const char *what, const char *why) {
++  fprintf (stderr, "fmake: %s: %s\n", what, why);
++  exit (MAKE_FAILURE);
++}
++
++static int
++fmake_write_all (int fd, const void *buf, size_t len) {
++  const char *p = buf;
++  while (len > 0) {
++    ssize_t w = write (fd, p, len);
++    if (w < 0) { if (errno == EINTR) continue; return -1; }
++    p += w;
++    len -= (size_t) w;
++  }
++  return 0;
++}
++
++static int
++fmake_read_all (int fd, void *buf, size_t len) {
++  char *p = buf;
++  while (len > 0) {
++    ssize_t r = read (fd, p, len);
++    if (r < 0) { if (errno == EINTR) continue; return -1; }
++    if (r == 0) return -1;
++    p += r;
++    len -= (size_t) r;
++  }
++  return 0;
++}
++
++static int
++fmake_read_line (int fd, char *buf, size_t size) {
++  size_t len = 0;
++  for (;;) {
++    char c;
++    ssize_t r = read (fd, &c, 1);
++    if (r < 0) { if (errno == EINTR) continue; return 0; }
++    if (r == 0) return 0;
++    if (c == '\n') break;
++    if (len < size - 1) buf[len++] = c;
++  }
++  buf[len] = '\0';
++  return 1;
++}
++
++/* Make installs a fatal handler for the broken-pipe signal, so a departed
++   client must not take a finished child down before it exits on its own.  */
++
++static void
++fmake_write_status (int fd, int status) {
++  char buf[32];
++  int len = sprintf (buf, "%d\n", status);
++  void (*prev) (int) = signal (SIGPIPE, SIG_IGN);
++  fmake_write_all (fd, buf, (size_t) len);
++  signal (SIGPIPE, prev);
++}
++
++static void
++fmake_put_u32 (char **p, size_t v) {
++  unsigned char *q = (unsigned char *) *p;
++  q[0] = (unsigned char) (v & 0xff);
++  q[1] = (unsigned char) ((v >> 8) & 0xff);
++  q[2] = (unsigned char) ((v >> 16) & 0xff);
++  q[3] = (unsigned char) ((v >> 24) & 0xff);
++  *p += 4;
++}
++
++static size_t
++fmake_get_u32 (const char **p) {
++  const unsigned char *q = (const unsigned char *) *p;
++  *p += 4;
++  return (size_t) q[0] | ((size_t) q[1] << 8) | ((size_t) q[2] << 16)
++         | ((size_t) q[3] << 24);
++}
++
++/* Pack cwd, argv and the environment into one length-prefixed buffer.  */
++
++static char *
++fmake_build_request (int argc, char **argv, size_t *lenp) {
++  PATH_VAR (cwd);
++  size_t need = 4 + 4 + 4;
++  int i, envc;
++  char *buf, *p;
++
++  if (getcwd (cwd, GET_PATH_MAX) == 0)
++    fmake_die ("getcwd", strerror (errno));
++
++  need += strlen (cwd) + 1;
++  for (i = 0; i < argc; ++i) need += strlen (argv[i]) + 1;
++  for (envc = 0; environ[envc] != 0; ++envc) need += strlen (environ[envc]) + 1;
++
++  buf = xmalloc (need);
++  p = buf;
++  fmake_put_u32 (&p, need - 4);
++  strcpy (p, cwd);
++  p += strlen (cwd) + 1;
++
++  fmake_put_u32 (&p, (size_t) argc);
++  for (i = 0; i < argc; ++i) { strcpy (p, argv[i]); p += strlen (argv[i]) + 1; }
++
++  fmake_put_u32 (&p, (size_t) envc);
++  for (i = 0; i < envc; ++i) { strcpy (p, environ[i]); p += strlen (environ[i]) + 1; }
++
++  *lenp = need;
++  return buf;
++}
++
++/* Hand the request over with the three standard descriptors attached.  A
++   zygote that answered and closed before the send gives 0, not a signal.  */
++
++static int
++fmake_send_request (int fd, const char *buf, size_t len) {
++  union { struct cmsghdr align; char b[CMSG_SPACE (FMAKE_NFD * sizeof (int))]; } cbuf;
++  int fds[FMAKE_NFD];
++  struct msghdr msg;
++  struct iovec iov;
++  struct cmsghdr *cm;
++  ssize_t sent;
++
++  fds[0] = STDIN_FILENO;
++  fds[1] = STDOUT_FILENO;
++  fds[2] = STDERR_FILENO;
++
++  memset (&msg, '\0', sizeof msg);
++  memset (&cbuf, '\0', sizeof cbuf);
++  iov.iov_base = (void *) buf;
++  iov.iov_len = len;
++  msg.msg_iov = &iov;
++  msg.msg_iovlen = 1;
++  msg.msg_control = cbuf.b;
++  msg.msg_controllen = CMSG_SPACE (FMAKE_NFD * sizeof (int));
++
++  cm = CMSG_FIRSTHDR (&msg);
++  cm->cmsg_level = SOL_SOCKET;
++  cm->cmsg_type = SCM_RIGHTS;
++  cm->cmsg_len = CMSG_LEN (FMAKE_NFD * sizeof (int));
++  memcpy (CMSG_DATA (cm), fds, sizeof fds);
++
++  for (;;) {
++    sent = sendmsg (fd, &msg, 0);
++    if (sent >= 0) break;
++    if (errno != EINTR) return 0;
++  }
++
++  /* Ancillary data rides the first sendmsg; any tail is plain stream.  */
++  if ((size_t) sent < len
++      && fmake_write_all (fd, buf + sent, len - (size_t) sent) < 0)
++    return 0;
++  return 1;
++}
++
++/* Collect one request and its descriptors.  Returns 0 on a malformed one.  */
++
++static int
++fmake_recv_request (int fd, char **bufp, int fds[FMAKE_NFD]) {
++  union { struct cmsghdr align; char b[CMSG_SPACE (FMAKE_NFD * sizeof (int))]; } cbuf;
++  char head[4];
++  const char *hp = head;
++  struct msghdr msg;
++  struct iovec iov;
++  struct cmsghdr *cm;
++  ssize_t r;
++  size_t len;
++  char *buf;
++
++  memset (&msg, '\0', sizeof msg);
++  memset (&cbuf, '\0', sizeof cbuf);
++  iov.iov_base = head;
++  iov.iov_len = sizeof head;
++  msg.msg_iov = &iov;
++  msg.msg_iovlen = 1;
++  msg.msg_control = cbuf.b;
++  msg.msg_controllen = sizeof cbuf.b;
++
++  do r = recvmsg (fd, &msg, 0); while (r < 0 && errno == EINTR);
++  if (r < 1) return 0;
++
++  cm = CMSG_FIRSTHDR (&msg);
++  if (cm == 0 || cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS
++      || cm->cmsg_len != CMSG_LEN (FMAKE_NFD * sizeof (int)))
++    return 0;
++  memcpy (fds, CMSG_DATA (cm), FMAKE_NFD * sizeof (int));
++
++  if ((size_t) r < sizeof head
++      && fmake_read_all (fd, head + r, sizeof head - (size_t) r) < 0)
++    return 0;
++
++  len = fmake_get_u32 (&hp);
++  if (len == 0 || len > FMAKE_MAXREQ) return 0;
++
++  buf = xmalloc (len);
++  if (fmake_read_all (fd, buf, len) < 0) { free (buf); return 0; }
++
++  *bufp = buf;
++  return 1;
+ }
+ 
++/* Names make maintains across recursion, which keep the zygote's values.  */
++
++static const char *const fmake_env_managed[] =
++  {
++    "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKE_TERMOUT", "MAKE_TERMERR",
++    "MAKE_RESTARTS", "CURDIR"
++  };
++
++static int
++fmake_env_is_managed (const char *name, size_t len)
++{
++  unsigned int i;
++
++  for (i = 0; i < sizeof fmake_env_managed / sizeof *fmake_env_managed; ++i)
++    if (strlen (fmake_env_managed[i]) == len
++        && memcmp (name, fmake_env_managed[i], len) == 0)
++      return 1;
++  return 0;
++}
++
++/* Drop what the zygote took from its own environment, so that a request's
++   environment matches a cold run instead of adding to the zygote's.  */
++
+ static void
++fmake_clear_zygote_env (void)
++{
++  unsigned int i;
++
++  for (i = 0; environ[i] != 0; ++i) {
++    size_t len = strcspn (environ[i], "=");
++    if (environ[i][len] == '=' && !fmake_env_is_managed (environ[i], len))
++      undefine_variable_global (environ[i], len, o_env);
++  }
++}
++
++/* Names the caller lists in FMAKE_REARM: per-execution values a makefile
++   computes once at parse time, which a shared parse would otherwise freeze.  */
++
++static int
++fmake_rearm_has (const char *set, const char *name, size_t len) {
++  const char *p = set;
++
++  if (set == 0)
++    return 0;
++  while (*p != '\0') {
++    size_t n;
++    p += strspn (p, " \t");
++    n = strcspn (p, " \t");
++    if (n == len && strncmp (p, name, len) == 0)
++      return 1;
++    p += n;
++  }
++  return 0;
++}
++
++static char *
++fmake_env_value (const char *p, size_t envc, const char *key) {
++  size_t klen = strlen (key);
++  size_t i;
++
++  for (i = 0; i < envc; ++i) {
++    if (strncmp (p, key, klen) == 0 && p[klen] == '=')
++      return xstrdup (p + klen + 1);
++    p += strlen (p) + 1;
++  }
++  return 0;
++}
++
++/* Import the request environment the way make imports its own at startup, so
++   that a makefile assignment still outranks it unless -e was given.  A rearmed
++   name is the exception: the caller's value must beat the zygote's parse.  */
++
++static void
++fmake_import_env (const char *p, size_t envc, const char *rearm) {
++  size_t i;
++
++  for (i = 0; i < envc; ++i) {
++    size_t len = strcspn (p, "=");
++    const char *val = p + len;
++    struct variable *v;
++
++    if (*val != '=' || fmake_env_is_managed (p, len)) {
++      p += strlen (p) + 1;
++      continue;
++    }
++    ++val;
++
++    v = define_variable (p, len, val,
++                         fmake_rearm_has (rearm, p, len) ? o_override : o_env, 1);
++    v->export = v_export;
++
++    /* A makefile SHELL must not reach subprocesses, per posix.  */
++    if (streq (v->name, "SHELL")) {
++      v->export = v_noexport;
++      shell_var.name = xstrdup ("SHELL");
++      shell_var.length = 5;
++      shell_var.value = xstrdup (val);
++    }
++    else if (streq (v->name, MAKELEVEL_NAME))
++      makelevel = make_toui (val, NULL);
++
++    p += strlen (p) + 1;
++  }
++}
++
++/* The zygote's own options, normalized so that a separated argument is joined
++   to its flag.  A request repeating one of these is asking for what the zygote
++   already is, so the token is dropped; anything else it cannot serve.  */
++
++#define FMAKE_ARGOPTS "fCoWImj"
++
++static char **fmake_zopts;
++static int fmake_nzopts;
++static char fmake_zshort[64];
++
++static int
++fmake_opt_takes_arg (const char *tok) {
++  return tok[2] == '\0' && strchr (FMAKE_ARGOPTS, tok[1]) != 0;
++}
++
++static void
++fmake_zshort_add (const char *chars) {
++  size_t n = strlen (fmake_zshort);
++  for (; *chars != '\0'; ++chars)
++    if (strchr (fmake_zshort, *chars) == 0 && n + 1 < sizeof fmake_zshort) {
++      fmake_zshort[n++] = *chars;
++      fmake_zshort[n] = '\0';
++    }
++}
++
++/* A run of short flags none of which takes an argument, so the letters can be
++   compared one at a time rather than as a whole token.  */
++
++static int
++fmake_opt_is_cluster (const char *tok) {
++  const char *p;
++  for (p = tok + 1; *p != '\0'; ++p)
++    if (!isalpha ((unsigned char) *p) || strchr (FMAKE_ARGOPTS, *p) != 0)
++      return 0;
++  return tok[1] != '\0';
++}
++
++static void
++fmake_zopts_note (const char *tok) {
++  if (tok[1] != '-' && fmake_opt_is_cluster (tok))
++    fmake_zshort_add (tok + 1);
++  else
++    fmake_zopts[fmake_nzopts++] = xstrdup (tok);
++}
++
++/* The zygote's effective options: its own argv, which carries the makefile, plus
++   MAKEFLAGS, which the makefiles themselves may set and which is therefore what
++   a recursive call site expands to.  */
++
++static void
++fmake_zopts_init (void) {
++  struct variable *v;
++  int i;
++
++  fmake_zopts = xmalloc (((size_t) fmake_serve_argc + 64) * sizeof *fmake_zopts);
++
++  for (i = 1; i < fmake_serve_argc; ++i) {
++    const char *tok = fmake_serve_argv[i];
++
++    if (tok[0] != '-' || tok[1] == '\0') continue;
++    if (fmake_opt_takes_arg (tok) && i + 1 < fmake_serve_argc) {
++      char *joined = xmalloc (strlen (tok) + strlen (fmake_serve_argv[i + 1]) + 1);
++      sprintf (joined, "%s%s", tok, fmake_serve_argv[++i]);
++      fmake_zopts[fmake_nzopts++] = joined;
++    }
++    else
++      fmake_zopts_note (tok);
++  }
++
++  v = lookup_variable (STRING_SIZE_TUPLE ("MAKEFLAGS"));
++  if (v != 0 && v->value != 0) {
++    char *copy = xstrdup (v->value);
++    char *tok;
++
++    for (tok = strtok (copy, " \t"); tok != 0; tok = strtok (0, " \t")) {
++      /* Everything past the separator is a variable override, not a flag.  */
++      if (streq (tok, "--")) break;
++      if (tok[0] == '-') fmake_zopts_note (tok);
++      else if (strchr (tok, '=') == 0) fmake_zshort_add (tok);
++    }
++    free (copy);
++  }
++}
++
++static int
++fmake_zopts_has (const char *tok) {
++  int i;
++
++  /* A cluster is satisfied letter by letter, so a request asking for less than
++     the zygote carries still matches.  */
++  if (tok[1] != '-' && fmake_opt_is_cluster (tok)) {
++    const char *p;
++    for (p = tok + 1; *p != '\0'; ++p)
++      if (strchr (fmake_zshort, *p) == 0) return 0;
++    return 1;
++  }
++
++  for (i = 0; i < fmake_nzopts; ++i)
++    if (streq (fmake_zopts[i], tok)) return 1;
++  return 0;
++}
++
++/* Walk a request's argv, joining a separated option argument.  Returns 0 when
++   the request carries an option the zygote does not already have.  */
++
++static void
++fmake_refused (const char *tok) {
++  if (getenv ("FMAKE_DEBUG") != 0)
++    fprintf (stderr, "fmake: refused, zygote has no %s (it holds -%s %s)\n",
++             tok, fmake_zshort, fmake_nzopts > 0 ? fmake_zopts[0] : "");
++}
++
++static int
++fmake_negotiate (const char *p, size_t argc) {
++  size_t i;
++
++  for (i = 0; i < argc; ++i) {
++    const char *tok = p;
++
++    p += strlen (p) + 1;
++    if (tok[0] != '-' || tok[1] == '\0') continue;
++
++    if (fmake_opt_takes_arg (tok) && i + 1 < argc) {
++      char *joined = xmalloc (strlen (tok) + strlen (p) + 1);
++      int known;
++
++      sprintf (joined, "%s%s", tok, p);
++      p += strlen (p) + 1;
++      ++i;
++      known = fmake_zopts_has (joined);
++      if (!known) fmake_refused (joined);
++      free (joined);
++      if (!known) return 0;
++    }
++    else if (!fmake_zopts_has (tok)) {
++      fmake_refused (tok);
++      return 0;
++    }
++  }
++  return 1;
++}
++
++/* Adopt the request and run it in this process.  Never returns.  */
++
++static void fmake_dispatch (int conn) NORETURN;
++
++static void
++fmake_dispatch (int conn) {
++  int status = MAKE_SUCCESS;
++  int fds[FMAKE_NFD];
++  const char *p, *argp;
++  char *buf;
++  size_t argc, envc, i;
++
++  if (!fmake_recv_request (conn, &buf, fds)) {
++    fmake_write_status (conn, 0);
++    fmake_write_status (conn, MAKE_FAILURE);
++    _exit (MAKE_FAILURE);
++  }
++
++  fmake_write_status (conn, (int) getpid ());
++
++  /* Buffered parse-time output belongs to the zygote, not to this request.  */
++  fflush (NULL);
++
++  for (i = 0; i < FMAKE_NFD; ++i) {
++    dup2 (fds[i], (int) i);
++    if (fds[i] > STDERR_FILENO) close (fds[i]);
++  }
++
++  p = buf;
++  if (*p != '\0' && chdir (p) < 0)
++    pfatal_with_name (p);
++  p += strlen (p) + 1;
++
++  fmake_child = 1;
++  fmake_conn = conn;
++  goals = 0;
++  lastgoal = 0;
++  define_variable_cname ("MAKECMDGOALS", "", o_default, 0);
++
++  /* Walk past argv to reach the environment, which is imported first so that
++     an argv override still outranks it.  */
++  argc = fmake_get_u32 (&p);
++  argp = p;
++  for (i = 0; i < argc; ++i) p += strlen (p) + 1;
++  envc = fmake_get_u32 (&p);
++
++  /* An option the zygote does not already carry means a different make, which
++     only the caller's own cold command can be.  */
++  if (!fmake_negotiate (argp, argc)) {
++    fmake_write_status (conn, FMAKE_STALE);
++    _exit (FMAKE_STALE);
++  }
++
++  fmake_clear_zygote_env ();
++  {
++    char *rearm = fmake_env_value (p, envc, "FMAKE_REARM");
++    char *aspid = fmake_env_value (p, envc, "FMAKE_REARM_PID");
++
++    if (getenv ("FMAKE_DEBUG") != 0)
++      fprintf (stderr, "fmake: rearm [%s] aspid [%s]\n",
++               rearm != 0 ? rearm : "", aspid != 0 ? aspid : "");
++
++    fmake_import_env (p, envc, rearm);
++
++    /* A name whose value is this process rather than the caller's: only the
++       child knows it, so it is set here rather than promoted from the request.  */
++    if (aspid != 0) {
++      char pid[32];
++      const char *q = aspid;
++
++      sprintf (pid, "%d", (int) getpid ());
++      while (*q != '\0') {
++        size_t n;
++
++        q += strspn (q, " \t");
++        n = strcspn (q, " \t");
++        if (n == 0)
++          break;
++        define_variable (q, n, pid, o_override, 0);
++        q += n;
++      }
++    }
++    free (rearm);
++    free (aspid);
++  }
++
++  p = argp;
++  for (i = 0; i < argc; ++i) {
++    /* Options were matched against the zygote's own, so they are no-ops here.  */
++    if (p[0] == '-' && p[1] != '\0') {
++      if (fmake_opt_takes_arg (p) && i + 1 < argc) { p += strlen (p) + 1; ++i; }
++      p += strlen (p) + 1;
++      continue;
++    }
++    handle_non_switch_argument (p, o_command);
++    p += strlen (p) + 1;
++  }
++
++  /* A request naming no goal means the default, which the zygote resolved for its
++     own argv before the fork and this child discarded along with the rest.  */
++  if (goals == 0 && default_goal_var != 0 && default_goal_var->value[0] != '\0') {
++    char *dg = allocated_variable_expand (default_goal_var->value);
++
++    if (dg != 0 && dg[0] != '\0')
++      handle_non_switch_argument (dg, o_command);
++    free (dg);
++  }
++
++  /* MAKEFLAGS was built before the hook point, so rebuild it for sub-makes.  */
++  define_makeflags (0);
++
++  /* A makefile may record its own command line by reading the parent process,
++     which under dispatch is the zygote rather than the caller.  Rebuild it from
++     the request, at an origin that outranks the parse-time assignment.  */
++  {
++    size_t need = strlen (fmake_serve_argv[0]) + 1;
++    const char *q = argp;
++    char *cli, *w;
++
++    for (i = 0; i < argc; ++i) { need += strlen (q) + 1; q += strlen (q) + 1; }
++
++    cli = xmalloc (need);
++    w = cli + sprintf (cli, "%s", fmake_serve_argv[0]);
++    q = argp;
++    for (i = 0; i < argc; ++i) { w += sprintf (w, " %s", q); q += strlen (q) + 1; }
++    define_variable_cname ("MAKE_CLI", cli, o_override, 0)->export = v_export;
++    free (cli);
++  }
++
++  if (goals != 0)
++    switch (update_goal_chain (goals)) {
++    case us_none:
++    case us_success:                      break;
++    case us_question: status = MAKE_TROUBLE; break;
++    case us_failed:   status = MAKE_FAILURE; break;
++    }
++
++  die (status);
++}
++
++/* Opt-in staleness, for a makefile nothing else version-stamps.  cmk names its
++   own artifacts by content, so a changed program is a different path and a
++   zygote cannot go stale; watching there only misfires when a warm cache
++   touches a file it read.  FMAKE_WATCH arms it for hand-written makefiles.  */
++
++struct fmake_watch { const char *name; time_t mtime; };
++
++static struct fmake_watch *fmake_watched;
++static unsigned int fmake_nwatched;
++
++static void
++fmake_watch_init (struct goaldep *deps) {
++  const char *arm = getenv ("FMAKE_WATCH");
++  struct goaldep *d;
++  unsigned int n = 0;
++
++  if (arm == 0 || *arm == '\0' || streq (arm, "0")) return;
++
++  for (d = deps; d != 0; d = d->next) ++n;
++  if (n == 0) return;
++
++  fmake_watched = xmalloc (n * sizeof *fmake_watched);
++  for (d = deps; d != 0; d = d->next) {
++    const char *name = dep_name (d);
++    struct stat st;
++
++    fmake_watched[fmake_nwatched].name = name;
++    fmake_watched[fmake_nwatched].mtime
++      = stat (name, &st) == 0 ? st.st_mtime : (time_t) 0;
++    ++fmake_nwatched;
++  }
++}
++
++static int
++fmake_watch_stale (void) {
++  unsigned int i;
++
++  for (i = 0; i < fmake_nwatched; ++i) {
++    struct stat st;
++    time_t now = stat (fmake_watched[i].name, &st) == 0 ? st.st_mtime : (time_t) 0;
++    if (now != fmake_watched[i].mtime) return 1;
++  }
++  return 0;
++}
++
++/* Serve requests on a unix socket, forking a child for each.  Never returns.  */
++
++static void
++fmake_serve (const char *sockpath, struct goaldep *deps) {
++  struct { pid_t pid; int fd; } live[FMAKE_MAXCONN];
++  unsigned int nlive = 0;
++  struct sockaddr_un addr;
++  struct pollfd pfd;
++  int lfd;
++
++  fmake_watch_init (deps);
++  fmake_zopts_init ();
++
++  if (strlen (sockpath) >= sizeof addr.sun_path)
++    OS (fatal, NILF, _("socket path too long: %s"), sockpath);
++
++  lfd = socket (AF_UNIX, SOCK_STREAM, 0);
++  if (lfd < 0)
++    pfatal_with_name ("socket");
++
++  memset (&addr, '\0', sizeof addr);
++  addr.sun_family = AF_UNIX;
++  strcpy (addr.sun_path, sockpath);
++  unlink (sockpath);
++
++  if (bind (lfd, (struct sockaddr *) &addr, sizeof addr) < 0)
++    pfatal_with_name (sockpath);
++  if (listen (lfd, 64) < 0)
++    pfatal_with_name ("listen");
++
++  /* A zygote outlives whatever started it, so an inherited descriptor would be
++     held open for good and a caller waiting for end of stream on one would wait
++     forever.  The client supplies the standard three; the listener is ours.  */
++  {
++    int fd, top = (int) sysconf (_SC_OPEN_MAX);
++
++    if (top < 0 || top > 4096) top = 4096;
++    for (fd = 3; fd < top; ++fd)
++      if (fd != lfd) close (fd);
++  }
++
++  for (;;) {
++    unsigned int i;
++    pid_t done;
++    int conn;
++
++    pfd.fd = lfd;
++    pfd.events = POLLIN;
++    if (poll (&pfd, 1, 1000) < 0 && errno != EINTR)
++      pfatal_with_name ("poll");
++
++    /* Reap children and release the connections they answered on.  */
++    while ((done = waitpid (-1, NULL, WNOHANG)) > 0)
++      for (i = 0; i < nlive; ++i)
++        if (live[i].pid == done) {
++          close (live[i].fd);
++          live[i] = live[--nlive];
++          break;
++        }
++
++    /* A client that has gone takes its child with it.  The peek consumes
++       nothing and reports a live peer whether or not the child has read.  */
++    for (i = 0; i < nlive; ++i) {
++      char c;
++      if (recv (live[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0)
++        kill (live[i].pid, SIGTERM);
++    }
++
++    if (!(pfd.revents & POLLIN)) continue;
++
++    conn = accept (lfd, NULL, NULL);
++    if (conn < 0) {
++      if (errno == EINTR || errno == ECONNABORTED) continue;
++      pfatal_with_name ("accept");
++    }
++
++    if (fmake_watch_stale () || nlive == FMAKE_MAXCONN) {
++      fmake_write_status (conn, 0);
++      fmake_write_status (conn, nlive == FMAKE_MAXCONN ? MAKE_FAILURE : FMAKE_STALE);
++      close (conn);
++      continue;
++    }
++
++    /* Fork before reading, so a client that stalls blocks only its own
++       child rather than every request behind it.  */
++    fflush (NULL);
++    live[nlive].pid = fork ();
++    if (live[nlive].pid < 0)
++      pfatal_with_name ("fork");
++
++    if (live[nlive].pid == 0) { close (lfd); fmake_dispatch (conn); }
++
++    live[nlive++].fd = conn;
++  }
++}
++
++/* The command to run when no zygote can serve the request.  After `--` the
++   caller supplied it outright; otherwise FMAKE_COLD names the make to prepend.  */
++
++static char **fmake_cold_argv;
++
++static void fmake_cold (int argc, char **argv) NORETURN;
++
++static void
++fmake_cold (int argc, char **argv) {
++  const char *cold;
++  char **nargv;
++  char *spec, *tok;
++  int n = 0, i;
++
++  /* The client ignores a broken pipe; a cold make must not inherit that.  */
++  signal (SIGPIPE, SIG_DFL);
++
++  if (fmake_cold_argv != 0) {
++    execvp (fmake_cold_argv[0], fmake_cold_argv);
++    fmake_die (fmake_cold_argv[0], strerror (errno));
++  }
++
++  cold = getenv ("FMAKE_COLD");
++  if (cold == 0 || *cold == '\0')
++    fmake_die ("no zygote answered", "no command after -- and FMAKE_COLD unset");
++
++  spec = xstrdup (cold);
++  nargv = xmalloc ((strlen (spec) / 2 + (size_t) argc + 2) * sizeof *nargv);
++  for (tok = strtok (spec, " \t"); tok != 0; tok = strtok (0, " \t")) nargv[n++] = tok;
++  for (i = 0; i < argc; ++i) nargv[n++] = argv[i];
++  nargv[n] = 0;
++
++  execvp (nargv[0], nargv);
++  fmake_die (nargv[0], strerror (errno));
++}
++
++/* The child this client is waiting on, and the signal it last passed along.  */
++
++static volatile sig_atomic_t fmake_peer_pid;
++static volatile sig_atomic_t fmake_peer_sig;
++
++static void
++fmake_forward_signal (int sig) {
++  fmake_peer_sig = sig;
++  if (fmake_peer_pid > 0) kill ((pid_t) fmake_peer_pid, sig);
++  else _exit (128 + sig);
++}
++
++/* An already-ignored signal stays ignored, as make does for its own.  */
++
++static void
++fmake_catch (int sig) {
++  if (signal (sig, fmake_forward_signal) == SIG_IGN)
++    signal (sig, SIG_IGN);
++}
++
++/* One run, resident: fork a zygote on this command's own argv, route the
++   command through it, and take the zygote down when the command is done.
++
++   The lifetime belongs here rather than to the zygote.  A trampoline has no
++   client at all between hops, so a zygote that exited when its last client
++   left would exit in that gap.  Every nested client is a descendant of the
++   request, so when the request returns there are none.
++
++   Returns nonzero in the child, which then falls through into an ordinary
++   parse and parks; the parent never returns.  */
++
++static char fmake_run_dir[] = "/tmp/fmake-resident.XXXXXX";
++static char fmake_run_sock[sizeof fmake_run_dir + 16];
++static pid_t fmake_run_zygote;
++
++/* Idempotent, since a resident run may reach it by exit, by signal, or by the
++   client dying alongside its child.  */
++
++static void
++fmake_resident_reap (void) {
++  if (fmake_run_sock[0] == '\0')
++    return;
++  if (fmake_run_zygote > 0) {
++    kill (fmake_run_zygote, SIGTERM);
++    waitpid (fmake_run_zygote, NULL, 0);
++    fmake_run_zygote = 0;
++  }
++  unlink (fmake_run_sock);
++  rmdir (fmake_run_dir);
++  fmake_run_sock[0] = '\0';
++}
++
++static void
++fmake_resident_signal (int sig) {
++  fmake_resident_reap ();
++  signal (sig, SIG_DFL);
++  raise (sig);
++}
++
++static int
++fmake_resident (int argc, char **argv) {
++  const char *tmp = getenv ("TMPDIR");
++  unsigned int waited;
++  pid_t pid;
++
++  if (tmp != 0 && *tmp != '\0'
++      && strlen (tmp) + sizeof "/fmake-resident.XXXXXX" <= sizeof fmake_run_dir)
++    sprintf (fmake_run_dir, "%s/fmake-resident.XXXXXX", tmp);
++
++  /* Nowhere to put a socket is a reason to be an ordinary make, not to fail.  */
++  if (mkdtemp (fmake_run_dir) == 0)
++    return 0;
++  sprintf (fmake_run_sock, "%s/zygote.sock", fmake_run_dir);
++
++  pid = fork ();
++  if (pid < 0) {
++    rmdir (fmake_run_dir);
++    return 0;
++  }
++
++  if (pid == 0) {
++    /* The zygote answers on the socket and owns none of the caller's streams.  */
++    int null = open ("/dev/null", O_RDWR);
++    if (null >= 0) {
++      dup2 (null, STDIN_FILENO);
++      dup2 (null, STDOUT_FILENO);
++      dup2 (null, STDERR_FILENO);
++      if (null > STDERR_FILENO) close (null);
++    }
++    fmake_serve_path = fmake_run_sock;
++    return 1;
++  }
++
++  fmake_run_zygote = pid;
++  atexit (fmake_resident_reap);
++  signal (SIGINT, fmake_resident_signal);
++  signal (SIGTERM, fmake_resident_signal);
++  signal (SIGHUP, fmake_resident_signal);
++
++  for (waited = 0; waited < 3000; ++waited) {
++    struct stat st;
++    int gone;
++
++    if (stat (fmake_run_sock, &st) == 0)
++      break;
++    gone = waitpid (pid, NULL, WNOHANG) == pid;
++    if (gone) {
++      fmake_run_zygote = 0;
++      rmdir (fmake_run_dir);
++      return 0;
++    }
++    usleep (10000);
++  }
++
++  /* A zygote that never bound costs nothing but the saving.  */
++  {
++    struct stat st;
++    if (stat (fmake_run_sock, &st) != 0) {
++      fmake_resident_reap ();
++      return 0;
++    }
++  }
++
++  /* Recursion by path reaches the zygote through MAKE, and cmk's recursion by
++     name through its own retrofit, which reads FMAKE_CLIENT.  */
++  {
++    char *spec = xmalloc (strlen (argv[0]) * 2 + strlen (fmake_run_sock) + 32);
++    sprintf (spec, "%s --client %s -- %s", argv[0], fmake_run_sock, argv[0]);
++    setenv ("MAKE", spec, 1);
++    sprintf (spec, "%s --client %s -- ", argv[0], fmake_run_sock);
++    setenv ("FMAKE_CLIENT", spec, 1);
++    free (spec);
++  }
++
++  /* A refusal re-runs the caller's own command as an ordinary make.  */
++  fmake_cold_argv = argv;
++  fmake_client (fmake_run_sock, argc - 1, argv + 1);
++  return 0;
++}
++
++/* Hand this command to a zygote and exit on its status.  Never returns.  */
++
++static void
++fmake_client (const char *sockpath, int argc, char **argv) {
++  struct sockaddr_un addr;
++  char line[64];
++  size_t len;
++  char *buf;
++  int fd;
++
++  if (strlen (sockpath) >= sizeof addr.sun_path)
++    fmake_die (sockpath, "socket path too long");
++
++  /* A cold command after the separator is the caller's own fallback; the
++     request then repeats it without the program name the zygote already is.  */
++  if (argc >= 2 && strcmp (argv[0], "--") == 0) {
++    fmake_cold_argv = argv + 1;
++    argv += 2;
++    argc -= 2;
++  }
++
++  fd = socket (AF_UNIX, SOCK_STREAM, 0);
++  if (fd < 0)
++    fmake_die ("socket", strerror (errno));
++
++  memset (&addr, '\0', sizeof addr);
++  addr.sun_family = AF_UNIX;
++  strcpy (addr.sun_path, sockpath);
++
++  /* A missing or dead socket is the same answer as a stale one.  */
++  if (connect (fd, (struct sockaddr *) &addr, sizeof addr) < 0)
++    fmake_cold (argc, argv);
++
++  signal (SIGPIPE, SIG_IGN);
++  fmake_catch (SIGINT);
++  fmake_catch (SIGTERM);
++  fmake_catch (SIGHUP);
++  fmake_catch (SIGQUIT);
++
++  buf = fmake_build_request (argc, argv, &len);
++  if (!fmake_send_request (fd, buf, len))
++    fmake_cold (argc, argv);
++  free (buf);
++
++  /* The pid line, then the status.  Waiting for end of stream instead would
++     cost a poll interval, since the parent holds its copy until it reaps.  */
++  if (!fmake_read_line (fd, line, sizeof line))
++    fmake_cold (argc, argv);
++  fmake_peer_pid = (sig_atomic_t) atoi (line);
++
++  if (!fmake_read_line (fd, line, sizeof line)) {
++    /* No status after a signal means the child died on it, so die alike.
++       Dying by signal skips the exit handlers, so a resident run reaps here.  */
++    if (fmake_peer_sig) {
++      fmake_resident_reap ();
++      signal ((int) fmake_peer_sig, SIG_DFL);
++      raise ((int) fmake_peer_sig);
++    }
++    exit (MAKE_FAILURE);
++  }
++
++  if (atoi (line) == FMAKE_STALE)
++    fmake_cold (argc, argv);
++
++  exit (atoi (line));
++}
++
++#endif /* !WINDOWS32 */
++
++static void
+ clean_jobserver (int status)
+ {
+   /* Sanity: have we written all our jobserver tokens back?  If our
+@@ -3865,5 +4924,11 @@
+         }
+     }
+ 
++#ifndef WINDOWS32
++  /* A dispatch child answers here, since a failing goal never returns.  */
++  if (fmake_child && fmake_conn >= 0)
++    fmake_write_status (fmake_conn, status);
++#endif
++
+   exit (status);
+ }
+--- a/src/makeint.h
++++ b/src/makeint.h
+@@ -749,6 +749,8 @@
+ extern char cmd_prefix;
+ 
+ extern unsigned int no_intermediates;
++
++extern unsigned int fmake_child;
+ 
+ #if HAVE_MKFIFO
+ /* It seems that mkfifo() is not working correctly, or at least not the way
+|)
