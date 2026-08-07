@@ -1,0 +1,471 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+# cmk_pragma ::: { "kind": "plugin" } :::
+
+'''
+platform.beam: cmk concurrency coordination hosted on the BEAM (Elixir).
+BEAM coordinates fan-out and join; cmk runs the polyglot leaves.
+See SPIKE-BEAM.md (working log) and IDEAS-BEAM.md (strategy).
+'''
+
+import virtual-machine.cmk, plugin=1
+from cmk import Dockerfile
+
+# The opt-in BEAM+cmk image (Debian base + jq); see SPIKE-BEAM.md.
+Dockerfile beam.node(|
+  FROM elixir:1.16
+  RUN apt-get update && apt-get install -y --no-install-recommends make gawk jq
+|)
+
+beam.branch:
+  '''
+  One fork branch: run ACTOR_GOAL in a fresh _vm.ambient keyed by ACTOR_KEY,
+  then emit its record on stdout -- os_rc, semantic verdict, and K frames.
+  The cmk leaf BEAM drives; see SPIKE-BEAM.md.
+  '''
+  run="$${MAKE_SUPER:-$$$$}"; \
+  key="$${ACTOR_KEY:-$${run}.beam.branch}"; \
+  kfile=".tmp.CONTROL_STACK_FRAMES.$${key}"; \
+  cmk.io.safe_rm($$kfile); cmk.io.safe_rm(.tmp.cmk.vmenv.$$key); cmk.io.safe_rm(.tmp.mk.super.$$key); \
+  $(call _vm.ambient,$$key) ${make} $${ACTOR_GOAL:-flux.ok} 2>/dev/null; \
+  rc=$$?; \
+  verdict=`{ [ -s ".tmp.mk.super.$$key" ] && cat ".tmp.mk.super.$$key"; } 2>/dev/null`; \
+  st=`{ [ -s "$$kfile" ] && cat "$$kfile"; } 2>/dev/null || echo '[]'`; \
+  ${jq.run} -nc --argjson os "$$rc" --arg v "$$verdict" --argjson st "$$st" \
+    '{os_rc:$$os,verdict:(if $$v=="" then null else ($$v|tonumber?) end),frames:$$st}'
+
+# The Elixir orchestrator: Port leaf executor + fan-out/gather.
+beam.node.exs(|
+  defmodule CmkLeaf do
+    # Port shape per SPIKE-BEAM: stdout to a file, stderr apart, stdin closed.
+    def run(cmd, env) when is_binary(cmd) and is_map(env) do
+      vf = Map.get(env, "CMK_VALUE_FILE") || tmp("val")
+      env = Map.put(env, "CMK_VALUE_FILE", vf)
+      _ = File.rm(vf)
+      outf = tmp("out")
+      errf = outf <> ".err"
+      sh = System.find_executable("sh") || "/bin/sh"
+      wrapped = "{ " <> cmd <> " ; } > " <> outf <> " 2> " <> errf <> " < /dev/null"
+      port =
+        Port.open({:spawn_executable, String.to_charlist(sh)}, [
+          :binary,
+          :exit_status,
+          :hide,
+          {:args, ["-c", wrapped]},
+          {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
+        ])
+      rc = wait_exit(port)
+      out =
+        case File.read(outf) do
+          {:ok, b} -> b
+          _ -> ""
+        end
+      _ = File.rm(outf)
+      _ = File.rm(errf)
+      %{rc: rc, value: read_value(vf), output: out}
+    end
+
+    defp wait_exit(port) do
+      receive do
+        {^port, {:exit_status, s}} -> s
+        {^port, {:data, _}} -> wait_exit(port)
+      end
+    end
+
+    defp read_value(vf) do
+      case File.read(vf) do
+        {:ok, b} ->
+          _ = File.rm(vf)
+          t = String.trim(b)
+          if t == "", do: nil, else: t
+        _ ->
+          nil
+      end
+    end
+
+    defp tmp(tag) do
+      Path.join(System.tmp_dir!(), "cmk_" <> tag <> "_#{:erlang.unique_integer([:positive])}")
+    end
+  end
+
+  defmodule CmkFork do
+    # Fan one beam.branch out per goal as a BEAM Task; await_many is the join.
+    def fork(leaf, goals) do
+      warmup(leaf)
+      goals
+      |> Enum.with_index(1)
+      |> Enum.map(fn {g, i} -> Task.async(fn -> branch(leaf, g, i) end) end)
+      |> Task.await_many(:infinity)
+    end
+
+    # warmup serializes the first hosted-compile so branches reuse the cache.
+    defp warmup(leaf), do: CmkLeaf.run(leaf <> " flux.ok", env())
+
+    defp branch(leaf, goal, i) do
+      key = "beamfork.fork." <> Integer.to_string(i)
+      cmd = "ACTOR_KEY=" <> key <> " ACTOR_GOAL=" <> goal <> " " <> leaf <> " beam.branch"
+      r = CmkLeaf.run(cmd, env())
+      tag(last_record(r.output), i)
+    end
+
+    defp last_record(out) do
+      lines = out |> String.split("\n", trim: true) |> Enum.reverse()
+      case Enum.find(lines, fn l -> String.starts_with?(String.trim(l), "{") end) do
+        nil -> "{}"
+        l -> String.trim(l)
+      end
+    end
+
+    # tag with the branch index, no JSON decoder (mirrors jq {branch} + .).
+    defp tag("{" <> rest, i), do: "{\"branch\":\"branch " <> Integer.to_string(i) <> "\"," <> rest
+    defp tag(_, i), do: "{\"branch\":\"branch " <> Integer.to_string(i) <> "\",\"frames\":[]}"
+
+    # CMK_SUPERVISOR=0: the headless leaf path (BEAM is the supervisor now).
+    defp env do
+      %{"CMK_SUPERVISOR" => "0", "CMK_INTERNAL" => "1", "NO_COLOR" => "1", "TERM" => "dumb"}
+    end
+  end
+
+  defmodule CmkSwarm do
+    # Race WORKERS searchers (diversified by SEED); first to find claims :global and wins, losers killed; supervised leaves (CMK_SUPERVISOR=1) so each backtracks.
+    def swarm(leaf, goal, workers, space, delay) do
+      dist()
+      _ = :global.unregister_name(:cmk_swarm_win)
+      CmkLeaf.run(leaf <> " flux.ok", %{"CMK_SUPERVISOR" => "0", "TERM" => "dumb"})
+      parent = self()
+      for i <- 0..(workers - 1) do
+        seed = div(i * space, workers)
+        spawn(fn -> worker(parent, leaf, goal, seed, space, delay) end)
+      end
+      loop(workers)
+    end
+
+    # first {:won} wins (kill the rest); all {:done} means no solution.
+    defp loop(0), do: :none
+    defp loop(left), do: recv(left, %{})
+
+    defp recv(left, pids) do
+      receive do
+        {:pid, from, os} -> recv(left, Map.put(pids, from, os))
+        {:won, from, line} ->
+          pids |> Map.delete(from) |> Map.values() |> Enum.each(&kill_leaf/1)
+          {:won, line}
+        {:done, _from} -> loop(left - 1)
+      end
+    end
+
+    defp worker(parent, leaf, goal, seed, space, delay) do
+      pre = "SEED=" <> Integer.to_string(seed) <> " SPACE=" <> Integer.to_string(space) <> " DELAY=" <> delay <> " "
+      cmd = pre <> leaf <> " " <> goal
+      {port, outf} = open(cmd)
+      send(parent, {:pid, self(), os_pid(port)})
+      rc = wait(port)
+      line = read_line(outf)
+      won =
+        rc == 0 and line != "" and :global.register_name(:cmk_swarm_win, self()) == :yes
+      if won, do: send(parent, {:won, self(), line}), else: send(parent, {:done, self()})
+    end
+
+    # supervised leaf (CMK_SUPERVISOR=1) as a Port; stdout to a file (rung-1 shape).
+    defp open(cmd) do
+      outf = Path.join(System.tmp_dir!(), "swarm_#{:erlang.unique_integer([:positive])}")
+      errf = outf <> ".err"
+      sh = System.find_executable("sh") || "/bin/sh"
+      wrapped = "{ " <> cmd <> " ; } > " <> outf <> " 2> " <> errf <> " < /dev/null"
+      env = [{~c"CMK_SUPERVISOR", ~c"1"}, {~c"NO_COLOR", ~c"1"}, {~c"TERM", ~c"dumb"}]
+      port =
+        Port.open({:spawn_executable, String.to_charlist(sh)}, [
+          :binary,
+          :exit_status,
+          :hide,
+          {:args, ["-c", wrapped]},
+          {:env, env}
+        ])
+      {port, outf}
+    end
+
+    defp os_pid(port) do
+      case Port.info(port, :os_pid) do
+        {:os_pid, p} -> p
+        _ -> nil
+      end
+    end
+
+    defp wait(port) do
+      receive do
+        {^port, {:exit_status, s}} -> s
+        {^port, {:data, _}} -> wait(port)
+      end
+    end
+
+    defp read_line(outf) do
+      out =
+        case File.read(outf) do
+          {:ok, b} -> b
+          _ -> ""
+        end
+      _ = File.rm(outf)
+      _ = File.rm(outf <> ".err")
+      lines = out |> String.split("\n", trim: true)
+      case Enum.find(lines, fn l -> String.contains?(l, "candidate=") end) do
+        nil -> ""
+        l -> String.trim(l)
+      end
+    end
+
+    # best-effort tree kill for promptness; the container exit is the hard backstop.
+    defp kill_leaf(nil), do: :ok
+    defp kill_leaf(os) do
+      s = Integer.to_string(os)
+      _ = System.cmd("pkill", ["-P", s], stderr_to_stdout: true)
+      _ = System.cmd("kill", [s], stderr_to_stdout: true)
+      :ok
+    rescue
+      _ -> :ok
+    end
+
+    # start distribution so :global is the real (cluster-ready) registry.
+    defp dist do
+      case node() do
+        :nonode@nohost ->
+          case System.find_executable("epmd") do
+            nil -> :ok
+            bin -> (try do System.cmd(bin, ["-daemon"]) rescue _ -> :ok catch _, _ -> :ok end)
+          end
+          case Node.start(:"cmk@127.0.0.1", :longnames) do
+            {:ok, _} -> :ok
+            {:error, {:already_started, _}} -> :ok
+            other -> raise "dist: #{inspect(other)}"
+          end
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defmodule CmkCluster do
+    # start <n> peer nodes in this container; erpc dispatches packets to them.
+    def up(n) do
+      dist()
+      for i <- 0..(n - 1) do
+        name = String.to_atom("cmkw" <> Integer.to_string(i))
+        {:ok, pid, node} = :peer.start_link(%{name: name, host: ~c"127.0.0.1", longnames: true})
+        {pid, node}
+      end
+    end
+
+    def down(peers) do
+      Enum.each(peers, fn {pid, _n} ->
+        try do :peer.stop(pid) rescue _ -> :ok catch _, _ -> :ok end
+      end)
+    end
+
+    # start distribution so erpc + peer nodes use real long node names.
+    defp dist do
+      case node() do
+        :nonode@nohost ->
+          case System.find_executable("epmd") do
+            nil -> :ok
+            bin -> (try do System.cmd(bin, ["-daemon"]) rescue _ -> :ok catch _, _ -> :ok end)
+          end
+          case Node.start(:"cmkctl@127.0.0.1", :longnames) do
+            {:ok, _} -> :ok
+            {:error, {:already_started, _}} -> :ok
+            other -> raise "dist: #{inspect(other)}"
+          end
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defmodule CmkPool do
+    # distributed bounded pool: erpc each packet to a peer node, tag it by node.
+    def pool(leaf, size, goals) do
+      peers = CmkCluster.up(size)
+      nodes = Enum.map(peers, fn {_p, n} -> n end)
+      cwd = File.cwd!()
+      warm(leaf, cwd, hd(nodes))
+      try do
+        goals
+        |> Enum.with_index()
+        |> Task.async_stream(
+             fn {g, i} -> dispatch(leaf, cwd, g, Enum.at(nodes, rem(i, length(nodes)))) end,
+             max_concurrency: size, ordered: false, timeout: :infinity)
+        |> Enum.reduce_while(:ok, fn
+          {:ok, {g, node, 0}}, acc -> IO.puts(:stderr, "  ok " <> g <> " @ " <> node); {:cont, acc}
+          {:ok, {g, _node, rc}}, _acc -> {:halt, {:error, g, rc}}
+          {:exit, reason}, _acc -> {:halt, {:error, inspect(reason), 1}}
+        end)
+      after
+        CmkCluster.down(peers)
+      end
+    end
+
+    # prime the shared hosted-compile cache once (all peers share the fs).
+    defp warm(leaf, cwd, node), do: dispatch(leaf, cwd, "flux.ok", node)
+
+    # run <leaf> <goal> on <node> via erpc, tagged CMK_LOG_PRE=<node>.
+    defp dispatch(leaf, cwd, goal, node) do
+      tag = Atom.to_string(node)
+      shell =
+        "cd '" <> cwd <> "' && { CMK_LOG_PRE='" <> tag <>
+          "' CMK_SUPERVISOR=1 NO_COLOR=1 TERM=dumb " <> leaf <> " " <> goal <>
+          " ; } < /dev/null 2>&1; echo CMKRC:$?"
+      out = :erpc.call(node, :os, :cmd, [String.to_charlist(shell)], :infinity) |> to_string()
+      {rc, body} = split_rc(out)
+      IO.write(:stderr, body)
+      {goal, tag, rc}
+    end
+
+    # split the rc sentinel from the leaf's node-tagged log, re-emitted to stderr.
+    defp split_rc(out) do
+      lines = String.split(out, "\n")
+      {rc_lines, body} = Enum.split_with(lines, fn l -> String.starts_with?(l, "CMKRC:") end)
+      rc =
+        case rc_lines do
+          [l | _] -> l |> String.replace_prefix("CMKRC:", "") |> String.trim() |> to_int()
+          _ -> 1
+        end
+      {rc, Enum.join(body, "\n")}
+    end
+
+    defp to_int(s) do
+      case Integer.parse(s) do
+        {n, _} -> n
+        _ -> 1
+      end
+    end
+  end
+
+  defmodule Main do
+    def main(["fork", leaf, goals]) do
+      Enum.each(CmkFork.fork(leaf, String.split(goals, ",", trim: true)), &IO.puts/1)
+    end
+
+    def main(["swarm", leaf, goal, workers, space, delay]) do
+      case CmkSwarm.swarm(leaf, goal, String.to_integer(workers), String.to_integer(space), delay) do
+        {:won, line} -> IO.puts("winner: " <> line)
+        _ -> IO.puts("no solution")
+      end
+    end
+
+    def main(["pool", leaf, spec]) do
+      [size | goals] = String.split(spec, ",", trim: true)
+      case CmkPool.pool(leaf, String.to_integer(size), goals) do
+        :ok ->
+          IO.puts("pool: ok (" <> Integer.to_string(length(goals)) <> " goals)")
+        {:error, g, rc} ->
+          IO.puts(:stderr, "pool: FAILED at " <> g <> " (rc " <> Integer.to_string(rc) <> ")")
+          System.halt(1)
+      end
+    end
+
+    def main(_) do
+      IO.puts(:stderr, "usage: <exs> fork <leaf-file> <goal,goal,...>")
+      System.halt(2)
+    end
+  end
+
+  Main.main(System.argv())
+|)
+
+beam.fork/%: beam.node.build
+  '''
+  BEAM-backed fan-out over comma-listed goals: one beam.branch per goal as an
+  independent BEAM process, joined, one record per branch. Needs docker.
+  USAGE: ./compose.mk beam.fork/handler/a,handler/b
+  '''
+  cmk.io.mktemp()
+  ${mk.def.to.file}/beam.node.exs,$${tmpf}
+  img=${beam.node.img} entrypoint=elixir \
+    cmd="$${tmpf} fork $${__file__} ${*}" ${make} docker.run.sh
+
+beam.swarm/%: beam.node.build
+  '''
+  BEAM swarm race: run WORKERS copies of <goal> diversified by SEED on the node;
+  the first to find claims a :global sink and wins, the losers are killed.
+  USAGE: ./compose.mk beam.swarm/search/13  (env WORKERS, SPACE)
+  '''
+  cmk.io.mktemp()
+  ${mk.def.to.file}/beam.node.exs,$${tmpf}
+  img=${beam.node.img} entrypoint=elixir \
+    cmd="$${tmpf} swarm $${__file__} ${*} $(or ${WORKERS},4) $(or ${SPACE},16) $(or ${DELAY},0.35)" ${make} docker.run.sh
+
+beam.pool/%: beam.node.build
+  '''
+  Bounded streaming worker pool (roughly flux.pool): run the goals with at most
+  <size> concurrent BEAM workers, fail-fast on the first nonzero. Needs docker.
+  USAGE: ./compose.mk beam.pool/2,goal.a,goal.b,goal.c
+  '''
+  cmk.io.mktemp()
+  ${mk.def.to.file}/beam.node.exs,$${tmpf}
+  img=${beam.node.img} entrypoint=elixir \
+    cmd="$${tmpf} pool $${__file__} ${*}" ${make} docker.run.sh
+
+beam.tramp: beam.node.build
+  '''
+  Run the given goals under beam-tramp (the BEAM trampoline BACKEND) in beam.node,
+  via the CMK_BOOTLOADER handoff -- no core edit; prototype (boots BEAM per run).
+  USAGE: goals='cmk run demos/cmk/beam-tramp.cmk find/5' ./compose.mk beam.tramp
+  '''
+  # direct docker run (docker.run.sh's eval/-i interferes with the nested cmk-run re-exec).
+  docker run --rm -e CMK_TRAMP_CHOOSE -e CMK_TRAMP_TRACE -e CMK_TRAMPOLINE=beam \
+    -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} ./compose.mk $${goals}
+
+# Warm-node cluster id: deterministic, env-inherited, per-tree.
+export CMK_BEAM_CLUSTER ?= cmk-beam-$(_mk.run.id)
+
+beam.node.ensure: beam.node.build
+  '''
+  Bring up (or JOIN) the resident BEAM node for this run tree; idempotent by docker
+  inspect. Reaped at the owning run exit via CMK_POST. Needs docker.
+  '''
+  docker inspect ${CMK_BEAM_CLUSTER} >/dev/null 2>&1 && exit 0; \
+  docker network inspect ${CMK_BEAM_CLUSTER}-net >/dev/null 2>&1 || docker network create ${CMK_BEAM_CLUSTER}-net >/dev/null; \
+  docker run -d --name ${CMK_BEAM_CLUSTER} --network ${CMK_BEAM_CLUSTER}-net \
+    --label cmk.run="$${MAKE_SUPER:-none}" -e CMK_PLUGINS_DIR=.cmk \
+    -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} \
+    elixir .cmk/beam-node-server.exs >/dev/null; \
+  touch .tmp.beam.node.${_mk.run.id}; \
+  i=0; while [ $$i -lt 60 ]; do docker logs ${CMK_BEAM_CLUSTER} 2>&1 | grep -q 'cmk-beam-node up' && break; i=$$((i+1)); sleep 0.25; done
+
+beam.node.reap:; docker rm -f ${CMK_BEAM_CLUSTER} >/dev/null 2>&1 || true; docker network rm ${CMK_BEAM_CLUSTER}-net >/dev/null 2>&1 || true; rm -f .tmp.beam.node.${_mk.run.id}
+
+# tree-scoped teardown: wildcard-gated, auto-registers at exit.
+$(if $(wildcard .tmp.beam.node.*),$(call __cmk_post__.append,beam.node.reap))
+
+beam.warm/%: beam.node.ensure
+  '''
+  Run <goal> on the warm resident by attaching (no per-run BEAM boot; the loop runs
+  in the shared warm VM). e.g. beam.warm/flux.ok  or  CMK_TRAMP_MK=... beam.warm/find/5
+  '''
+  RIP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${CMK_BEAM_CLUSTER}`; \
+  docker run --rm --network ${CMK_BEAM_CLUSTER}-net -e CMK_TRAMP_MK -e CMK_TRAMP_CHOOSE -e CMK_TRAMP_TRACE \
+    -e CMK_BEAM_NODE=cmk_tramp@$$RIP -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} \
+    elixir .cmk/beam-node-attach.exs ${*}
+
+# Foundation lifecycle verbs -- compose the beam.node.* primitives.
+
+beam.purge:
+  '''
+  Full cold teardown: remove ALL resident nodes + networks, the beam.node
+  image, and stale beam tmp state. Next bootstrap rebuilds from scratch.
+  '''
+  docker ps -aq --filter name=cmk-beam | xargs -r docker rm -f >/dev/null 2>&1 || true; \
+  docker network ls -q --filter name=cmk-beam | xargs -r docker network rm >/dev/null 2>&1 || true; \
+  docker rmi -f ${beam.node.img} >/dev/null 2>&1 || true; \
+  rm -f .tmp.beam* .tmp.beamtramp.*
+
+beam.bootstrap:
+  '''
+  Cold to warm, watchable: build the beam.node image (quiet=0 streams the
+  docker build) then bring up the resident node for this run tree.
+  '''
+  quiet=0 ${make} beam.node.build; \
+  ${make} beam.node.ensure
+
+beam.rebootstrap: beam.purge
+  '''
+  Purge everything then bootstrap fresh -- one watchable rebuild cycle.
+  '''
+  ${make} beam.bootstrap

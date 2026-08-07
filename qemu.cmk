@@ -1,0 +1,124 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+qemu: run a block inside a real kernel.
+
+`runner` is an image kind carrying qemu and a tiny alpine guest; `guest` is the
+ambient kind that dispatches into one; declare instances with an empty body.
+A guest program runs unbounded; only the boot is guarded, failing after
+CMK_QEMU_STALL seconds of console silence, 30 by default.  Worked examples in
+demos/cmk/machine-qemu-exfile.cmk and demos/cmk/ambient-ladder-qemu.cmk.
+'''
+import log
+from cmk import class, dockerfs, Dockerfile
+
+# the image recipe every runner instance builds from, so an instance needs only its tag
+define qemu.recipe
+FROM alpine:3.21
+RUN apk add --no-cache linux-virt busybox-static coreutils
+RUN case "$(uname -m)" in aarch64) apk add --no-cache qemu-system-aarch64;; x86_64) apk add --no-cache qemu-system-x86_64;; *) echo "qemu: unsupported arch $(uname -m)" >&2; exit 1;; esac
+RUN mkdir -p /guest/root/bin /guest/root/proc /guest/root/sys /guest/root/dev
+RUN cp /bin/busybox.static /guest/root/bin/busybox
+RUN cd /guest/root && find . | cpio -o -H newc | gzip > /guest/initramfs.gz
+ENTRYPOINT ["/usr/local/bin/vmexec"]
+endef
+
+dockerfs qemu.init(bind=qemu.runner path=/guest/root/init mode=+x)(|
+  #!/bin/busybox sh
+  /bin/busybox mkdir -p /proc /sys /bin
+  /bin/busybox mount -t proc proc /proc
+  /bin/busybox mount -t sysfs sys /sys
+  /bin/busybox --install -s /bin
+  export PATH=/bin
+  b64=""
+  for tok in $(cat /proc/cmdline); do
+    case "$tok" in cmk_payload=*) b64="${tok#cmk_payload=}";; esac
+  done
+  echo "$b64" | base64 -d > /prog
+  echo "___CMK_VM_BEGIN___"
+  sh /prog
+  rc=$?
+  echo "___CMK_VM_END___"
+  echo "___CMK_VM_RC___$rc"
+  poweroff -f
+|)
+
+dockerfs qemu.vmexec(bind=qemu.runner path=/usr/local/bin/vmexec mode=+x)(|
+  #!/bin/sh
+  b64=$(base64 -w0 "$1")
+  case "$(uname -m)" in
+    aarch64) console=ttyAMA0; qemu=qemu-system-aarch64; mach="-machine virt -cpu max";;
+    x86_64) console=ttyS0; qemu=qemu-system-x86_64; mach="-machine accel=kvm:tcg";;
+    *) echo "qemu: unsupported arch $(uname -m)" >&2; exit 1;;
+  esac
+  stall="${CMK_QEMU_STALL:-30}"
+  log=$(mktemp); err=$(mktemp)
+  ${CMK_QEMU_TIMEOUT:+timeout $CMK_QEMU_TIMEOUT} \
+    $qemu $mach -m "${CMK_QEMU_MEM:-256M}" -smp "${CMK_QEMU_CPUS:-1}" \
+    -no-reboot -nographic -kernel /boot/vmlinuz-virt -initrd /guest/initramfs.gz \
+    -append "console=$console cmk_payload=$b64" >"$log" 2>"$err" &
+  qpid=$!
+  # the boot guard is console silence, not elapsed time, so a slow host is never punished for being slow
+  while kill -0 "$qpid" 2>/dev/null; do
+    sleep 1
+    grep -q ___CMK_VM_BEGIN___ "$log" && break
+    size=$(wc -c < "$log")
+    if [ "$size" = "$last" ]; then idle=$((idle + 1)); else idle=0; last=$size; fi
+    if [ "$idle" -ge "$stall" ]; then stalled=1; kill "$qpid" 2>/dev/null; break; fi
+  done
+  wait "$qpid"; qrc=$?
+  out=$(cat "$log")
+  echo "$out" | awk '/___CMK_VM_BEGIN___/{f=1;next} /___CMK_VM_END___/{f=0} f'
+  rc=$(echo "$out" | sed -n 's/.*___CMK_VM_RC___\([0-9][0-9]*\).*/\1/p' | tail -1)
+  # a guest that reported its own status is a completed boot, whatever the status was
+  if [ -n "$rc" ]; then
+    [ "$rc" = 0 ] || echo "qemu: guest program exited $rc" >&2
+    exit "$rc"
+  fi
+  if [ -n "$stalled" ]; then
+    echo "qemu: the console went quiet for ${stall}s while booting, so the guest is stuck" >&2
+    echo "qemu: raise CMK_QEMU_STALL if this host really does pause that long mid-boot" >&2
+  else
+    case $qrc in
+      124) echo "qemu: hit the CMK_QEMU_TIMEOUT of ${CMK_QEMU_TIMEOUT}s" >&2;;
+      0) echo "qemu: guest finished but never reported an exit code" >&2;;
+      *) echo "qemu: $qemu exited $qrc before the guest finished" >&2;;
+    esac
+  fi
+  echo "qemu: was running $qemu $mach, ${CMK_QEMU_MEM:-256M} ram, ${CMK_QEMU_CPUS:-1} cpu" >&2
+  echo "$out" | grep -q ___CMK_VM_BEGIN___ \
+    && echo "qemu: init started but did not reach the end marker" >&2 \
+    || echo "qemu: init never started" >&2
+  [ -s "$err" ] && sed 's/^/qemu| /' "$err" >&2
+  # an empty console means the emulator never got far enough to say anything, worth saying plainly
+  if [ -n "$out" ]; then
+    echo "qemu: last lines of the guest console follow" >&2
+    echo "$out" | tail -25 | sed 's/^/qemu| /' >&2
+  else
+    echo "qemu: the guest console was empty, so the emulator produced nothing at all" >&2
+  fi
+  exit 1
+|)
+
+class qemu.runner(bases=cmk.Dockerfile)(|
+  '''
+  An image with qemu, a virt kernel, and a busybox initramfs.  The guest init
+  and the vmexec entrypoint arrive as bound files, so the recipe reads as
+  intent.  Declare an instance with an empty body; it supplies its own tag.
+  '''
+  self.src := qemu.recipe
+  self.img := $(or $(self.img),compose.mk:self)
+  self.__files__ := qemu.init qemu.vmexec
+|)
+
+class qemu.guest(bases=cmk.container)(|
+  '''
+  Inherits every container behavior except the way out and the way in: a block
+  runs in the guest, which offers no channel back, so an outward move faults by
+  name, and entering announces a kernel boot rather than a container run.
+  '''
+  self.__out__ = $(call ambient.out.unavailable,${self})
+  self.__announce__ = ${dim}booting a guest kernel ${sep} ${bold}${underline}$(self.img)
+|)

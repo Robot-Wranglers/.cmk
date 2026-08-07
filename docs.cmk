@@ -110,11 +110,12 @@ self.docs.render.io/%:
   python3 ⬥_docs.render.py $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)
 
 docs.render/%:; j2c.dispatch(self.docs.render/${*})
-  '''Render one template in place (docs/foo.md.j2 -> docs/foo.md).'''
+  '''Render one template, or every template under one directory, in place.'''
 
 self.docs.render/%:
-  '''Render one template in place (in the container).  Accepts foo.md.j2, foo.md, or
-  bare foo -- the driver resolves it to the foo.md.j2 source, rendered to foo.md.'''
+  '''Render in place (in the container).  Accepts foo.md.j2, foo.md, or bare foo --
+  the driver resolves it to the foo.md.j2 source, rendered to foo.md.  A directory
+  argument renders every *.md.j2 below it, skipping includes/ and macros/.'''
   python3 ⬥_docs.render.py ${*} \
   && log.io(${dim}rendered ${sep} ${*})
 
@@ -126,7 +127,7 @@ self.docs.render/%:
 ## depends on -- `docs.mirrors` (which files are README mirrors) and the
 ## `docs.plugins.sync.allow` policy -- live in the root Makefile.
 
-docs: flux.stage/documentation docs.mirrors docs.plugins.sync docs.render docs.site
+docs: stage/documentation docs.mirrors docs.plugins.sync docs.render docs.site
   '''Full docs pipeline (serial): stage marker -> README mirrors -> plugin-doc sync ->
   render all templates -> build the mkdocs site into site/.'''
 
@@ -141,7 +142,8 @@ self.docs.render.all:
   tux.progress, which draws the bar and passes the stream through.
   '''
   log.io(rendering all pages via the jinja driver)
-  ${docs.templates} | python3 ⬥_docs.render.py --all | ${docs.progress.bin} >${devnull}
+  set -o pipefail \
+  && ${docs.templates} | python3 ⬥_docs.render.py --all | ${docs.progress.bin} >${devnull}
 
 docs.site: j2c.build
   '''
@@ -230,16 +232,35 @@ _docs.render.py=(|
       return env.from_string(source).render()
   def _resolve(tpl):
       return tpl if tpl.endswith(".md.j2") else tpl + (".j2" if tpl.endswith(".md") else ".md.j2")
+  def _walk(root):
+      hits = []
+      for base, _dirs, files in os.walk(root):
+          if "/includes" in base or "/macros" in base:
+              continue
+          hits.extend(os.path.join(base, f) for f in files if f.endswith(".md.j2"))
+      return sorted(hits)
   def render_all(templates):
+      # one broken template must not abort the pages after it; collect and fail at the end
       env = build_environment()
       n = len(templates)
+      failed = []
       for i, tpl in enumerate(templates, 1):
           src = _resolve(tpl)
           dest = src[:-3]
-          with open(dest, "w") as handle:
-              handle.write(render(src, env))
-          sys.stdout.write(json.dumps({"index": i, "total": n, "output": dest, "status": "ok"}) + "\n")
+          try:
+              body = render(src, env)
+          except Exception as exc:
+              failed.append(src)
+              sys.stderr.write("render: %s failed: %s: %s\n" % (src, type(exc).__name__, exc))
+              event = {"index": i, "total": n, "output": dest, "status": "error"}
+          else:
+              with open(dest, "w") as handle:
+                  handle.write(body)
+              event = {"index": i, "total": n, "output": dest, "status": "ok"}
+          sys.stdout.write(json.dumps(event) + "\n")
           sys.stdout.flush()
+      if failed:
+          raise SystemExit("render: %s of %s templates failed:\n  %s" % (len(failed), n, "\n  ".join(failed)))
   def main(argv=None):
       ap = argparse.ArgumentParser(description="Render docs Jinja templates.")
       ap.add_argument("template", nargs="?"); ap.add_argument("-o", "--output")
@@ -247,6 +268,9 @@ _docs.render.py=(|
       a = ap.parse_args(argv)
       if a.all:
           render_all([ln.strip() for ln in sys.stdin if ln.strip()])
+          return
+      if os.path.isdir(a.template):
+          render_all(_walk(a.template))
           return
       tpl = _resolve(a.template)
       out = render(tpl)
