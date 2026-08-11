@@ -45,7 +45,7 @@
 ##
 ## IMPORT: `cmk.include.plugins(virtual-machine.cmk)` -- a `.mk` plugin (PURE MAKE with jq/awk the
 ## cmk compiler would mangle, so included verbatim, never JIT-compiled).  Needs compose.mk first
-## (declare.stack/io.stack/mk.super.tramp/jq.run).  Worked examples: demos/call_stack.mk, demos/vm.mk,
+## (io.stack!/io.stack/mk.super.tramp/jq.run).  Worked examples: demos/call_stack.mk, demos/vm.mk,
 ## demos/cmk/vm-steer.cmk (the live steer+dashboard REPL).
 
 # The generic control-stack algebra.  Bodies are pure make, imported FLAT (names written out in
@@ -64,7 +64,7 @@ control_stack.after=awk -v g='$(strip ${1})' 'f{print} $$0==g{f=1}'
 # `frame.pop` emits+removes the top; `frame.peek` emits the top without removing; `frames`
 # is the whole stack (oldest first).  The stack can hold sub-stacks (a tree): a frame may
 # carry a `branches` array of frame-lists, which is how a fork is reflected.
-$(call declare.stack,CONTROL_STACK_FRAMES)
+$(call io.stack!,CONTROL_STACK_FRAMES)
 control_stack.frames=$(call io.stack,${CONTROL_STACK_FRAMES})
 control_stack.frame.push=$(call io.stack.push,${CONTROL_STACK_FRAMES})
 control_stack.frame.pop=$(call io.stack.pop,${CONTROL_STACK_FRAMES})

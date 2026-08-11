@@ -126,7 +126,7 @@ self.docs.render/%:
 ## depends on -- `docs.mirrors` (which files are README mirrors) and the
 ## `docs.plugins.sync.allow` policy -- live in the root Makefile.
 
-docs: flux.stage/documentation docs.mirrors docs.plugins.sync docs.render docs.site
+docs: stage/documentation docs.mirrors docs.plugins.sync docs.render docs.site
   '''Full docs pipeline (serial): stage marker -> README mirrors -> plugin-doc sync ->
   render all templates -> build the mkdocs site into site/.'''
 
