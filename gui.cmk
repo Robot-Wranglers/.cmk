@@ -1,0 +1,61 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+gui: serve a containerized X session to a browser over html5.
+
+`xpra_base` is an image kind carrying xpra and a default i3 keymap, bound at
+`/root/.config/i3/config` and inert unless the client installs i3.  Declare an
+instance, export its tag, and a compose service builds from that tag while
+adding only its own packages.  Build the instance as a prerequisite, since
+compose does not go through the image kind.  Worked example in demos/cmk/xpra.cmk.
+'''
+from cmk import class, dockerfs, Dockerfile
+
+export XPRA_PORT_INTERNAL?=14500
+export XPRA_ARGS?=--mdns=no --printing=no --speaker=no --sharing=yes --audio=no --pulseaudio=no --webcam=no --microphone=off --html=on --daemon=no --window-close=disconnect --file-transfer=no --tray=no --system-tray=no --exit-with-children=yes --terminate-children=yes
+
+# the image recipe every base instance builds from, so an instance needs only its tag
+define gui.xpra_recipe
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq
+RUN apt-get install -qq -y wget apt-transport-https software-properties-common ca-certificates
+RUN wget -O /usr/share/keyrings/xpra.asc https://xpra.org/xpra.asc
+RUN wget -O /etc/apt/sources.list.d/xpra.sources https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/noble/xpra-lts.sources
+RUN apt-get update -qq
+RUN apt-get install -qq -y xpra
+endef
+
+dockerfs gui.i3conf(bind=gui.xpra_base path=/root/.config/i3/config mode=0644)(|
+  # See https://i3wm.org/docs/userguide.html for a complete reference
+  set $mod Mod1
+  font pango:Monaco 10
+  floating_modifier $mod
+  bindsym $mod+Shift+q kill
+  bindsym $mod+h focus left
+  bindsym $mod+j focus down
+  bindsym $mod+k focus up
+  bindsym $mod+l focus right
+  bindsym $mod+v split v
+  bindsym $mod+b split h
+  bindsym $mod+f fullscreen toggle
+  bindsym $mod+s layout stacking
+  bindsym $mod+w layout tabbed
+  bindsym $mod+e layout toggle split
+  bindsym $mod+Shift+space floating toggle
+  exec i3-layouts
+  set $i3l spiral
+|)
+
+class gui.xpra_base(bases=cmk.Dockerfile)(|
+  '''
+  An ubuntu image with xpra from the upstream repository, and an i3 keymap as a
+  bound file.  A client adds its own window manager and applications on top
+  rather than repeating the setup.  Declare an instance with an empty body.
+  '''
+  self.src := gui.xpra_recipe
+  self.img := $(or $(self.img),compose.mk:self)
+  self.__files__ := gui.i3conf
+|)

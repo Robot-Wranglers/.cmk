@@ -1,0 +1,169 @@
+#!/usr/bin/env -S ./compose.mk cmk run
+
+# cmk_pragma ::: { "kind": "plugin" } :::
+
+'''
+Drives the fossil tool for its built-in ticket system.
+Targets carry the fossil prefix and import flat, so a project aliases the whole
+namespace to whatever reads well.  The tracker is one repository file at the git
+root, never checked out, so fossil and git never contend for the working tree.
+'''
+import log
+
+# FIXME: this open only registers a receiver so the private callforms below lower, which is a misuse of a module directive
+open .fossil
+
+.fossil.db ?= .fossil.db
+.fossil.user ?= $(call m5|,USER,fossil)
+.fossil.root = $$(git rev-parse --show-toplevel)
+.fossil.repo = ${.fossil.root}/${.fossil.db}
+.fossil.exec = fossil ${1} -R "${.fossil.repo}"
+.fossil.port ?= 9080
+.fossil.days ?= 7
+.fossil.filter = want="$${status:-Open}"; if [ "$${want}" = all ]; then filter=''; else filter="where status='$${want}'"; fi
+# a ticket is a chain of artifacts, so removal means shunning them; a plain delete is undone by the next rebuild
+.fossil.shun = insert or ignore into shun(uuid,mtime) select b.uuid, strftime('%s','now') from blob b join ticketchng c on c.tkt_rid=b.rid join ticket t on t.tkt_id=c.tkt_id where ${1};
+.fossil.boot = test -f "${.fossil.repo}" || fossil init --admin-user "${.fossil.user}" --project-name "$$(basename ${.fossil.root})" "${.fossil.repo}" | ${stream.as.log}
+# one roster, shared by the entrypoint and the help verb; a dotted name is invisible to subs auto-detection
+.fossil.subs = init add list list.json serve stop run ticket clean.closed clean.old
+
+__main__:
+  '''
+  Bug tracking over the fossil ticket system.  Reflects the fossil.<verb> targets
+  into a menu and routes a chosen verb to its handler.  On import this demotes to
+  the fossil target, so make fossil opens the same menu.  USAGE:  ./fossil.cmk
+  '''
+  cmk.cli.subcommands.enter(namespace=fossil subs='${.fossil.subs}')
+
+fossil.help:
+  '''
+  Print the verb menu.  The same thing a bare ./fossil.cmk prints, but reachable as a
+  target, so it survives whatever name a project aliases the tracker to.
+  USAGE:  make fossil.help
+  '''
+  cmk.cli.subcommands.enter(namespace=fossil subs='${.fossil.subs}')
+
+fossil.init:
+  '''
+  Bootstrap the ticket tracker at the git root.  Idempotent: an existing tracker
+  is left alone, so this is safe as a prereq of a project init target.  Under
+  GITHUB_ACTIONS it is a no-op.  USAGE:  make fossil.init
+  '''
+  if [ "$${GITHUB_ACTIONS:-false}" = true ]; then log.io(${dim}skip ${sep} no tracker in ci); exit 0; fi
+  cmk.assert.tool.required(fossil,see https://fossil-scm.org for install instructions)
+  if [ -f "${.fossil.repo}" ]; then log.io(${dim}tracker ${sep} ${no_ansi}${.fossil.repo}${dim} already exists${comma} leaving it); exit 0; fi
+  log.io(${dim}creating tracker ${sep} ${no_ansi}${.fossil.repo})
+  ${.fossil.boot}
+  log.io(${green}ok ${sep} ${no_ansi}${.fossil.repo})
+
+fossil.run/%:
+  '''
+  Run any fossil command against the tracker: the comma-delimited stem is argv,
+  the args env var carries words that contain spaces, and stdin passes through.
+  Excludes ui and server, which take the repository positionally.
+  USAGE:  make fossil.run/ticket,history,<uuid>
+  '''
+  ${.fossil.boot}
+  eval "set -- $${args:-}"
+  .fossil.exec(`echo '${*}' | ${stream.comma.to.space}` "$$@")
+
+fossil.ticket/%:
+  '''
+  Run a fossil ticket command, the same as the run verb with a ticket prefix and
+  spelled for the namespace this tracker lives in.  Field names come from the
+  list,fields subcommand.  USAGE:  make fossil.ticket/set,<uuid>,status,Closed
+  '''
+  ${.fossil.boot}
+  eval "set -- $${args:-}"
+  .fossil.exec(ticket `echo '${*}' | ${stream.comma.to.space}` "$$@")
+
+fossil.stop:
+  '''
+  Stop a tracker server started by the serve verb, matched on the port it was given.
+  Quiet and successful when nothing is running there.  USAGE:  port=9000 make fossil.stop
+  '''
+  at="$${port:-${.fossil.port}}"
+  pids=`pgrep -f "fossil ui --port $${at}" 2>${devnull} || true`
+  live=''; for p in $${pids}; do case $$(ps -o comm= -p $${p} 2>${devnull}) in *fossil) live="$${live} $${p}";; esac; done
+  if [ -z "$${live}" ]; then log.io(${dim}nothing serving ${sep} ${no_ansi}port $${at}); exit 0; fi
+  kill $${live}
+  log.io(${green}stopped ${sep} ${no_ansi}port $${at}${dim} (`echo $${live} | ${stream.count.words}` process))
+
+fossil.serve:
+  '''
+  Serve the tracker over http on the given port, 9080 by default.  Runs in the
+  foreground until interrupted, and lands the browser on the ticket list rather than
+  the home page.  USAGE:  port=9000 make fossil.serve
+  '''
+  ${.fossil.boot}
+  at="$${port:-${.fossil.port}}"
+  rn=`printf 'select rn from reportfmt order by rn limit 1;\n' | fossil sql -R "${.fossil.repo}"`
+  log.io(${dim}serving tracker ${sep} ${no_ansi}http://localhost:$${at}/rptview?rn=$${rn:-1})
+  fossil ui --port "$${at}" --page "rptview?rn=$${rn:-1}" $${nobrowser:+--nobrowser} "${.fossil.repo}"
+
+fossil.add: assert.env/title
+  '''
+  File a ticket without prompting.  A title is required; type, status, severity,
+  priority and subsystem are optional.  Piped stdin becomes the ticket body,
+  rendered as markdown unless mimetype says otherwise, and foundin defaults to
+  the current commit.  USAGE:  title='widget explodes' make fossil.add
+  '''
+  ${.fossil.boot}
+  body=''; if [ -p ${stdin} ]; then body=`${stream.stdin}`; fi
+  origin=stdin; test -n "$${body}" || origin=empty
+  log.io(${dim}filing ${sep} ${no_ansi}$${title}${dim} (body from $${origin}))
+  version <- git rev-parse HEAD
+  .fossil.exec(ticket add title "$${title}" type "$${type:-Code_Defect}" status "$${status:-Open}" severity "$${severity:-Important}" priority "$${priority:-Medium}" subsystem "$${subsystem:-}" foundin "$${foundin:-$${version}}" mimetype "$${mimetype:-text/x-markdown}" icomment "$${body}") | ${stream.as.log}
+  log.io(${green}filed ${sep} ${no_ansi}$${title}${dim} (found in $${version}))
+
+fossil.clean.closed:
+  '''
+  Remove every closed ticket for good.  Shuns the ticket artifacts and rebuilds, so
+  they stay gone instead of returning on the next rebuild.  USAGE:  make fossil.clean.closed
+  '''
+  ${.fossil.boot}
+  before <- printf 'select count(*) from ticket;\n' | fossil sql -R "${.fossil.repo}"
+  printf '%s\n' ".fossil.shun(t.status='Closed')" | .fossil.exec(sql)
+  fossil rebuild "${.fossil.repo}" > ${devnull}
+  after <- printf 'select count(*) from ticket;\n' | fossil sql -R "${.fossil.repo}"
+  log.io(${green}cleaned ${sep} ${no_ansi}`expr $${before} - $${after}`${dim} closed tickets removed${comma} $${after} left)
+
+fossil.clean.old:
+  '''
+  Remove tickets last touched more than a week ago, whatever their status.  Set days
+  to change the window.  Shuns and rebuilds, like the closed verb.
+  USAGE:  days=30 make fossil.clean.old
+  '''
+  ${.fossil.boot}
+  window="$${days:-${.fossil.days}}"
+  before <- printf 'select count(*) from ticket;\n' | fossil sql -R "${.fossil.repo}"
+  printf '%s\n' ".fossil.shun(t.tkt_mtime < julianday('now') - $${window})" | .fossil.exec(sql)
+  fossil rebuild "${.fossil.repo}" > ${devnull}
+  after <- printf 'select count(*) from ticket;\n' | fossil sql -R "${.fossil.repo}"
+  log.io(${green}cleaned ${sep} ${no_ansi}`expr $${before} - $${after}`${dim} tickets older than $${window} days removed${comma} $${after} left)
+
+fossil.list.json:
+  '''
+  Dump matching tickets to stdout as json, one object per ticket, with dates rendered,
+  a url onto the served ticket page, and the body folded in from the change log.
+  Defaults to the Open ones; set status to `all`.  USAGE:  status=all make fossil.list.json
+  '''
+  ${.fossil.boot}
+  ${.fossil.filter}
+  at="$${port:-${.fossil.port}}"
+  log.io(${dim}tickets ${sep} ${no_ansi}$${want}${dim} as json)
+  printf '%s\n' ".mode json" "select tkt_uuid as uuid, 'http://localhost:$${at}/tktview/' || tkt_uuid as url, datetime(tkt_ctime) as created, datetime(tkt_mtime) as modified, type, status, subsystem, priority, severity, foundin, resolution, title, coalesce(nullif(comment,''), (select group_concat(icomment, char(10) order by tkt_mtime) from ticketchng where tkt_id=ticket.tkt_id and icomment is not null)) as comment, (select mimetype from ticketchng where tkt_id=ticket.tkt_id order by tkt_mtime desc limit 1) as mimetype from ticket $${filter} order by tkt_mtime desc;" | .fossil.exec(sql) | ${jq} -s '.[0] // []'
+
+fossil.list:
+  '''
+  Dump matching tickets as markdown, ordered by last-modified, newest first: a table
+  of id, status, type, severity, subsystem and a clipped title, then a link list
+  carrying the full titles.  Honors status like the json verb.  USAGE:  make fossil.list
+  '''
+  ${.fossil.boot}
+  ${.fossil.filter}
+  at="$${port:-${.fossil.port}}"
+  log.io(${dim}tickets ${sep} ${no_ansi}$${want})
+  printf '%s\n' ".mode markdown" "select substr(tkt_uuid,1,10) as id, status, type, severity, subsystem, substr(title,1,28) as title from ticket $${filter} order by tkt_mtime desc;" | .fossil.exec(sql)
+  printf '\n'
+  printf '%s\n' ".mode list" ".headers off" "select '- [' || substr(tkt_uuid,1,10) || '](http://localhost:$${at}/tktview/' || tkt_uuid || ') ' || title from ticket $${filter} order by tkt_mtime desc;" | .fossil.exec(sql)
