@@ -5,19 +5,20 @@
 '''
 gui: serve a containerized X session to a browser over html5.
 
-`xpra_base` is an image kind carrying xpra and a default i3 keymap, bound at
-`/root/.config/i3/config` and inert unless the client installs i3.  Declare an
-instance, export its tag, and a compose service builds from that tag while
-adding only its own packages.  Build the instance as a prerequisite, since
-compose does not go through the image kind.  Worked example in demos/cmk/xpra.cmk.
+`desktop` is an image kind carrying xpra, i3, and the usual X clients, with the
+i3 and i3status configs as bound files.  Declare an instance, export its tag,
+and a compose service builds from that tag while adding only its own apps.
+Build the instance as a prerequisite, since compose does not go through the
+image kind.  Worked example in demos/cmk/xpra.cmk.
 '''
 from cmk import class, dockerfs, Dockerfile
 
 export XPRA_PORT_INTERNAL?=14500
+export XPRA_PORT_EXTERNAL?=9090
 export XPRA_ARGS?=--mdns=no --printing=no --speaker=no --sharing=yes --audio=no --pulseaudio=no --webcam=no --microphone=off --html=on --daemon=no --window-close=disconnect --file-transfer=no --tray=no --system-tray=no --exit-with-children=yes --terminate-children=yes
 
-# the image recipe every base instance builds from, so an instance needs only its tag
-define gui.xpra_recipe
+# the image recipe every desktop instance builds from, so an instance needs only its tag
+define gui.desktop_recipe
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq
@@ -26,9 +27,12 @@ RUN wget -O /usr/share/keyrings/xpra.asc https://xpra.org/xpra.asc
 RUN wget -O /etc/apt/sources.list.d/xpra.sources https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/noble/xpra-lts.sources
 RUN apt-get update -qq
 RUN apt-get install -qq -y xpra
+RUN apt-get install -qq -y make i3 i3status xterm x11-apps mesa-utils feh
+RUN apt-get install -qq -y python3-pip xdotool
+RUN pip3 install --break-system-packages i3-layouts
 endef
 
-dockerfs gui.i3conf(bind=gui.xpra_base path=/root/.config/i3/config mode=0644)(|
+dockerfs gui.i3conf(bind=gui.desktop path=/root/.config/i3/config mode=0644)(|
   # See https://i3wm.org/docs/userguide.html for a complete reference
   set $mod Mod1
   font pango:Monaco 10
@@ -45,17 +49,35 @@ dockerfs gui.i3conf(bind=gui.xpra_base path=/root/.config/i3/config mode=0644)(|
   bindsym $mod+w layout tabbed
   bindsym $mod+e layout toggle split
   bindsym $mod+Shift+space floating toggle
+  bar {
+    status_command i3status
+  }
   exec i3-layouts
   set $i3l spiral
 |)
 
-class gui.xpra_base(bases=cmk.Dockerfile)(|
+dockerfs gui.i3statconf(bind=gui.desktop path=/root/.config/i3status/config mode=0644)(|
+  # See https://i3wm.org/i3status/manpage.html
+  general {
+    output_format = "i3bar"
+    colors = true
+    interval = 5
+  }
+  order += "cpu_usage"
+  order += "disk /"
+  order += "tztime local"
+  cpu_usage { format = "CPU: %usage" }
+  disk "/" { format = "Disk: %free" }
+  tztime local { format = "%Y-%m-%d %H:%M:%S" }
+|)
+
+class gui.desktop(bases=cmk.Dockerfile)(|
   '''
-  An ubuntu image with xpra from the upstream repository, and an i3 keymap as a
-  bound file.  A client adds its own window manager and applications on top
-  rather than repeating the setup.  Declare an instance with an empty body.
+  An ubuntu image with xpra, i3, and the usual X clients.  The window-manager
+  configs arrive as bound files, so a client adds only its own applications.
+  Declare an instance with an empty body; it supplies its own tag.
   '''
-  self.src := gui.xpra_recipe
+  self.src := gui.desktop_recipe
   self.img := $(or $(self.img),compose.mk:self)
-  self.__files__ := gui.i3conf
+  self.__files__ := gui.i3conf gui.i3statconf
 |)

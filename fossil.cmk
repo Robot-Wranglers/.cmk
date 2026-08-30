@@ -1,13 +1,24 @@
 #!/usr/bin/env -S ./compose.mk cmk run
-
+#
+# fossil.cmk:
+#   A thin wrapper for fossil, only supporting the bugtracker capabilities.
+#
+# A few useful hints:
+#
+#  1. Targets herein carry the fossil prefix.  
+#  2. Fossil uses a single-file sqlite backend typically in the repo root.
+#  3. Individual projects may or may not decide to add that to VCS.
+#
+# Project-level imports of this plugin may wish to treat it as a swappable 
+# backend, pivot later to github-issues, etc.  In the case.. the suggestion 
+# is to import it as simply  "bugs".
+#
+# USAGE: 
+#   $ .cmk/fossil.cmk help  # Invoke plugin directly
+#   $ make bugs.help        # Typical project import/alias
+#
 # cmk_pragma ::: { "kind": "plugin" } :::
 
-'''
-Drives the fossil tool for its built-in ticket system.
-Targets carry the fossil prefix and import flat, so a project aliases the whole
-namespace to whatever reads well.  The tracker is one repository file at the git
-root, never checked out, so fossil and git never contend for the working tree.
-'''
 import log
 
 # FIXME: this open only registers a receiver so the private callforms below lower, which is a misuse of a module directive
@@ -51,10 +62,12 @@ fossil.init:
   '''
   if [ "$${GITHUB_ACTIONS:-false}" = true ]; then log.io(${dim}skip ${sep} no tracker in ci); exit 0; fi
   cmk.assert.tool.required(fossil,see https://fossil-scm.org for install instructions)
-  if [ -f "${.fossil.repo}" ]; then log.io(${dim}tracker ${sep} ${no_ansi}${.fossil.repo}${dim} already exists${comma} leaving it); exit 0; fi
-  log.io(${dim}creating tracker ${sep} ${no_ansi}${.fossil.repo})
+  if [ -f "${.fossil.repo}" ]; then \
+    log.io(${dim}tracker ${sep} ${.fossil.repo}${dim} already exists${comma} leaving it); exit 0; \
+  fi
+  log.io(${dim}creating tracker ${sep} ${.fossil.repo})
   ${.fossil.boot}
-  log.io(${green}ok ${sep} ${no_ansi}${.fossil.repo})
+  log.io(${green}ok ${sep} ${.fossil.repo})
 
 fossil.run/%:
   '''
