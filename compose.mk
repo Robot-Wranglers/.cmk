@@ -25,10 +25,12 @@
 #/* \
 _make_="make -sS --warn-undefined-variables -f ${0}"; export MAKEFLAGS="${MAKEFLAGS:+${MAKEFLAGS} }--no-print-directory"; trace="${TRACE:-${trace:-0}}"; \
 export CMK_TWIN_PATH=""; \
+_cmk_xdg() { _r="${XDG_CACHE_HOME:-}"; [ -n "${_r}" ] || _r="${HOME:+${HOME}/.cache}"; [ -n "${_r}" ] || { _t="${TMPDIR:-/tmp}"; _r="${_t%/}/.cache-$(id -u 2>/dev/null || echo 0)"; }; printf %s "${_r}/compose.mk"; }; \
+export CMK_XDG_CACHE="${CMK_XDG_CACHE:-$(_cmk_xdg)}"; \
 case "${CMK_TWIN:-1}" in 0|off|false|no) :;; *) \
-	_twin_dir="${XDG_CACHE_HOME:-$HOME/.cache}/compose.mk/twin"; \
+	_twin_dir="${CMK_XDG_CACHE}/twin"; \
 	_twin_id=$(cksum "${0}" 2>/dev/null | awk '{print $1"-"$2}'); \
-	_twin_="${_twin_dir}/${_twin_id}.${0##*/}"; \
+	_twin_="${_twin_dir}/${_twin_id}.compose.mk"; \
 	if [ -n "${_twin_id}" ] && [ ! -s "${_twin_}" ]; then mkdir -p "${_twin_dir}" 2>/dev/null && awk '/^define /{d++} d&&/^endef[ \t]*$/{d--} { if(!d && !p && $0 ~ /^\t[ \t]*@?#/) print ""; else print; p=($0 ~ /\\[ \t]*$/) }' "${0}" > "${_twin_}.$$" 2>/dev/null && mv "${_twin_}.$$" "${_twin_}" 2>/dev/null; fi; \
 	if [ -s "${_twin_}" ]; then _make_="make -sS --warn-undefined-variables -f ${_twin_}"; export CMK_TWIN_PATH="${_twin_}"; export MAKEFILE="${0}"; fi; ;; \
 esac; \
@@ -77,6 +79,8 @@ esac \
 ##     The list of includes, from 'include ..' or given at the CLI with '-f ..'
 #░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 SHELL:=bash
+# Collision guard: a cwd file named like one of these must not shadow the target, and compose.mk runs under `-s`, so the shadow would be silent.  Every name here is a seed head, so it exists whatever the hosted partition does; `test_phony_collisions` pins the list against `__builtins__`.
+.PHONY: __builtins__ __exit_code__ __ip__ __posix_code__ __pragma__ __step__ cmk dir help jq loadf mkparse stage yq
 # Version floor, checked at parse time in syntax every old make accepts; it must sit above the first modern construct or users see a bare missing-separator error instead of this.
 ifeq ($(filter-out 3.% 4.0 4.0.% 4.1 4.1.%,$(MAKE_VERSION)),)
 $(error compose.mk needs GNU make >= 4.2 but this is $(MAKE_VERSION). Stock macOS ships 3.81 forever; install a modern make (macOS: brew install make, then put the gnubin dir first on PATH or invoke gmake; debian/ubuntu: apt install make; alpine: apk add make))
@@ -103,7 +107,8 @@ export TERM?=xterm-256color
 export OS_NAME := $(or $(value OS_NAME),$(shell uname -s))
 # OS_MACOS: non-empty on macOS (Darwin); test with 'ifdef OS_MACOS'.
 OS_MACOS := $(filter Darwin,${OS_NAME})
-export CMK_XDG_CACHE := $(or $(value CMK_XDG_CACHE),$(shell echo "$${XDG_CACHE_HOME:-$${HOME}/.cache}")/compose.mk)
+# An unset HOME resolves to a per-uid temp root, never to `/.cache`, since a bare `include compose.mk` often runs with a stripped env.
+export CMK_XDG_CACHE := $(or $(value CMK_XDG_CACHE),$(shell r="$${XDG_CACHE_HOME:-}"; [ -n "$$r" ] || r="$${HOME:+$${HOME}/.cache}"; [ -n "$$r" ] || { t="$${TMPDIR:-/tmp}"; r="$${t%/}/.cache-$$(id -u 2>/dev/null || echo 0)"; }; printf %s "$$r")/compose.mk)
 # Put compose.mk's XDG bin first on PATH so host tools it installs there (e.g. `jb.init` -> json.bash) are
 # found ahead of any dockerized fallback.  Guarded so recursive sub-makes (which inherit the exported PATH)
 # don't keep re-prepending it as MAKELEVEL grows.
@@ -264,12 +269,14 @@ make=make ${MAKE_FLAGS} $(call twin.map,${makefile_list})
 # source path, workspace, and relative form; its escaped comment char stops make truncating the value.
 # Compiled-program runs carry no compose.mk in their makefile list; the inherited interpreter path fills in.
 cmk.self = $(abspath $(or $(call twin.unmap,$(firstword $(filter %compose.mk,$(MAKEFILE_LIST)))),${__interpreter__}))
-$(call m5.declare, CMK_VERSION:=0.0.0-dev, CMK_DOCKER_PATH:=/usr/local/bin/compose.mk)
+$(call m5.declare, CMK_VERSION:=0.0.0-dev, CMK_DOCKER_PATH:=/usr/local/bin/compose.mk, CMK_DOCKER_CACHE:=/cmk-cache)
 # In-container the interpreter lives under the local mount point, so the host anchor misses; retry on cwd.
 _cmk.ws.probe=s='${cmk.self}'; ws="$${DOCKER_HOST_WORKSPACE:-$$PWD}"; rel="$${s\#$$ws/}"; case "$$rel" in "$$s") rel="$${s\#$$PWD/}";; esac
 # A relative cache path is anchored to the docker-host workspace; docker reads one as a volume name.  Nested crossings inherit the resolved host path, since the daemon they talk to is the host daemon.
 docker.hosted.mount.src=$${HOSTED_CACHE_HOST:-$(if $(filter /%,${HOSTED_CACHE}),${HOSTED_CACHE},$${workspace:-$${DOCKER_HOST_WORKSPACE:-$${PWD}}}/$(patsubst ./%,%,${HOSTED_CACHE}))}
 docker.hosted.mount=$(if $(wildcard ${HOSTED_CACHE}),-v ${docker.hosted.mount.src}:/cmk-hosted/$(notdir ${HOSTED_CACHE}):ro -e HOSTED_CACHE_DIR=/cmk-hosted -e HOSTED_CACHE_HOST="${docker.hosted.mount.src}",)
+# The stage dir crosses into a dispatch container, since staged modules are included there by path.
+docker.cache.mount=-v $(abspath ${CMK_STAGE_DIR}):${CMK_DOCKER_CACHE} -e CMK_STAGE_DIR=${CMK_DOCKER_CACHE}
 makefile_list.dind=$(if $(strip ${docker.cmk.mount}),$(patsubst -f${cmk.self},-f${CMK_DOCKER_PATH},${makefile_list}),${makefile_list})
 make.dind=make ${MAKE_FLAGS} ${makefile_list.dind}
 # Re-entry inside an already-running container: the compiled entrypoint, never the host-only twin.
@@ -700,9 +707,9 @@ docker.run.base:=docker run --rm -i -v $${DOCKER_HOST_WORKSPACE:-$${PWD}}:/works
 ##     sub-make.  For the strict "literally inside a container?" test use
 ##     CMK_IN_CONTAINER (a subset, set only at dispatch).
 ## * CMK_STAGE_DIR :: The one dir compose.mk writes host artifacts into.
-##     Writable CMK_MODULES_DIR wins (co-located with the workspace bind-mount,
-##     reused in container); an explicit value is trusted; else (read-only default
-##     `.cmk`) it falls back to the writable user XDG cache.
+##     Writable CMK_MODULES_DIR wins (project-local); an explicit value is trusted;
+##     else (read-only default `.cmk`) it falls back to the user XDG cache.  Bind-mounted
+##     at CMK_DOCKER_CACHE on dispatch.  Pruned daily by mk.cache.gc, unless CMK_CACHE_GC is 0.
 ##
 ## * CMK_IN_CONTAINER :: 1 only literally inside a dispatch container
 ## * CMK_LIB / CMK_STANDALONE :: Library-mode vs standalone-mode flags
@@ -751,7 +758,7 @@ docker.run.base:=docker run --rm -i -v $${DOCKER_HOST_WORKSPACE:-$${PWD}}:/works
 # Exported knobs: order-independent ?= defaults, overridable from env.
 $(call m5.declare!, \
 	CMK_COMPILER_VERBOSE?=1, COMPOSE_IGNORE_ORPHANS?=True, CMK_COMPOSE_FILE?=.tmp.compose.mk.yml, CMK_DIND?=0, \
-	CMK_INTERNAL?=0, CMK_IN_CONTAINER?=0, CMK_SUPERVISOR?=1, CMK_EXTRA_REPO?=., \
+	CMK_INTERNAL?=0, CMK_IN_CONTAINER?=0, CMK_SUPERVISOR?=1, CMK_EXTRA_REPO?=., CMK_CACHE_GC?=1, \
 	CMK_LOG_IMPORTS?=0, CMK_IMPORT_DISCOVER?=0, GITHUB_ACTIONS?=false, \
 	DEBIAN_CONTAINER_VERSION?=debian:bookworm, ALPINE_VERSION?=3.21.2)
 # Below: an ORDERED bootstrap (paths, interpreter-state, lib/standalone) -- keep in order.
@@ -1359,6 +1366,11 @@ endif
 ##  * `[1]:` [Main API](https://robot-wranglers.github.io/compose.mk/api#api-compose)
 ##
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+# Core defaults for the spec-cache probes that hosted redefines; without hosted every build is a miss, stamping is a no-op, and the build recipes stay legal shell.
+compose.ensure =
+compose.cached.test = false
+compose.cached.stamp = true
 
 # compose._quiet: drop compose's noisy Container/Network status lines.
 define compose._quiet
@@ -2050,6 +2062,7 @@ docker.run.sh:
 		-v $${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock \
 		${docker.cmk.mount} \
 		${docker.hosted.mount} \
+		${docker.cache.mount} \
 		-w /workspace \
 		$${entry} \
 		$${docker_args:-}" \
@@ -2938,10 +2951,37 @@ mk.clean:
 	@# (the `./.cmk` seed and the XDG fallback -- both swept, since either may hold a
 	@# run's staging).  User-invoked + best-effort (deliberately not an at-exit hook --
 	@# see import.module): a non-root `rm` cannot remove files a ROOT docker submake may
-	@# have left on a mounted dir.
+	@# have left on a mounted dir.  For age-based pruning instead, see `mk.cache.gc`.
 	rm -rf -- .tmp.* 2>/dev/null || true
 	$(if $(filter-out . ./,$(strip ${CMK_MODULES_DIR})),( cd "$(strip ${CMK_MODULES_DIR})" 2>/dev/null && rm -rf -- .tmp.module.* .tmp.hosted.*.mk native ) 2>/dev/null || true)
 	( cd "${CMK_XDG_CACHE}" 2>/dev/null && rm -rf -- .tmp.module.* .tmp.hosted.*.mk native ) 2>/dev/null || true
+
+# `_CMK_CACHE_TTL` -- days an unused cache entry survives `mk.cache.gc`.
+_CMK_CACHE_TTL?=14
+
+# `_cmk.cache.gc` -- the whole sweep, report included; stamps first so a concurrent parse skips instead of repeating it.
+_cmk.cache.gc=ttl=$${_CMK_CACHE_TTL:-14} ; case "$$ttl" in ''|*[!0-9]*) ttl=14 ;; esac ; \
+	  stamp="${CMK_XDG_CACHE}/.gc-stamp" ; \
+	  if [ -z "$${force:-}" ] && [ -n "`find \"$$stamp\" -mtime -1 2>${devnull}`" ]; then exit 0; fi ; \
+	  mkdir -p "${CMK_XDG_CACHE}" 2>${devnull} ; touch "$$stamp" ; n=0 ; seen='' ; \
+	  for d in "${CMK_STAGE_DIR}" "${CMK_XDG_CACHE}"; do \
+	    case " $$seen " in *" $$d "*) continue ;; esac ; seen="$$seen $$d" ; [ -d "$$d" ] || continue ; \
+	    old=`{ find "$$d" -maxdepth 1 -mtime +$$ttl \( -name '.tmp.*' -o -name '[0-9]*' \) ; \
+	           find "$$d/twin" -maxdepth 1 -type f -mtime +$$ttl ; } 2>${devnull}` ; \
+	    n=$$(( n + `printf '%s\n' "$$old" | grep -c . || true` )) ; \
+	    printf '%s\n' "$$old" | while IFS= read -r p; do [ -n "$$p" ] && rm -rf -- "$$p" ; done ; \
+	  done ; \
+	  [ "$$n" -gt 0 ] && $(call log.io, ${dim}cache gc ${sep} aged out ${no_ansi}$$n${dim} entries unused for $$ttl days${no_ansi}) || true
+
+# Detached parse-time sweep, top-level parses only; the redirect is what stops make waiting on it.
+$(if $(filter 0,${CMK_INTERNAL}),$(if $(filter 0 off false no,${CMK_CACHE_GC}),,$(shell ( ( ${_cmk.cache.gc} ) >${devnull} 2>&1 & ) )))
+
+mk.cache.gc:
+	@# Ages out every cache family under both cache roots, keeping anything used inside
+	@# _CMK_CACHE_TTL days.  Entries are touched on a hit, so this is a last-use sweep,
+	@# not a creation-date one.  Matches only cache-shaped names, so an install dir like
+	@# `bin/` is out of scope.  Runs at most once a day unless force is set.
+	${_cmk.cache.gc}
 
 mk.compile/% mk.compiler/%:; ls ${*} && export __interpreting__=${*} && cat ${*} | (${mk.compile})
 	@# Like `mk.compile`, but accepts file as argument instead of using stdin.
@@ -4011,7 +4051,7 @@ _mk.demote.main/%:; @${stream.stdin} | awk -v root='${*}' "$${_awklang_demote_ma
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 _mk.module.key=$(if $(filter $(m5[1]),$(m5[2])),$(m5[2]),$(m5[1])-$(m5[2]))
 _mk.hash.file=$(shell cksum < "$(1)" | awk '{printf "%07x",$$1%268435456}')
-_mk.module.stage=$(shell mkdir -p ${CMK_STAGE_DIR})$(shell _o=${CMK_STAGE_DIR}/.tmp.module.${1}.mk; if [ -s "$$_o" ] && [ "$$_o" -nt "${2}" ]; then true; else cat ${2} | CMK_INTERNAL=1 MAKEFLAGS= make -f $(firstword $(filter %compose.mk,${MAKEFILE_LIST}) ${MAKEFILE}) flux.column/$(if $(m5[4]),$(m5[4]):)_mk.demote.main/$(strip $(if $(filter 1,$(strip ${5})),${6},${7})):$(if $(filter 1,$(strip ${5})),,_mk.module.namespace/${7}:_mk.module.header/${6}:)$(or $(m5[3]),mk.compile) > $$_o.$$$$.out && mv $$_o.$$$$.out $$_o 2>/dev/null; fi; true)
+_mk.module.stage=$(shell mkdir -p ${CMK_STAGE_DIR})$(shell _o=${CMK_STAGE_DIR}/.tmp.module.${1}.mk; if [ -s "$$_o" ] && [ "$$_o" -nt "${2}" ]; then touch "$$_o"; else cat ${2} | CMK_INTERNAL=1 MAKEFLAGS= make -f $(firstword $(filter %compose.mk,${MAKEFILE_LIST}) ${MAKEFILE}) flux.column/$(if $(m5[4]),$(m5[4]):)_mk.demote.main/$(strip $(if $(filter 1,$(strip ${5})),${6},${7})):$(if $(filter 1,$(strip ${5})),,_mk.module.namespace/${7}:_mk.module.header/${6}:)$(or $(m5[3]),mk.compile) > $$_o.$$$$.out && mv $$_o.$$$$.out $$_o 2>/dev/null; fi; true)
 _mk.assert.define=$(if $(call m5.undefined?,${1}),$(call mk.error, import.module: no such define: $(m5[1]), errno=MODULE_MISSING))
 _mk.module.from_def=$(call _mk.assert.define,${1})$(shell mkdir -p ${CMK_STAGE_DIR})$(eval _mk_mod_k:=$(call _mk.module.key,${1},${2}))$(file > ${CMK_STAGE_DIR}/.tmp.module.${_mk_mod_k}.raw.new,$(value ${1}))$(shell _r=${CMK_STAGE_DIR}/.tmp.module.${_mk_mod_k}.raw; if cmp -s "$$_r.new" "$$_r"; then rm -f "$$_r.new"; else mv "$$_r.new" "$$_r"; fi)$(call _mk.module.stage,${_mk_mod_k},${CMK_STAGE_DIR}/.tmp.module.${_mk_mod_k}.raw,${3},${4},${5},${1},${2})$(call _include, prefix=${CMK_STAGE_DIR} strict=1 file=.tmp.module.${_mk_mod_k}.mk)
 _mk.module.from_file=$(if $(wildcard ${1}),,$(call mk.error, import.module: no such file: ${1}, errno=MODULE_MISSING))$(eval _mk_mod_k:=$(call _mk.module.key,$(basename $(notdir ${1})),${2})-$(call _mk.hash.file,${1}))$(call _mk.module.stage,${_mk_mod_k},${1},${3},${4},${5},$(basename $(notdir ${1})),${2})$(call _include, prefix=${CMK_STAGE_DIR} strict=1 file=.tmp.module.${_mk_mod_k}.mk)
@@ -4413,7 +4453,33 @@ define __hosted__
   container.content.key = $(file > ${container.content.tmp},$(call container.content,$(1)))$(shell set -- `cksum < ${container.content.tmp}`; rm -f ${container.content.tmp}; echo $$1)
   # read on demand, not at mint, since a file can bind itself to an instance that already minted
   container.tag = $(if $(call container.buildable,$(1)),$($(1).img)-$(call container.content.key,$(1)),$($(1).img))
-  container.ensure = $(if $(call container.owner,$(1)),docker image inspect $(call container.tag,$(call container.owner,$(1))) >/dev/null 2>&1 || ${make} $(call container.owner,$(1)).build &&)
+  # probes the launched tag alongside the content-hashed one, since either can go missing alone
+  container.ensure = $(if $(call container.owner,$(1)),docker image inspect $(call container.tag,$(call container.owner,$(1))) $($(1).img) >/dev/null 2>&1 || ${make} $(call container.owner,$(1)).build &&)
+  # the base tags a compose file builds from, read straight out of the file
+  compose.from.tags = $(shell awk '/^[ \t]*FROM[ \t]/{print $$2}' $(strip $(1)) 2>${devnull} | sort -u)
+  # the compose-side counterpart of container.ensure; a base that names no registered tag emits nothing
+  compose.ensure = $(foreach _t,$(call compose.from.tags,$(1)),$(foreach _o,$(call container.owner.registered,$(call container.owner.key,$(call mk.expand,${_t}))),$(call container.ensure,${_o})))
+  # a key over the resolved spec, stamped per service selection rather than per file
+  compose.key.file = ${CMK_NATIVE_CACHE}/.tmp.compose.key.$$(basename $(1)).$$(echo "$${svc:-all}" | tr ',' '_')
+  compose.key.now = ${docker.compose} -f $(1) config 2>${devnull} | cksum | tr ' ' '-'
+  # the probe as inline shell, so a hit costs docker calls without re-entering make
+  compose.cached.test = [ "$${force:-0}" = 0 ] && _k="$(call compose.key.file,$(1))" && [ -f "$$_k" ] && [ "`cat $$_k`" = "`$(call compose.key.now,$(1))`" ] && docker image inspect `${docker.compose} -f $(1) config --images 2>${devnull}` >${devnull} 2>&1
+  compose.cached.stamp = mkdir -p ${CMK_NATIVE_CACHE} && $(call compose.key.now,$(1)) > "$(call compose.key.file,$(1))"
+  # what a one-service kind inherits, kept in its own file so compose merges it instead of the wrapper prepending keys
+  compose.svc.defaults.file = .tmp.cmk.svc-defaults.json
+  # every instance stages the same static content, so write through a pid temp and only swap when it differs
+  compose.svc.defaults.stage = \
+    $(file > ${compose.svc.defaults.file}.${_cmk.pid},{"services":{"defaults":{"working_dir":"/workspace","volumes":["$(PWD):/workspace"]}}}) \
+    $(shell if cmp -s "${compose.svc.defaults.file}.${_cmk.pid}" "${compose.svc.defaults.file}"; \
+      then rm -f "${compose.svc.defaults.file}.${_cmk.pid}"; \
+      else mv -f "${compose.svc.defaults.file}.${_cmk.pid}" "${compose.svc.defaults.file}"; fi)
+  # a reparse re-mints every kind, so the notice is stamped once per run rather than once per parse
+  compose.kind.memo = ${CMK_STAGE_DIR}/.tmp.composekind.$(call m5|,MAKE_SUPER,${_cmk.pid}).$(strip $(1))
+  # a compose kind rewrites its body, so say which files it wrote and how; trace adds the artifacts themselves
+  compose.kind.announce = $(if $(wildcard $(call compose.kind.memo,$(1))),, \
+    $(shell mkdir -p ${CMK_STAGE_DIR} && : > $(call compose.kind.memo,$(1))) \
+    $(call log.module, ${dim}compose.kind ${sep} ${no_ansi}$(strip $(1)) ${sep} ${dim}wrote ${no_ansi}$(strip $(2)) ${sep} $(3)) \
+    $(if $(filter 1,${TRACE}),$(shell cat $(2) >${stderr})))
   _crun/%:; @$(call container.ensure,$(firstword $(subst $(comma), ,${*}))) $(call container.exec,$(firstword $(subst $(comma), ,${*})),$(lastword $(subst $(comma), ,${*})))
   *[|
     cmk.class cmk.container.capabilities[|
@@ -4583,17 +4649,24 @@ define __hosted__
       self.compose = $(addsuffix .yml,$(addprefix .tmp.,self.__im_self__))
       self.stem = $(addprefix .tmp.,self.__im_self__)
       self.content = $(value self)
-      self.__all__ = $(shell awk '/^services:/{s=1;next} s&&/^  [A-Za-z0-9_]+:/{gsub(/:.*/,"");gsub(/^ +/,"");print} s&&/^[^ ]/{s=0}' self.compose 2>/dev/null)
-      self.__minted__ = $(if $(filter-out 1,${CMK_INTERNAL}),$(file > self.compose,self.content))$(eval $(call compose.import.generic, self.__im_self__, FALSE, self.compose))$(foreach _svc,self.__all__,$(eval $(_svc).stem = self.stem)$(eval $(call compose.machine, def=$(_svc))))
+      self.__artifacts__ = self.compose
+      self.__rewrite__ = ${dim}verbatim
+      self.__all__ = $(shell awk '/^services:/{s=1;next} s&&/^  [A-Za-z0-9_]+:/{gsub(/:.*/,"");gsub(/^ +/,"");print;next} s&&/^[^ ]/{s=0}' self.compose 2>/dev/null)
+      self.__minted__ = $(if $(filter-out 1,${CMK_INTERNAL}),$(file > self.compose,self.content)$(call compose.kind.announce,self.__im_self__,$(${self}.__artifacts__),$(${self}.__rewrite__)))$(eval $(call compose.import.generic, self.__im_self__, FALSE, self.compose))$(foreach _svc,self.__all__,$(eval $(_svc).stem = self.stem)$(eval $(call compose.machine, def=$(_svc))))
+      self.render:
+        $(foreach _a,$(${self}.__artifacts__),printf -- '---\n# %s\n' $(_a) && cat $(_a) && ) true
     |)
 
     cmk.class compose.service(bases=compose.group,compose.machine)(|
       '''
-      A degenerate compose.group that is itself the one service (and its machine): the
-      raw body is a single service body, wrapped into a one-service compose file
-      (services, self, body) when it materializes.
+      A degenerate compose.group (see there) that is itself the one service and its
+      machine: the raw body is a single service body, wrapped into a one-service
+      compose file when it materializes.  Workspace defaults arrive by compose
+      extends, so a body declaring volumes or working_dir merges rather than collides.
       '''
-      self.content = services:$(nl)  $(addsuffix :,self.__im_self__)$(nl)    working_dir: /workspace$(nl)    volumes: [$(PWD):/workspace]$(nl)    $(subst $(nl),$(nl)    ,$(value self))
+      self.content = ${compose.svc.defaults.stage}services:$(nl)  $(addsuffix :,self.__im_self__)$(nl)    extends:$(nl)      file: ${compose.svc.defaults.file}$(nl)      service: defaults$(nl)    $(subst $(nl),$(nl)    ,$(value self))
+      self.__artifacts__ = self.compose ${compose.svc.defaults.file}
+      self.__rewrite__ = ${dim}wrapped as one service${no_ansi_dim}, workspace defaults by extends
       self.__all__ =
     |)
 
@@ -4622,7 +4695,7 @@ define __hosted__
     $(eval __name__ := $(__fqn__))
     # an empty body has no heads to dedent/hoist, so skip the file+awk+include entirely -- this also
     # keeps a pure container (an identity-only namespace) from adding a temp to MAKEFILE_LIST.
-    $(if $(strip $(value $(__fqn__).shape)),$(eval __ns_base.$(__fqn__) := $(filter $(__fqn__).%,$(.VARIABLES)))$(eval __ns_tmp := .tmp.ns.$(__fqn__).${_cmk.pid})$(file >$(__ns_tmp).raw,$(value $(__fqn__).shape))$(eval __ns_mk := $(shell set -- `cksum < $(__ns_tmp).raw`; o=.tmp.ns.$(__fqn__).${HOSTED_HASH}$(firstword $(subst ., ,$(notdir ${CMK_TWIN_PATH}))).$$1-$$2.mk; [ -f "$$o" ] || { awk "$${_awklang_ns_dedent}" $(__ns_tmp).raw | awk "$${_awklang_indent}" | awk -v ns='$(__fqn__)' -v dunders=1 -v frags=1 "$${_awklang_module_ns}" > $(__ns_tmp).mk && mv -f $(__ns_tmp).mk "$$o"; }; rm -f $(__ns_tmp).raw; echo "$$o"))$(eval include $(__ns_mk)))
+    $(if $(strip $(value $(__fqn__).shape)),$(eval __ns_base.$(__fqn__) := $(filter $(__fqn__).%,$(.VARIABLES)))$(eval __ns_tmp := .tmp.ns.$(__fqn__).${_cmk.pid})$(file >$(__ns_tmp).raw,$(value $(__fqn__).shape))$(eval __ns_mk := $(shell set -- `cksum < $(__ns_tmp).raw`; o=${CMK_STAGE_DIR}/.tmp.ns.$(__fqn__).${HOSTED_HASH}$(firstword $(subst ., ,$(notdir ${CMK_TWIN_PATH}))).$$1-$$2.mk; [ -d ${CMK_STAGE_DIR} ] || mkdir -p ${CMK_STAGE_DIR}; if [ -f "$$o" ]; then touch "$$o"; else awk "$${_awklang_ns_dedent}" $(__ns_tmp).raw | awk "$${_awklang_indent}" | awk -v ns='$(__fqn__)' -v dunders=1 -v frags=1 "$${_awklang_module_ns}" > $(__ns_tmp).mk && mv -f $(__ns_tmp).mk "$$o"; fi; rm -f $(__ns_tmp).raw; echo "$$o"))$(eval include $(__ns_mk)))
     $(eval __name__ := $(call m5.stack.top,$(__name__stack)))$(eval __name__stack := $(call m5.rest,$(__name__stack)))
     $(eval __fqn__ := $(if $(__name__),$(if $(filter $(__name__).%,${self}),${self},$(__name__).${self}),${self}))
     # the member manifest is collected here, once the name is this instance's again: a nested body leaves it pointing at the nested one
@@ -5520,6 +5593,7 @@ define __hosted__
       $(if $(call m5.defined?,_cce.done.${_cce}),:,$(eval _cce.done.${_cce} := 1) \
           $(call log.io.part1, $(call mk.kwargs.get,${1},lang) ${sep} ${dim}checking for cache) ; \
           if [ -x "$$bin" ]; then \
+              touch "$$bin" "`dirname \"$$bin\"`" 2>${devnull} ; \
               $(call log.io.part2, ${dim}$(patsubst $(HOME)%,~%,${_cce.bin.${_cce}}) ${green}${GLYPH_CHECK}${no_ansi}) ; \
           else \
               $(call log.io.part2, ${yellow}not found${no_ansi}) ; \
@@ -5632,7 +5706,7 @@ __hosted__.loaded =$(strip $(filter ${HOSTED_CACHE},${MAKEFILE_LIST}))
 ##     A lab bench for the dedent/cook/docstring hazards, run through the real
 ##     transpile pipeline but depended on by nothing.
 ## * _CMK_PARTITION_BUILDING :: Re-entrancy guard so the cache-build sub-make skips this whole block
-## * partition.stage :: The staging template; call it as `name[, min-count][, phony-source]`.
+## * partition.stage :: The staging template; call it as `name[, min-count]`.
 ##     It derives the upper prefix and stages in one call; `CMK_<PREFIX>_SRC` overrides the body.
 ## * partition.opt.in :: The shared opt-in predicate deciding whether a gated partition stages
 ## * partition.failmsg :: The cold-build failure message, named by partition
@@ -5704,8 +5778,7 @@ $${$(m5[2])_CACHE}:
 	&& case "$$$$_mf" in --*) ;; -*) _rest="$$$${_mf#"$$$${_mf%% *}"}" ; _w1=`printf %s "$$$${_mf%% *}" | tr -d n` ; [ "$$$$_w1" = - ] && _w1="" ; _mf="$$$$_w1$$$$_rest" ;; esac \
 	&& _t=$${@}.$$$$$$$$.build \
 	&& { $${partition.$(m5[1]).body} \
-	     | CMK_INTERNAL=1 _CMK_PARTITION_BUILDING=1 MAKEFLAGS= $$(MAKE) $$$$_mf -f $${PARTITION_SRC} lang.transpile > $$$$_t$(if $(m5[4]), \
-	     && printf '\n.PHONY: %s\n' "`$${$(m5[4])}`" >> $$$$_t) ; } ; \
+	     | CMK_INTERNAL=1 _CMK_PARTITION_BUILDING=1 MAKEFLAGS= $$(MAKE) $$$$_mf -f $${PARTITION_SRC} lang.transpile > $$$$_t ; } ; \
 	if [ -s "$$$$_t" ] && [ "$$$$(grep -cE '^[A-Za-z_][A-Za-z0-9._/%-]*:' $$$$_t)" -ge $(m5[3]) ]; then \
 	  mv $$$$_t $${@} ; \
 	else \
@@ -5717,31 +5790,26 @@ mk.$(m5[1]).prewarm: $${$(m5[2])_CACHE}
 endef
 
 # The public entrypoint: derive the upper prefix, default the min-count, stage in one call.
-partition.stage = $(call m5!,$(call partition.stage.impl,$(m5[1]),$(call m5.lex.upper,$(m5[1])),$(or $(m5[2]?),1),$(m5[3]?)))
+partition.stage = $(call m5!,$(call partition.stage.impl,$(m5[1]),$(call m5.lex.upper,$(m5[1])),$(or $(m5[2]?),1)))
 
 # A gated partition stages on its own CMK toggle, a source override, or a goal in its namespace.
 partition.opt.in = $(if $(filter-out 0 false no off,$(call m5|,CMK_$(call m5.lex.upper,$(m5[1])),)),1,)$(if $(call m5|,CMK_$(call m5.lex.upper,$(m5[1]))_SRC,),1,)$(if $(filter $(m5[1]).% mk.$(m5[1]).%,$(call m5|,MAKECMDGOALS,)),1,)
 
 # The cold-build failure message, named by partition; every region shares the one cold compiler.
-partition.failmsg = $(strip ${1}) partition failed to compile ${sep} $(strip ${1})-only targets will be missing. The cold compiler needs GNU awk (busybox awk is not enough). Install gawk or provide a prebuilt cache (see scratch/TODO-hosted-needs-gawk.md)
+partition.failmsg = $(strip ${1}) partition failed to compile ${sep} $(strip ${1})-only targets will be missing. The cold compiler needs GNU awk (busybox awk is not enough) plus a writable cache dir at ${CMK_STAGE_DIR}. Install gawk, point CMK_XDG_CACHE somewhere writable, or provide a prebuilt cache (see scratch/TODO-hosted-needs-gawk.md)
 
 # The file carrying every region plus the transpiler: compose.mk, or the running makefile when inlined.
 PARTITION_SRC := $(or ${cmk.self},$(abspath $(firstword ${MAKEFILE_LIST})))
 
-$(call partition.stage,hosted,5,_cmk.phony.bare)
+$(call partition.stage,hosted,5)
 
 # Bind __builtins__ bare at load (floor precedence: guest read last).
 $(if $(filter 1,$(__hosted__.enabled)),$(call lang.module.bind,__builtins__,$(__builtins__.__all__)))
 
-# Hosted-only whole-file bookkeeping (NOT partition mechanics): the `.PHONY` collision guard and
-# the core-namespace auto-help.  compose.mk ships no .PHONY and runs under `-s`, so a client
-# file/dir named like a bare target would silently shadow it; we phony only the bare (dotless)
-# core heads.  `_cmk.phony.roots` (first-segment of every head) also feeds the auto-help below,
-# which is gated on a `.help` goal so the enumeration shell runs only when help is requested.
+# Core-namespace auto-help; `_cmk.phony.roots` feeds it, gated on a `.help` goal.
 _cmk.seed.heads = sed '/^define /,/^endef/d' ${PARTITION_SRC} | grep -oE '^[A-Za-z_][A-Za-z0-9._/%-]*:([^=]|$$)'
 _cmk.hosted.heads = ${partition.hosted.body} | grep -oE '^[A-Za-z_][A-Za-z0-9._/%-]*:([^=]|$$)'
 _cmk.phony.roots = { ${_cmk.seed.heads}; ${_cmk.hosted.heads}; } | sed -E 's/:.*//; s/[./%].*//' | sort -u | tr '\n' ' '
-_cmk.phony.bare = ${__builtins__} | grep -vE '[./%]' | tr '\n' ' '
 _cmk.help.auto.roots = for r in $$(${_cmk.phony.roots}); do case "$$r" in _*) continue;; esac; grep -qE "^$$r[.]help[ :]" ${CMK_SRC} || printf '%s ' "$$r"; done
 $(if $(filter %.help,$(call m5|,MAKECMDGOALS,)),$(foreach _hr,$(shell ${_cmk.help.auto.roots}),$(call _mk.gen.help,${_hr})))
 
@@ -5758,7 +5826,7 @@ endif
 define _cmk.prewarm.hosted
 _hosted_warm=""
 if [ -z "${CMK_HOSTED_SRC:-}" ]; then
-  for _hf in "${CMK_MODULES_DIR:-.cmk}"/.tmp.hosted.*.mk "${XDG_CACHE_HOME:-$HOME/.cache}/compose.mk"/.tmp.hosted.*.mk; do
+  for _hf in "${CMK_MODULES_DIR:-.cmk}"/.tmp.hosted.*.mk "${CMK_XDG_CACHE}"/.tmp.hosted.*.mk; do
     [ -s "${_hf}" ] && _hosted_warm=1 && break
   done
 fi
@@ -5848,7 +5916,8 @@ case $(1) in \
 		 && cat ${CMK_SRC} | tail -n1 ) \
 	> $${tmpf} \
 	&& $(call log.trace.compiler.part2, ${dim}deduplicated includes from ${ital}$${fname}) \
-	&& { [ -n "`cat $${tmpf} | ${lang.main.has.stream}`" ] || printf '%s\n' '$(lang.main.stub.error)' >> $${tmpf} ; } ; \
+	&& { [ -n "`cat $${tmpf} | ${lang.main.has.stream}`" ] || printf '%s\n' '$(lang.main.stub.error)' >> $${tmpf} ; } \
+	&& { _gp="`$(call mk.goals.phony,$${tmpf})`" ; [ -z "$${_gp}" ] || printf '\n.PHONY: %s\n' "$${_gp}" >> $${tmpf} ; } ; \
 	( export CMK_INTERNAL=0 goals="$${continuation%% *}" ; $(call mk.validate,$${tmpf}) ) \
 		|| { rc=$$? ; { [ -z "$${MAKE_SUPER}" ] || [ -s .tmp.mk.super.$${MAKE_SUPER} ] || echo $${rc} > .tmp.mk.super.$${MAKE_SUPER} ; } ; exit $${rc} ; } \
 	; chmod +x $${tmpf} \
@@ -5911,6 +5980,9 @@ define .awk.completion.scan
       if(!(seen[out]++)) print out }
   }
 endef
+
+# The scanner as an exported block, so name lookups cost an awk, not a sub-make.
+export _cmk_blk_scan := $(value .awk.completion.scan)
 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 ## BEGIN: native mk.parse :: The awk+jq Makefile-to-JSON engine (the `mkparse` seam)
@@ -6493,7 +6565,7 @@ cli.cmk.eval:
 _cmk.compile=if [ -f "$(strip $(1))" ]; then \
 	_cs=`{ cat "$(strip $(1))"; printf '%s' "$${CMK_LANG:-}|$${dialect:-}|$${sugar:-}|$${cmk_dialect:-}|$${cmk_sugar:-}"; _pifs=$$IFS; IFS=:; for _pd in $${CMK_PLUGINS_DIR:-}; do cat "$$_pd"/*.cmk 2>${devnull}; done; IFS=$$_pifs; } | cksum | tr ' ' '-'` \
 	&& _co=${CMK_STAGE_DIR}/.tmp.cmkc.${HOSTED_HASH}$(firstword $(subst ., ,$(notdir ${CMK_TWIN_PATH}))).$$_cs.mk \
-	&& if [ -f "$$_co" ]; then cat "$$_co" > $${tmpf} && chmod +x $${tmpf}; \
+	&& if [ -f "$$_co" ]; then touch "$$_co" 2>${devnull}; cat "$$_co" > $${tmpf} && chmod +x $${tmpf}; \
 	else cat "$(strip $(1))" | ${_cli.subcommands.make} mk.compile > $${tmpf} && chmod +x $${tmpf} \
 		&& if [ -s $${tmpf} ]; then mkdir -p ${CMK_STAGE_DIR} && cp $${tmpf} "$$_co.${_cmk.pid}" && mv -f "$$_co.${_cmk.pid}" "$$_co"; fi; fi; \
 else cat $(1) | ${_cli.subcommands.make} mk.compile > $${tmpf} && chmod +x $${tmpf}; fi
@@ -6657,8 +6729,8 @@ dir/%:
 # always-available stdlib namespace (cf. python's `__builtins__`), distinct from a guest
 # program's own targets (`mk.targets`) and from the whole loaded namespace (`__dir__`).
 # Names come from `${PARTITION_SRC}` (the seed heads plus the `__hosted__` partition), sorted
-# and deduped, newline-delimited and pipe-friendly.  This is the single enumerator behind
-# the `.PHONY` guard: `_cmk.phony.bare` filters it down to the bare (dotless) heads.
+# and deduped, newline-delimited and pipe-friendly.  `test_phony_collisions` pins the seed
+# collision guard against the bare (dotless) heads this reports.
 # USAGE:  $(call __builtins__)   ||   ./compose.mk __builtins__
 __builtins__={ ${_cmk.seed.heads}; ${_cmk.hosted.heads}; } | sed 's/:.*//' | sort -u
 
@@ -6841,6 +6913,9 @@ mk.interrupt=CMK_INTERNAL=1 ${MAKE} -f ${MAKEFILE} mk.interrupt
 # mk.super.once: deprecated alias for m5.memoize! (run-scoped once).
 mk.super.once=$(call m5.memoize!,$(1))
 
+# The supervisor's out-of-band mailbox; the status channel guards on MAKE_SUPER, not CMK_SUPERVISOR.
+mk.super.pidfile=.tmp.mk.super.$${MAKE_SUPER}
+
 ifeq (${CMK_SUPERVISOR},0)
 mk.super.interrupt/% mk.interrupt/%:
 	@# CMK_SUPERVISOR is 0; signals are disabled.
@@ -6850,12 +6925,21 @@ mk.super.interrupt/% mk.interrupt/%:
 mk.super.pid/%: #; $(call log.base ${GLYPH_COMPOSE} ${@} ${sep} ${dim}Supervisor is disabled.)
 	@# CMK_SUPERVISOR is 0; signals are disabled.
 	@#
+# With signals disabled there are no supervised children; both degrade to shell no-ops.
+mk.super.children=true
+mk.super.reap=true
 else
 # Single source for supervisor-pid detection: the child make whose PPid is
 # MAKE_SUPER (returns empty when MAKE_SUPER is unset/has no child). Inlined by
 # both the pid query and the interrupt path so the hot interrupt path computes
 # it in-process instead of paying a full sub-make re-parse.
 _mk.super.pid.find=case "${OS_NAME}" in Darwin) ps -axo pid=,ppid=|awk -v me="$${MAKE_SUPER}" '$$2==me{print $$1}';; *) awk -v me="$${MAKE_SUPER}" 'FNR==1{n=split(FILENAME,a,"/"); p=a[n-1]} /^PPid:/{if($$2==me) print p}' /proc/[0-9]*/status 2>/dev/null || true;; esac
+
+# Recipe-context shell snippet: pids of this supervisor's children (portable; no pgrep).
+mk.super.children=${_mk.super.pid.find}
+# Recipe-context shell snippet: portably terminate those children (no-op without a supervisor).
+mk.super.reap=${_mk.super.pid.find} | xargs -I% kill -TERM % 2>/dev/null || true
+
 mk.super.pid:
 	@# Returns the pid for the supervisor process which is responsible for trapping signals.
 	@# See 'mk.interrupt' docs for more details.
@@ -6999,6 +7083,26 @@ mk.super.enter/%:
 	&& { [ -z "$(strip $(filter-out flux.noop,$(__cmk_post__.targets)))" ] || : > .tmp.cmk.mbox.${*}.post ; } \
 	&& $(call log.trace, ${GLYPH_MK} ${@} ${sep} ${red}started pid ${no_ansi}$${MAKE_SUPER})
 
+# The exact-exit-code channel; the targets below are thin wrappers over these.
+mk.super.status=([ -z "$${MAKE_SUPER}" ] || echo "${1}" > ${mk.super.pidfile}) ; exit ${1}
+mk.super.status.clear=([ -z "$${MAKE_SUPER}" ] || $(call io.safe_rm,${mk.super.pidfile}))
+
+mk.super.status/%:
+	@# Records an exact exit-code in the supervisor mailbox, then fails so the stack unwinds
+	@# normally and cleanup arms still run.  Needs CMK_SUPERVISOR=1, else make flattens to 2.
+	@# Contrast mk.yield, which short-circuits via signal and skips finally arms.
+	@#
+	@# USAGE: ... || make mk.super.status/42
+	$(call mk.super.status,${*})
+
+mk.super.status.clear:
+	@# Retracts a pending exit-code recorded by mk.super.status.  A handler that swallows a
+	@# failure and means to succeed must call this, else the code still reaches the top.
+	@# flux.try.except.finally calls it automatically when its except arm recovers.
+	@#
+	@# USAGE: ... || { make this.thing.handled ; make mk.super.status.clear ; }
+	$(call mk.super.status.clear)
+
 mk.super.stderr.filter:; ${stream.stdin} | awk "$${_cmk_blk_super_split}" | awk "$${_cmk_blk_super_filter}"
 	@# The supervisor's stderr filter, as a testable target (make-child transport of the same
 	@# `.awk.super.stderr.*` blocks the bootloader source-reads): splits a run-together
@@ -7108,6 +7212,9 @@ mk.targets.filter.parametric/%:
 	&& count=`printf '%s\n' "$${targets}"|${stream.count.lines}` \
 	&& ([ "$${quiet:-0}" == 1 ] && $(call log.base.part2, ${yellow}$${count}${no_ansi_dim} total) || true ) \
 	&& printf '%s\n' "$${targets}"
+
+# mk.goals.phony: the bare dotless heads of a compiled program, so a cwd file cannot shadow one.
+mk.goals.phony=awk "$${_cmk_blk_scan}" $(1) 2>/dev/null | grep -vE '[./%]' | sort -u | tr '\n' ' '
 
 mk.validate=_vf="$(1)" \
 	&& $(call log.compiler.part1, mk.validate) \
@@ -7231,7 +7338,7 @@ lang.lint.deep:; ${make} lang.lint.deep/-
 # Curated-divergent twins: intentionally-diverging, must not be smart-routed as pure stand-ins
 # (arg-shape mismatch, impure `exit`, a path var). The collisions lint classifies against it;
 # the receivers stage is threaded it so a compile-time send to a divergent opened member warns.
-lang.lint.divergent=io.env io.env.log mk.exit.code stage.file
+lang.lint.divergent=io.env io.env.log mk.super.status stage.file
 # Predicate: non-empty iff the named twin is curated-divergent.
 lang.lint.divergent.p=$(strip $(filter $(m5[1]),${lang.lint.divergent}))
 
@@ -7315,54 +7422,23 @@ endef
 # is disabled" and exit 1 (noise + a spurious error).  So we skip it and propagate `rc` directly;
 # the real top-level yield still fires its own interrupt to unwind the whole stack once.
 
-mk.exit.code/%:; [ -z "$${MAKE_SUPER}" ] || echo "${*}" > .tmp.mk.super.$${MAKE_SUPER} ; exit ${*}
-	@# Records an EXACT process exit-code, then fails so the make stack unwinds
-	@# NORMALLY (flux.*.finally / cleanup arms still run).  The bash supervisor
-	@# wrapper reads it out-of-band and the top-level `./compose.mk` exits with <N>.
-	@# Requires CMK_SUPERVISOR=1 (no out-of-band channel without it; degrades to the
-	@# usual make exit 2).  Contrast `mk.yield`, which short-circuits via signal and
-	@# SKIPS intermediate finally arms.
-	@#
-	@# USAGE: ... || make mk.exit.code/42      (or the `mk.exit.code` macro form, inline)
-	@#
-
-# Macro form of `mk.exit.code/<N>` for inline use inside other recipes.
-mk.exit.code=([ -z "$${MAKE_SUPER}" ] || echo "${1}" > .tmp.mk.super.$${MAKE_SUPER}) ; exit ${1}
-
-#░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-
-mk.exit.clear:; @[ -z "$${MAKE_SUPER}" ] || $(call io.safe_rm,.tmp.mk.super.$${MAKE_SUPER})
-	@# Retracts any pending exact exit-code recorded by `mk.exit.code` (drops the
-	@# supervisor pidfile).  Custom handlers that SWALLOW a failure (e.g. `|| true`)
-	@# and intend to succeed must call this, else the recorded code still reaches the
-	@# top-level process.  `flux.try.except.finally` calls it automatically when its
-	@# `except` arm recovers, so this is only for hand-rolled error handling.
-	@#
-	@# USAGE: ... || { make this.thing.handled ; make mk.exit.clear ; }
-	@#        (or the `mk.exit.clear` macro form, inline)
-
-# Macro form of `mk.exit.clear` for inline use inside other recipes.
-mk.exit.clear=([ -z "$${MAKE_SUPER}" ] || $(call io.safe_rm,.tmp.mk.super.$${MAKE_SUPER}))
+##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+## BEGIN: mk.error :: Typed faults and exit codes
+##
+## The parse-time and recipe-time error emitters, over the errno table.  The exact
+## exit code itself travels the supervisor mailbox (see `mk.super.status`).
+##
+## * mk.errno :: Curated symbol to exit-code table (default 1)
+## * mk.error :: Expansion-time root emitter
+## * mk.die   :: Recipe-time twin; themed line + exact exit code
+##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 # mk.errno: curated symbol to exit-code table (default 1).
 $(call m5.table, mk.errno, GENERIC=1 ENVVAR_UNSET=39 MODULE_MISSING=66 MODULE_ARGS=64 INCLUDE_MISSING=66 IMPORT_NOT_FOUND=66 DUPLICATE_KWARG=64 REGISTRY_ASSERT=70 NOT_IMPLEMENTED=70 GRAMMAR=65 IMPORT_DEF=66 IMPORT_TARGET=66 IMPORT_SYNTAX=64 NO_FORMATTER=69 KWARG_MISSING=64 BIND_ARGS=64 NOT_CALLABLE=70 NOT_RUNNABLE=70 CLASS_DECL=65 MODULE_MEMBER=65 DSL_BACKING=70, 1)
 # mk.error: expansion-time root emitter (thin error wrapper, errno=).
 mk.error = $(eval _mkerr_sym := $(patsubst errno=%,%,$(m5[2]?)))$(eval _mkerr_code := $(call mk.errno.resolve,$(_mkerr_sym),1))$(eval _mkerr_meta := $(strip $(m5[3]?) $(m5[4]?) $(m5[5]?) $(m5[6]?)))$(error cmk-fault errno=$(_mkerr_sym) code=$(_mkerr_code) :: $(strip $(m5[1]))$(if $(_mkerr_meta), :: $(_mkerr_meta)))
 # mk.die: recipe-time twin; themed line + exact exit code.
-mk.die = $(call log.mk, ${red}${bold}error${no_ansi} ${sep}${dim} $(patsubst errno=%,%,$(m5[2]?)) ${no_ansi}${sep} $(strip $(m5[1]))) ; $(call mk.exit.code,$(call mk.errno.resolve,$(patsubst errno=%,%,$(m5[2]?)),1))
-
-# __supervisor__.*: stable accessors over the core supervisor's identity + lifecycle, so
-# callers (e.g. flux.pool) depend on this surface instead of poking MAKE_SUPER /
-# _mk.super.pid.find directly.  Thin wrappers -- no reimplementation.
-__supervisor__.run_id    = ${_mk.run.id}
-__supervisor__.pid       = $${MAKE_SUPER}
-# Recipe-context shell snippet: PIDs of this supervisor's children (portable; no pgrep).
-__supervisor__.children  = ${_mk.super.pid.find}
-# Recipe-context shell snippet: portably TERM those children (no-op without a supervisor).
-__supervisor__.reap      = ${_mk.super.pid.find} | xargs -I% kill -TERM % 2>/dev/null || true
-# Inline macro forms of the exact-exit-code channel (wrap the existing recipes/macros).
-__supervisor__.exit_code  = $(call mk.exit.code,${1})
-__supervisor__.exit_clear = $(call mk.exit.clear)
+mk.die = $(call log.mk, ${red}${bold}error${no_ansi} ${sep}${dim} $(patsubst errno=%,%,$(m5[2]?)) ${no_ansi}${sep} $(strip $(m5[1]))) ; $(call mk.super.status,$(call mk.errno.resolve,$(patsubst errno=%,%,$(m5[2]?)),1))
 
 ##░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 ## BEGIN: flux.* :: A miniature workflow library
@@ -7811,7 +7887,7 @@ flux.try.except.finally/%:
 	&& ${make} $${try} && exit_status=0 || exit_status=1 \
 	&& case $${exit_status} in \
 		0) true; ;; \
-		1) $(call log.flux, ${underline}${cyan}except${no_ansi_dim} ${sep} $${except}) && ${make} $${except} && { $(call mk.exit.clear); exit_status=0; } || exit_status=1; ;; \
+		1) $(call log.flux, ${underline}${cyan}except${no_ansi_dim} ${sep} $${except}) && ${make} $${except} && { $(call mk.super.status.clear); exit_status=0; } || exit_status=1; ;; \
 	esac \
 	&& $(call log.flux, ${underline}${cyan}finally${no_ansi_dim} ${sep} $${finally}) && ${make} $${finally} \
 	&& exit $${exit_status}
@@ -9335,8 +9411,11 @@ $(compose_service_name).clean: ${compose_file_stem}.clean/$(compose_service_name
 	@# Shorthand for <stem>.clean/<svc>
 
 # NB: optimization: not using chaining
-$(compose_service_name).dispatch/%:
+$(compose_service_name).dispatch/%: ${compose_file_stem}.build/$(compose_service_name)
 	@# Shorthand for <stem>.dispatch/<svc>/<target_name>
+	@#
+	@# Ensures the service image matches its spec first, the way the container
+	@# dispatch ensures its image owner.
 	${trace_maybe} \
 	&& entrypoint=make \
 	cmd="${MAKE_FLAGS} -f ${MAKEFILE} $${*}" \
@@ -9588,9 +9667,15 @@ ${compose_file_stem}.build $(target_namespace).build:
 	@# WARNING: This is not actually safe for all legal compose files, because
 	@# compose handles run-ordering for defined services, but not build-ordering.
 	@#
-	$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}all services) \
-	&&  $(trace_maybe) \
-	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build $${docker._quiet_flag}
+	$$(call compose.ensure,${compose_file}) \
+	if $$(call compose.cached.test,${compose_file}); then \
+		$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}cached) ; \
+	else \
+		$$(call log.docker, ${compose.ctx.display} ${bold_cyan}build ${sep} ${dim_ital}all services) \
+		&&  $(trace_maybe) \
+		&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build $${docker._quiet_flag} \
+		&& $$(call compose.cached.stamp,${compose_file}) ; \
+	fi
 
 ${compose_file_stem}.build.quiet $(target_namespace).build.quiet:
 	@# Quiet build for all services in the given file.
@@ -9622,25 +9707,38 @@ ${compose_file_stem}.build/% $(target_namespace).build/%:
 	@# USAGE: 
 	@#   ./compose.mk <stem>.build/<svc1>,<svc2>,..<svcN>
 	@#
-	$$(call log.docker, ${target_namespace} ${sep} ${green}$${*} ${sep} ${no_ansi_dim}building..) 
-	echo $${*} | ${stream.comma.to.nl} \
-	| xargs -I% sh ${dash_x_maybe} -c "${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build %"
+	$$(call compose.ensure,${compose_file}) \
+	export svc=$${*} \
+	&& if $$(call compose.cached.test,${compose_file}); then \
+		$$(call log.docker, ${target_namespace} ${sep} ${green}$${*} ${sep} ${no_ansi_dim}cached) ; \
+	else \
+		$$(call log.docker, ${target_namespace} ${sep} ${green}$${*} ${sep} ${no_ansi_dim}building..) \
+		&& echo $${*} | ${stream.comma.to.nl} \
+		| xargs -I% sh ${dash_x_maybe} -c "${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} build %" \
+		&& $$(call compose.cached.stamp,${compose_file}) ; \
+	fi
 
 
 
-${compose_file_stem}.up/%:
+${compose_file_stem}.up/%: ${compose_file_stem}.build/%
 	@# Ups the given service(s) for the compose file.
 	@#
-	@# USAGE: 
+	@# The build prerequisite is a no-op when the service image already matches
+	@# its spec, and rebuilds it when it does not, since compose only builds on
+	@# a missing image and never on a changed one.
+	@#
+	@# USAGE:
 	@#   ./compose.mk <stem>.up/<svc_name>
 	@#
 	$$(call log.docker, ${target_namespace}.up ${sep} $${*}) \
 	&& ${docker.compose} $${COMPOSE_EXTRA_ARGS} -f ${compose_file} up $${*} 
 
-${compose_file_stem}.up.detach/%:
+${compose_file_stem}.up.detach/%: ${compose_file_stem}.build/%
 	@# Ups the given service(s) for the compose file, with implied --detach
 	@#
-	@# USAGE: 
+	@# Carries the same build prerequisite as the non-detached form.
+	@#
+	@# USAGE:
 	@#   ./compose.mk <stem>.up.detach/<svc_name>
 	@#
 	$$(call log.docker, ${target_namespace} ${sep} ${dim_cyan}up.detach ${sep} ${dim_green}$${*})

@@ -36,7 +36,7 @@ open .fossil
 .fossil.shun = insert or ignore into shun(uuid,mtime) select b.uuid, strftime('%s','now') from blob b join ticketchng c on c.tkt_rid=b.rid join ticket t on t.tkt_id=c.tkt_id where ${1};
 .fossil.boot = test -f "${.fossil.repo}" || fossil init --admin-user "${.fossil.user}" --project-name "$$(basename ${.fossil.root})" "${.fossil.repo}" | ${stream.as.log}
 # one roster, shared by the entrypoint and the help verb; a dotted name is invisible to subs auto-detection
-.fossil.subs = init add list list.json serve stop run ticket clean.closed clean.old
+.fossil.subs = init add amend list list.json serve stop run ticket clean.closed clean.old
 
 __main__:
   '''
@@ -128,6 +128,21 @@ fossil.add: assert.env/title
   version <- git rev-parse HEAD
   .fossil.exec(ticket add title "$${title}" type "$${type:-Code_Defect}" status "$${status:-Open}" severity "$${severity:-Important}" priority "$${priority:-Medium}" subsystem "$${subsystem:-}" foundin "$${foundin:-$${version}}" mimetype "$${mimetype:-text/x-markdown}" icomment "$${body}") | ${stream.as.log}
   log.io(${green}filed ${sep} ${no_ansi}$${title}${dim} (found in $${version}))
+
+fossil.amend/%:
+  '''
+  Amend an existing ticket, taking the value from piped stdin the way the add verb
+  does, so markdown with backticks, dollars, and quotes survives intact.  Appends a
+  comment by default; set field to write any other column, or to comment to replace
+  the body rather than append.  USAGE:  cat scratch/note.md | make fossil.amend/<uuid>
+  '''
+  ${.fossil.boot}
+  body=''; if [ -p ${stdin} ]; then body=`${stream.stdin}`; fi
+  test -n "$${body}" || { printf 'fossil.amend: nothing on stdin\n' >&2 ; exit 1 ; }
+  log.io(${dim}amending ${sep} ${no_ansi}${*}${dim} ($${field:-+icomment}))
+  fld="$${field:-+icomment}"
+  .fossil.exec(ticket set ${*} "$${fld}" "$${body}") | ${stream.as.log}
+  log.io(${green}amended ${sep} ${no_ansi}${*})
 
 fossil.clean.closed:
   '''

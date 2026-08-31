@@ -19,7 +19,9 @@ beam.super.tramp:
 	  CMK_TRAMP_MK='$(CMK_TRAMP_MK)' exec elixir '$(_bt_dir)beam-tramp.exs' $(__argv__); \
 	else \
 	  CMK_SUPERVISOR=0 CMK_INTERNAL=1 $(CMK_TRAMP_MK) beam.node.build >&2 || { printf 'beam: cannot build beam.node (does the program import platform.beam?)\n' >&2; exit 1; }; \
+	  _src="$$(cd '$(_bt_dir)' && pwd)"; \
 	  exec docker run --rm -e CMK_PLUGINS_DIR=.cmk -e CMK_TRAMPOLINE_ACTIVE=1 -e CMK_TRAMP_CHOOSE -e CMK_TRAMP_TRACE \
-	    -v "$$(pwd)":/workspace -w /workspace compose.mk:beam.node \
-	    bash -c "CMK_TRAMP_MK='$(CMK_TRAMP_MK)' elixir .cmk/beam-tramp.exs $(__argv__)"; \
+	    -v "$$_src/beam-tramp.exs":/cmk-beam-tramp.exs:ro \
+	    -v "$${DOCKER_HOST_WORKSPACE:-$$(pwd)}":/workspace -w /workspace compose.mk:beam.node \
+	    bash -c "CMK_TRAMP_MK='$(CMK_TRAMP_MK)' elixir /cmk-beam-tramp.exs $(__argv__)"; \
 	fi

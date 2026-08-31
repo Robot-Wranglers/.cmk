@@ -410,26 +410,33 @@ beam.tramp: beam.node.build
   '''
   # direct docker run (docker.run.sh's eval/-i interferes with the nested cmk-run re-exec).
   docker run --rm -e CMK_TRAMP_CHOOSE -e CMK_TRAMP_TRACE -e CMK_TRAMPOLINE=beam \
-    -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} ./compose.mk $${goals}
+    ${docker.cmk.mount} -v "$${DOCKER_HOST_WORKSPACE:-$$(pwd)}":/workspace \
+    -w /workspace ${beam.node.img} ${docker.cmk.bin} $${goals}
 
 # Warm-node cluster id: deterministic, env-inherited, per-tree.
 export CMK_BEAM_CLUSTER ?= cmk-beam-$(_mk.run.id)
 
 beam.node.ensure: beam.node.build
   '''
-  Bring up (or JOIN) the resident BEAM node for this run tree; idempotent by docker
-  inspect. Reaped at the owning run exit via CMK_POST. Needs docker.
+  Bring up (or join) the resident BEAM node for this run tree; idempotent by
+  liveness. Reaped at the owning run exit via CMK_POST. Needs docker.
   '''
-  docker inspect ${CMK_BEAM_CLUSTER} >/dev/null 2>&1 && exit 0; \
+  ${make} docker.is.running/${CMK_BEAM_CLUSTER} && exit 0; \
   docker network inspect ${CMK_BEAM_CLUSTER}-net >/dev/null 2>&1 || docker network create ${CMK_BEAM_CLUSTER}-net >/dev/null; \
+  d=${CMK_SCRATCH}.beam.src; mkdir -p $$d; \
+  cp "$(call cmk.plugin.find,beam-node-server.exs)" "$(call cmk.plugin.find,beam-tramp.exs)" $$d/; \
   docker run -d --name ${CMK_BEAM_CLUSTER} --network ${CMK_BEAM_CLUSTER}-net \
     --label cmk.run="$${MAKE_SUPER:-none}" -e CMK_PLUGINS_DIR=.cmk \
-    -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} \
-    elixir .cmk/beam-node-server.exs >/dev/null; \
+    ${docker.cmk.mount} -v "$${DOCKER_HOST_WORKSPACE:-$$(pwd)}":/workspace \
+    -w /workspace ${beam.node.img} \
+    elixir $$d/beam-node-server.exs >/dev/null; \
   touch .tmp.beam.node.${_mk.run.id}; \
   i=0; while [ $$i -lt 60 ]; do docker logs ${CMK_BEAM_CLUSTER} 2>&1 | grep -q 'cmk-beam-node up' && break; i=$$((i+1)); sleep 0.25; done
 
-beam.node.reap:; docker rm -f ${CMK_BEAM_CLUSTER} >/dev/null 2>&1 || true; docker network rm ${CMK_BEAM_CLUSTER}-net >/dev/null 2>&1 || true; rm -f .tmp.beam.node.${_mk.run.id}
+beam.node.reap:
+  ${make} docker.rm/${CMK_BEAM_CLUSTER}; \
+  docker network rm ${CMK_BEAM_CLUSTER}-net >/dev/null 2>&1 || true; \
+  rm -rf ${CMK_SCRATCH}.beam.src; rm -f .tmp.beam.node.${_mk.run.id}
 
 # tree-scoped teardown: wildcard-gated, auto-registers at exit.
 $(if $(wildcard .tmp.beam.node.*),$(call __cmk_post__.append,beam.node.reap))
@@ -440,9 +447,12 @@ beam.warm/%: beam.node.ensure
   in the shared warm VM). e.g. beam.warm/flux.ok  or  CMK_TRAMP_MK=... beam.warm/find/5
   '''
   RIP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${CMK_BEAM_CLUSTER}`; \
+  d=${CMK_SCRATCH}.beam.src; mkdir -p $$d; \
+  cp "$(call cmk.plugin.find,beam-node-attach.exs)" $$d/; \
   docker run --rm --network ${CMK_BEAM_CLUSTER}-net -e CMK_TRAMP_MK -e CMK_TRAMP_CHOOSE -e CMK_TRAMP_TRACE \
-    -e CMK_BEAM_NODE=cmk_tramp@$$RIP -v "$$(pwd)":/workspace -w /workspace ${beam.node.img} \
-    elixir .cmk/beam-node-attach.exs ${*}
+    -e CMK_BEAM_NODE=cmk_tramp@$$RIP ${docker.cmk.mount} \
+    -v "$${DOCKER_HOST_WORKSPACE:-$$(pwd)}":/workspace -w /workspace ${beam.node.img} \
+    elixir $$d/beam-node-attach.exs ${*}
 
 # Foundation lifecycle verbs -- compose the beam.node.* primitives.
 

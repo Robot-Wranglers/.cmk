@@ -1,0 +1,291 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+
+# cmk_pragma ::: { "kind": "module", "target_locals": true } :::
+
+'''
+beam.portal: resident coordination on the beam substrate.  One portal per
+run carries every beam actor as a process; the ingress is the actor-standard
+unix socket, and the wire is envelope v2 (one JSON-RPC 2.0 object with flat
+addressing extensions).  Library only: importing costs the classes and the
+node program; instances and the mode hooks belong to programs.  See the
+beam-actor spike doc under scratch and demos/cmk/experimental/beam-portal.cmk.
+'''
+import log
+import jb, flux
+from cmk import class
+from agents import Agent, SocketActor, Jsonrpc, Askable
+from platform.beam import beam.node.ensure
+
+PORTAL_MIN_NODES ?= 0
+
+# the portal program: route control to self, everything else to the named actor's process.
+portal.node.exs(|
+  defmodule PortalNode do
+    def main do
+      who = System.get_env("CMK_PORTAL_NAME") || "portal0"
+      up = System.get_env("CMK_PORTAL_UP") || ".tmp.portal.up"
+      reg = System.get_env("CMK_PORTAL_REG") || ".tmp.portal.reg."
+      System.put_env("CMK_PORTAL_REG", reg)
+      boot = System.get_env("CMK_PORTAL_BOOT") || "true"
+      run_quiet(boot)
+      {:ok, lsock} = :gen_tcp.listen(4455, [:binary, packet: :line, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+      parent = self()
+      spawn_link(fn -> acceptor(lsock, parent) end)
+      File.write!(up, "")
+      IO.puts("cmk-portal up: " <> who)
+      consume(who, up, %{})
+    end
+
+    defp run_quiet(cmd) do
+      {out, rc} = System.cmd("sh", ["-c", cmd], stderr_to_stdout: true)
+      if rc != 0 do
+        IO.write(out)
+        IO.puts("cmk-portal boot failed rc " <> Integer.to_string(rc))
+      end
+    end
+
+    defp acceptor(lsock, parent) do
+      {:ok, sock} = :gen_tcp.accept(lsock)
+      spawn_link(fn -> reader(sock, parent) end)
+      acceptor(lsock, parent)
+    end
+
+    defp reader(sock, parent) do
+      case :gen_tcp.recv(sock, 0) do
+        {:ok, line} ->
+          send(parent, {:msg, String.trim_trailing(line, "\n")})
+          reader(sock, parent)
+        {:error, _} ->
+          :ok
+      end
+    end
+
+    defp jqr(f, prog) do
+      {out, _} = System.cmd("jq", ["-r", prog, f], stderr_to_stdout: true)
+      String.trim(out)
+    end
+
+    defp consume(who, up, actors) do
+      receive do
+        {:msg, line} ->
+          f = Path.join(System.tmp_dir!(), "portal_msg_#{:erlang.unique_integer([:positive])}")
+          File.write!(f, line <> "\n")
+          to = jqr(f, ".to // \"\"")
+          actors2 =
+            cond do
+              to == who ->
+                control(who, up, actors, f)
+              Map.has_key?(actors, to) ->
+                send(Map.fetch!(actors, to), {:msg, line})
+                File.rm(f)
+                actors
+              true ->
+                IO.puts("cmk-portal drop: unknown actor [" <> to <> "]")
+                File.rm(f)
+                actors
+            end
+          consume(who, up, actors2)
+        {:done, name} ->
+          consume(who, up, Map.delete(actors, name))
+      end
+    end
+
+    defp control(who, up, actors, f) do
+      op = jqr(f, ".method // \"\"")
+      name = jqr(f, ".params.name // \"\"")
+      case op do
+        "portal.register" ->
+          recv = jqr(f, ".params.recv // \"\"")
+          parent = self()
+          pid = spawn_link(fn -> actor(parent, name, recv) end)
+          File.write!(System.get_env("CMK_PORTAL_REG") <> name, "")
+          IO.puts("cmk-portal register: " <> name)
+          File.rm(f)
+          Map.put(actors, name, pid)
+        "portal.drain" ->
+          case Map.fetch(actors, name) do
+            {:ok, pid} -> send(pid, :drain)
+            :error -> :ok
+          end
+          File.rm(f)
+          actors
+        "portal.scale" ->
+          IO.puts("cmk-portal scale requested (node pool deferred)")
+          File.rm(f)
+          actors
+        "portal.stop" ->
+          Enum.each(actors, fn {_n, pid} -> send(pid, :drain) end)
+          await_all(map_size(actors))
+          File.rm(up)
+          IO.puts("cmk-portal closed: " <> who)
+          System.halt(0)
+        _ ->
+          IO.puts("cmk-portal drop: unknown op [" <> op <> "]")
+          File.rm(f)
+          actors
+      end
+    end
+
+    defp await_all(0), do: :ok
+    defp await_all(n) do
+      receive do
+        {:done, _} -> await_all(n - 1)
+      end
+    end
+
+    # one process per actor: its mailbox is the queue; drain exits after queued work.
+    defp actor(parent, name, recv) do
+      receive do
+        {:msg, line} ->
+          f = Path.join(System.tmp_dir!(), "portal_act_#{:erlang.unique_integer([:positive])}")
+          File.write!(f, line <> "\n")
+          {out, _rc} = System.cmd("sh", ["-c", "cat " <> f <> " | " <> recv], stderr_to_stdout: true)
+          File.rm(f)
+          IO.write(out)
+          actor(parent, name, recv)
+        :drain ->
+          File.rm(System.get_env("CMK_PORTAL_REG") <> name)
+          send(parent, {:done, name})
+          IO.puts("cmk-portal drained: " <> name)
+      end
+    end
+  end
+
+  PortalNode.main()
+|)
+
+# the relay's container half: exec'd per connection, pipes stdin to the internal listener.
+portal.inject.sh(|
+  exec 3<>/dev/tcp/127.0.0.1/4455
+  cat >&3
+|)
+
+class beam.portal.Portal(bases=SocketActor,Agent)[|
+  '''
+  The portal is actor zero, literally: serve brings up the resident node and
+  a host socat relay behind the unix socket the base already names, and the
+  control surface (status, scale, purge) is calls to itself over the same
+  wire every actor uses.  deliver is inherited from SocketActor unchanged: a
+  portal is a socketed agent whose consumer loop is a BEAM VM.
+  '''
+  self.ensure:
+    '''Mode face for CMK_PRE: join the run tree's portal or start it (idempotent)'''
+    sock <- ${self}.get_sock()
+    ${make} docker.is.running/cmk-portal-${self} && [ -S "$$sock" ] && exit 0 || true
+    ${make} ${self}.serve
+
+  self.serve:
+    '''Bring up the resident node and the socket relay; cells are run-scoped scratch'''
+    sock <- ${self}.get_sock()
+    $(call container.ensure,beam.node) ${mk.def.to.file}/portal.node.exs,${CMK_SCRATCH}.portal.${self}.exs; \
+    ${mk.def.to.file}/portal.inject.sh,${CMK_SCRATCH}.portal.${self}.inject; \
+    ${make} docker.rm/cmk-portal-${self}; \
+    rm -f ${CMK_SCRATCH}.portal.${self}.up "$$sock" "$$sock.pid"; \
+    ws="$${DOCKER_HOST_WORKSPACE:-$$(pwd)}"; prog="$${__file__#$$ws/}"; \
+    boot="NO_COLOR=1 TERM=dumb CMK_INTERNAL=0 CMK_COMPILER_VERBOSE=0 CMK_PLUGINS_DIR=.cmk ${docker.cmk.bin} cmk compile $$prog > /tmp/twin.mk < /dev/null"; \
+    docker_args="-e CMK_PORTAL_NAME=${self} -e CMK_PORTAL_UP=${CMK_SCRATCH}.portal.${self}.up -e CMK_PORTAL_REG=${CMK_SCRATCH}.portal.reg. -e CMK_PORTAL_BOOT=\"$$boot\"" \
+      detach=1 name=cmk-portal-${self} img=compose.mk:beam.node entrypoint=none \
+      cmd="elixir ${CMK_SCRATCH}.portal.${self}.exs" ${make} docker.run.sh >/dev/null; \
+    cmk.flux.retry([ -f ${CMK_SCRATCH}.portal.${self}.up ], 4800) \
+    || { docker logs cmk-portal-${self} 2>&1 | tail -5 >&2; exit 96; }; \
+    ( socat UNIX-LISTEN:"$$sock",fork EXEC:"docker exec -i cmk-portal-${self} bash /workspace/${CMK_SCRATCH}.portal.${self}.inject" >/dev/null 2>&1 & echo $$! > "$$sock.pid" ); \
+    ${self}.log(portal up ${sep} $$sock)
+
+  self.reap:
+    '''Mode face for CMK_POST: graceful stop, then node and relay; core sweeps the cells'''
+    sock <- ${self}.get_sock()
+    msg=`${jq.run} -cn --arg t "${self}" '{jsonrpc:"2.0",method:"portal.stop",to:$$t}'`
+    """$$msg""" | ${make} ${self}.deliver || true
+    cmk.flux.retry(! ${make} docker.is.running/cmk-portal-${self}, 240)
+    p=`cat "$$sock.pid" 2>/dev/null`
+    [ -z "$$p" ] || kill "$$p" 2>/dev/null || true
+    ${make} docker.rm/cmk-portal-${self}
+    rm -f "$$sock" "$$sock.pid" ${CMK_SCRATCH}.portal.${self}.exs ${CMK_SCRATCH}.portal.${self}.inject 2>/dev/null || true
+    ${make} ${self}.mbox.purge
+
+  self.status:
+    '''Container state, socket address, and the registered actor roster'''
+    sock <- ${self}.get_sock()
+    st=`${make} docker.is.running/cmk-portal-${self} >/dev/null 2>&1 && echo true || echo absent`
+    regs=`ls ${CMK_SCRATCH}.portal.reg.* 2>/dev/null | sed 's/^${CMK_SCRATCH}.portal.reg.//' | tr '\n' ' ' || true`
+    ${self}.log(portal ${sep} $$st @ $$sock ${sep} actors: $${regs:-none})
+
+  self.scale/%:
+    '''A control envelope to self: grow or shrink the node pool to <n> (pool deferred)'''
+    msg=`${jq.run} -cn --arg t "${self}" --arg n "${*}" '{jsonrpc:"2.0",method:"portal.scale",params:{n:$$n},to:$$t}'`
+    """$$msg""" | ${make} ${self}.deliver
+
+  self.purge:
+    '''Crash recovery via the label-scoped core verb; stray relay killed by pidfile'''
+    sock <- ${self}.get_sock()
+    ${make} docker.reap
+    p=`cat "$$sock.pid" 2>/dev/null`
+    [ -z "$$p" ] || kill "$$p" 2>/dev/null || true
+    rm -f "$$sock" "$$sock.pid" 2>/dev/null || true
+|]
+
+class beam.portal.PortalActor(bases=Jsonrpc,Agent)[|
+  '''
+  An actor living in a portal, named explicitly at mint (no default):
+  PortalActor alice(portal=portal0)(| |).  deliver tags the envelope with
+  to=<name> and hands it to that portal; serve registers name plus recv
+  command and the process spawns portal-side; serve.stop deregisters and
+  drains behind everything already queued.  No port, no container, no
+  per-actor readiness, no per-actor registry cell.
+  '''
+  # required declaration kwarg; the actor's full address is (portal, name).
+  self.portal := $(call mk.kwargs.get,${__args__},portal)
+
+  self.deliver:
+    '''Envelope tagged to=${self}, handed to this actor's portal'''
+    msg <- ${stream.stdin}
+    tagged <- """$$msg""" | ${jq.run} -c --arg t "${self}" '.to=$$t'
+    """$$tagged""" | ${make} $(self.portal).deliver
+
+  self.serve:
+    '''Register with the portal; returns when the actor's queue is live'''
+    stackf=`printenv "events__${self}.mbox"`; \
+    rcmd="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 CMK_PLUGINS_DIR=.cmk make -sS --no-print-directory -f /tmp/twin.mk 'events__${self}.mbox=$$stackf' ${self}.recv"; \
+    msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" --arg r "$$rcmd" '{jsonrpc:"2.0",method:"portal.register",params:{name:$$n,recv:$$r},to:$$t}'`; \
+    """$$msg""" | ${make} $(self.portal).deliver
+    cmk.flux.retry([ -f ${CMK_SCRATCH}.portal.reg.${self} ], 600)
+
+  self.serve.stop:
+    '''Deregister via control envelope; idempotent, and drains before the process exits'''
+    [ -f ${CMK_SCRATCH}.portal.reg.${self} ] || exit 0
+    msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" '{jsonrpc:"2.0",method:"portal.drain",params:{name:$$n},to:$$t}'`
+    """$$msg""" | ${make} $(self.portal).deliver
+    cmk.flux.retry([ ! -f ${CMK_SCRATCH}.portal.reg.${self} ], 600)
+
+  self.stop: flux.try.except.finally/self.serve.stop,flux.noop,self.mbox.purge
+    '''Teardown at exit: drain if needed, always drop the mailbox'''
+
+  self.svc.start: self.serve
+    '''Handle: start the service (banana-svc vocabulary; alias)'''
+
+  self.svc.stop: self.serve.stop
+    '''Handle: drain and deregister; the mailbox survives and the service can restart'''
+
+  self.svc.send/%:
+    '''Handle: send target <stem> as a goals-plane message, so it rides the queue'''
+    """${*}""" | ${self}.send()
+
+  # svc.log: the handle's contextual logger; args append after the standing context.
+  ${self}.svc.log.__call__ = st=`[ -f ${CMK_SCRATCH}.portal.reg.${self} ] && echo registered || echo unregistered` && n=`${make} ${self}.mbox.count` && cmk.log(${self} ${sep} svc ${sep} $$st @ $(self.portal) ${sep} $$n in the mailbox$(if ${__args__},${sep} ${__args__}))
+
+  self.svc.status:
+    '''Handle: the standing svc context line, with no message'''
+    ${self}.svc.log()
+|]
+
+class beam.portal.PortalAsk(bases=Askable,beam.portal.PortalActor)[|
+  '''The portal actor with the ask verb mixed in'''
+|]
+
+class beam.portal.PortalJqd(bases=beam.portal.PortalActor,Materializable)[|
+  '''
+  A portal actor with an install-time shape: the instance body is a jq fold,
+  authored in the program, carried by the compiled twin, and applied
+  portal-side by the stock recv.  Materializable keeps the body raw.
+  '''
+|]

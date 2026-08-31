@@ -111,6 +111,56 @@ class agents.Agent(bases=Actor)[|
     rm -f -- "$$sock" "$${sock}.pid" "$${sock}.fifo" $(call flux.bg.pidfile,${self}.serve.fg)
 |]
 
+class agents.Jsonrpc[|
+  '''
+  Envelope v2: the wire is one JSON-RPC 2.0 object with flat addressing
+  extensions (to, reply_to) that conformant peers ignore.  Casts are
+  notifications: cmk.push carries the data plane, cmk.run the goals plane.
+  recv dispatches by method; any non-cmk method runs as a target with the
+  full request as the event, so ask handlers can answer by id.
+  '''
+  self._envelope = ${jq.run} -cn --arg g "$${goals:-}" --arg d "$${body:-}" 'if $$g != "" then {jsonrpc:"2.0",method:"cmk.run",params:{goals:$$g}} else {jsonrpc:"2.0",method:"cmk.push",params:$$d} end'
+
+  self.recv:
+    '''Dispatch one v2 message (push folds into the mailbox; methods run)'''
+    env <- ${stream.stdin}
+    method <- """$$env""" | ${jq.run} -r '.method // ""'
+    if [ "$$method" = "cmk.push" ]; then \
+      xform=`this.mk.def.read/self 2>/dev/null`; \
+      [ -n "$$xform" ] || xform='.'; \
+      obj=`"""$$env""" | ${jq.run} -c '.params | if type=="string" then (fromjson? // {raw:.}) else . end'`; \
+      n=`${make} ${self}.mbox.count`; \
+      """$$obj""" | ${jq.run} -c "$$xform" | ${jq.run} -c --argjson s "$$((n+1))" '.seq=$$s' | $(${self}.mbox.push); \
+    else \
+      case "$$method" in \
+        cmk.run) goals=`"""$$env""" | ${jq.run} -r '.params.goals // ""'`;; \
+        *) goals="$$method";; \
+      esac; \
+      printf '%s\n' "$$goals" | this.mk.kernel.each{CMK_EVENT=$$env}; \
+    fi
+|]
+
+class agents.Askable[|
+  '''
+  The reply plane as a mixin, envelope-level only: ask/<method> casts a
+  request carrying a correlation id and a reply address (a program-declared
+  replies actor with a source-pinned mailbox), then polls the reply mailbox
+  for the correlated result.  Any transport whose deliver works gains ask.
+  '''
+  self.ask/%:
+    '''One round-trip: stdin is the argument, stdout the correlated result'''
+    arg=`${stream.stdin.maybe}`
+    corr="c$$$$"
+    req=`${jq.run} -cn --arg m "${*}" --arg c "$$corr" --arg a "$$arg" '{jsonrpc:"2.0",method:$$m,id:$$c,reply_to:"replies",params:{arg:$$a}}'`
+    """$$req""" | ${self}.deliver()
+    cmk.flux.retry(${make} reply.ready/$$corr 2>/dev/null, 600)
+    ${make} replies.mbox.filter/id,$$corr | ${jq.run} -r '.[0].result'
+|]
+
+reply.ready/%:
+  '''True once the reply mailbox holds a Response with the given id'''
+  ${make} replies.mbox.filter/id,${*} | ${jq.run} -e 'length>0' >/dev/null 2>&1
+
 class agents.jqd(bases=agents.SocketActor,agents.Agent,Materializable)[|
   '''
   jqd: a socketed agent whose default handler is a jq fold -- is-a agent
