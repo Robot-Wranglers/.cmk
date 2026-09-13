@@ -34,29 +34,29 @@ cmk.class multi(bases=cmk.namespace,Dispatchable)(|
   published target.  Every dispatch traces itself; an axis names its condition via __cond__.
   '''
   # A namespace body is data, not a template: without this the class path evaluates it once at top level.
-  ${self}.__raw_body__ := 1
-  ${self}.__resolve__ =$(if $(filter $(strip ${__args__}),$(${self}.methods)),${self}.$(strip ${__args__}),$(if $(filter default,$(${self}.methods)),${self}.default,))
-  ${self}.__axisvars__ =
-  ${self}.methods = $(filter-out $(${self}.__axisvars__),$(${self}.__all__))
-  ${self}.__nokey__ = $(call log.module.fail, self declares no key source, CMK_NO_KEY)
-  ${self}.__dispatch__ = $(${self}.__nokey__)
-  ${self}.__nomatch__ = $(call log.module.fail, no method for key $(strip ${__args__}), CMK_NO_METHOD)
-  ${self}.__apply__ = $(if $(strip ${__args__}),$(call $(strip ${__args__})),$(call ${self}.__nomatch__,$(strip ${2})))
-  ${self}.__cond__ = $(strip ${__args__})
-  ${self}.__choice__ = $(patsubst ${self}.%,%,$(call ${self}.__resolve__,${__args__}))
-  ${self}.__trace__ = $(call log.part1, ${self} dispatching on $(call ${self}.__cond__,${__args__})) ; $(call log.part2, $(call ${self}.__choice__,${__args__}))
-  ${self}.dispatch.key = ${self}.__trace__(${__args__}) ; ${self}.__apply__(${self}.__resolve__(${__args__}),${__args__})
-  ${self}.dispatch = ${self}.dispatch.key($(${self}.__dispatch__))
-  ${self}.__call__ = $(${self}.dispatch)
+  self.__raw_body__ := 1
+  self.__resolve__ =$(if $(filter $(strip ${__args__}),$(${self}.methods)),${self}.$(strip ${__args__}),$(if $(filter default,$(${self}.methods)),${self}.default,))
+  self.__axisvars__ =
+  self.methods = $(filter-out $(${self}.__axisvars__),$(${self}.__all__))
+  self.__nokey__ = $(call log.module.fail, self declares no key source, CMK_NO_KEY)
+  self.__dispatch__ = $(${self}.__nokey__)
+  self.__nomatch__ = $(call log.module.fail, no method for key $(strip ${__args__}), CMK_NO_METHOD)
+  self.__apply__ = $(if $(strip ${__args__}),$(call $(strip ${__args__})),$(call ${self}.__nomatch__,$(strip ${2})))
+  self.__cond__ = $(strip ${__args__})
+  self.__choice__ = $(patsubst ${self}.%,%,$(call ${self}.__resolve__,${__args__}))
+  self.__trace__ = $(call log.part1, ${self} dispatching on $(call ${self}.__cond__,${__args__})) ; $(call log.part2, $(call ${self}.__choice__,${__args__}))
+  self.dispatch.key = self.__trace__(${__args__}) ; self.__apply__(self.__resolve__(${__args__}),${__args__})
+  self.dispatch = self.dispatch.key($(${self}.__dispatch__))
+  self.__call__ = $(${self}.dispatch)
 |)
 
 # An axis subkind: the key is the value of the environment variable named by var.
 cmk.class multi.env(bases=multi)(|
   ''' Dispatch on an environment variable, named per instance by the var keyword. '''
-  ${self}.__axis__ = env
-  ${self}.__axisvars__ = var
-  ${self}.__dispatch__ = $($(${self}.var))
-  ${self}.__cond__ = $(${self}.var)=$(${self}.__dispatch__)
+  self.__axis__ = env
+  self.__axisvars__ = var
+  self.__dispatch__ = $($(${self}.var))
+  self.__cond__ = $(${self}.var)=$(${self}.__dispatch__)
 |)
 
 # An open axis: the key names a foreign namespace that implements a shared operation.
@@ -66,12 +66,12 @@ cmk.class multi.kind(bases=multi)(|
   by the op keyword.  The table is discovered rather than declared, so a contributor joins
   it by defining that operation and never names the multimethod.
   '''
-  ${self}.__axis__ = kind
-  ${self}.__axisvars__ = op
-  ${self}.__op__ = $(${self}.op)
-  ${self}.__cond__ = kind=$(strip ${__args__})
-  ${self}.methods = $(sort $(patsubst %.$(${self}.__op__),%,$(filter %.$(${self}.__op__),$(.VARIABLES))))
-  ${self}.__resolve__ = $(if $(filter $(strip ${__args__}),$(${self}.methods)),$(strip ${__args__}).$(${self}.__op__),$(if $(filter default,$(${self}.__all__)),${self}.default,))
+  self.__axis__ = kind
+  self.__axisvars__ = op
+  self.__op__ = $(${self}.op)
+  self.__cond__ = kind=$(strip ${__args__})
+  self.methods = $(sort $(patsubst %.$(${self}.__op__),%,$(filter %.$(${self}.__op__),$(.VARIABLES))))
+  self.__resolve__ = $(if $(filter $(strip ${__args__}),$(${self}.methods)),$(strip ${__args__}).$(${self}.__op__),$(if $(filter default,$(${self}.__all__)),${self}.default,))
 |)
 
 # A runtime axis: the key is decided by the shell, so dispatch re-enters make with it.
@@ -81,11 +81,11 @@ cmk.class multi.stream(bases=multi)(|
   The key cannot exist before the recipe runs, so this axis probes and re-enters make,
   costing a sub-make per dispatch.
   '''
-  ${self}.__axis__ = stream
-  ${self}.__cond__ = stdin
-  ${self}.__probe__ = ${io.tty.stdin} && echo tty || echo pipe
-  ${self}/%:; ${self}.dispatch.key(${*})
-  ${self}.dispatch = ${make} ${self}/`$(${self}.__probe__)`
+  self.__axis__ = stream
+  self.__cond__ = stdin
+  self.__probe__ = ${io.tty.stdin} && echo tty || echo pipe
+  ${self}/%:; self.dispatch.key(${*})
+  self.dispatch = ${make} ${self}/`$(${self}.__probe__)`
 |)
 
 # Retrofit: give an existing name a method table without editing the file that owns it.

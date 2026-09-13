@@ -192,49 +192,34 @@ class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
 
   self.ensure:
     '''Mode face for CMK_PRE: join the run tree's portal or start it (idempotent)'''
-    sock <- ${self}.get_sock()
+    sock <- self.get_sock()
     self.__alive__ 2>/dev/null && [ -S "$$sock" ] && exit 0 || true
-    ${make} ${self}.serve.bg
+    $(self.serve.bg)
 
   self.serve: self.serve.bg
     '''The blocking form: bring the node up, then follow it until it exits'''
     docker wait $(self.__cname__) >/dev/null
 
+  # the bring-up as a macro, so a caller in the same run starts the portal without re-entering make
+  self.serve.bg = { sock=$$(${self}.get_sock()); $(call container.ensure,beam.node) $(call mk.def.to.file,portal.node.exs,${CMK_SCRATCH}.portal.${self}.exs); $(call mk.def.to.file,portal.inject.sh,${CMK_SCRATCH}.portal.${self}.inject); $(call docker.rm,cmk-portal-${self}); rm -f ${CMK_SCRATCH}.portal.${self}.up "$$sock" "$$sock.pid"; ws="$${DOCKER_HOST_WORKSPACE:-$$(pwd)}"; prog="$${__file__\#$$ws/}"; cid=$$(cksum < '${cmk.self}' 2>/dev/null | awk '{print $$1"-"$$2}'); cidkey=$$(case '${docker.cmk.bin}' in /*) echo '${docker.cmk.bin}';; *) echo "/workspace/$$(basename '${docker.cmk.bin}')";; esac); boot="NO_COLOR=1 TERM=dumb CMK_INTERNAL=0 CMK_COMPILER_VERBOSE=0 CMK_PLUGINS_DIR=.cmk ${docker.cmk.bin} cmk compile $$prog > /tmp/twin.mk < /dev/null"; [ "$${CMK_FMAKE:-1}" != 0 ] && boot="$$boot; (fmake --serve ${beam.portal.sock} -f /tmp/twin.mk flux.ok < /dev/null > /dev/null 2>&1 &)"; route=""; [ "$${CMK_FMAKE:-1}" != 0 ] && route="-e FMAKE_CLIENT=\"fmake --client ${beam.portal.sock} -- \" -e FMAKE_REARM=\"${beam.portal.rearm}\" -e FMAKE_REARM_PID=\"${beam.portal.rearm.pid}\""; extra="$${CMK_PORTAL_DOCKER_ARGS:-}"; ( export docker_args="-e CMK_PORTAL_NAME=${self} -e CMK_PORTAL_UP=${CMK_SCRATCH}.portal.${self}.up -e CMK_PORTAL_REG=${CMK_SCRATCH}.portal.reg. -e _CMK_CORE_ID=$$cid -e _CMK_CORE_ID_KEY=$$cidkey $$route $$extra -e CMK_PORTAL_BOOT=\"$$boot\"" detach=1 name=cmk-portal-${self} img=compose.mk:beam.node entrypoint=none cmd="elixir ${CMK_SCRATCH}.portal.${self}.exs"; ${docker.run.sh} ) >/dev/null; $(call flux.retry.sh,[ -f ${CMK_SCRATCH}.portal.${self}.up ],1200) || { docker logs cmk-portal-${self} 2>&1 | tail -5 >&2; exit 96; }; ( socat UNIX-LISTEN:"$$sock",fork EXEC:"docker exec -i cmk-portal-${self} bash /workspace/${CMK_SCRATCH}.portal.${self}.inject" >/dev/null 2>&1 & echo $$! > "$$sock.pid" ); ${self}.log(portal up ${sep} $$sock); }
+
   self.serve.bg:
     '''Bring up the resident node and the socket relay, detached; cells are run-scoped scratch'''
-    sock <- ${self}.get_sock()
-    $(call container.ensure,beam.node) $(call mk.def.to.file,portal.node.exs,${CMK_SCRATCH}.portal.${self}.exs); \
-    $(call mk.def.to.file,portal.inject.sh,${CMK_SCRATCH}.portal.${self}.inject); \
-    $(call docker.rm,cmk-portal-${self}); \
-    rm -f ${CMK_SCRATCH}.portal.${self}.up "$$sock" "$$sock.pid"; \
-    ws="$${DOCKER_HOST_WORKSPACE:-$$(pwd)}"; prog="$${__file__#$$ws/}"; \
-    cid=`cksum < '${cmk.self}' 2>/dev/null | awk '{print $$1"-"$$2}'`; \
-    cidkey=`case '${docker.cmk.bin}' in /*) echo '${docker.cmk.bin}';; *) echo "/workspace/\`basename '${docker.cmk.bin}'\`";; esac`; \
-    boot="NO_COLOR=1 TERM=dumb CMK_INTERNAL=0 CMK_COMPILER_VERBOSE=0 CMK_PLUGINS_DIR=.cmk ${docker.cmk.bin} cmk compile $$prog > /tmp/twin.mk < /dev/null"; \
-    [ "$${CMK_FMAKE:-1}" != 0 ] && boot="$$boot; (fmake --serve ${beam.portal.sock} -f /tmp/twin.mk flux.ok < /dev/null > /dev/null 2>&1 &)"; \
-    route=""; [ "$${CMK_FMAKE:-1}" != 0 ] && route="-e FMAKE_CLIENT=\"fmake --client ${beam.portal.sock} -- \" -e FMAKE_REARM=\"${beam.portal.rearm}\" -e FMAKE_REARM_PID=\"${beam.portal.rearm.pid}\""; \
-    extra="$${CMK_PORTAL_DOCKER_ARGS:-}"; \
-    docker_args="-e CMK_PORTAL_NAME=${self} -e CMK_PORTAL_UP=${CMK_SCRATCH}.portal.${self}.up -e CMK_PORTAL_REG=${CMK_SCRATCH}.portal.reg. -e _CMK_CORE_ID=$$cid -e _CMK_CORE_ID_KEY=$$cidkey $$route $$extra -e CMK_PORTAL_BOOT=\"$$boot\"" \
-      detach=1 name=cmk-portal-${self} img=compose.mk:beam.node entrypoint=none \
-      cmd="elixir ${CMK_SCRATCH}.portal.${self}.exs" ${make} docker.run.sh >/dev/null; \
-    cmk.flux.retry.sh([ -f ${CMK_SCRATCH}.portal.${self}.up ], 1200) \
-    || { docker logs cmk-portal-${self} 2>&1 | tail -5 >&2; exit 96; }; \
-    ( socat UNIX-LISTEN:"$$sock",fork EXEC:"docker exec -i cmk-portal-${self} bash /workspace/${CMK_SCRATCH}.portal.${self}.inject" >/dev/null 2>&1 & echo $$! > "$$sock.pid" ); \
-    ${self}.log(portal up ${sep} $$sock)
+    $(self.serve.bg)
 
   self.reap:
     '''Mode face for CMK_POST and the body of stop: graceful stop, then node and relay; idempotent'''
-    sock <- ${self}.get_sock()
+    sock <- self.get_sock()
     if self.__alive__ 2>/dev/null; then \
       msg=`${jq.run} -cn --arg t "${self}" '{jsonrpc:"2.0",method:"portal.stop",to:$$t}'`; \
-      """$$msg""" | ${self}.deliver() || true; \
+      """$$msg""" | self.deliver() || true; \
       cmk.flux.retry.sh(! self.__alive__ 2>/dev/null, 120); \
     fi
     p=`cat "$$sock.pid" 2>/dev/null`
     [ -z "$$p" ] || kill "$$p" 2>/dev/null || true
     $(call docker.rm,$(self.__cname__))
     rm -f "$$sock" "$$sock.pid" ${CMK_SCRATCH}.portal.${self}.exs ${CMK_SCRATCH}.portal.${self}.inject 2>/dev/null || true
-    ${self}.mbox.purge()
+    self.mbox.purge()
 
   self.scale/%:
     '''Grow or shrink the node pool to <n>; refuses until a pool exists'''
@@ -242,7 +227,7 @@ class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
 
   self.purge:
     '''Crash recovery via the label-scoped core verb; stray relay killed by pidfile'''
-    sock <- ${self}.get_sock()
+    sock <- self.get_sock()
     ${make} docker.reap
     p=`cat "$$sock.pid" 2>/dev/null`
     [ -z "$$p" ] || kill "$$p" 2>/dev/null || true
@@ -267,8 +252,11 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
   # deregister via control envelope; idempotent, and drains before the process exits
   self.__drain__ = ! $(self.__alive__) || { msg=$$(${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" '{jsonrpc:"2.0",method:"portal.drain",params:{name:$$n},to:$$t}'); printf '%s\n' "$$msg" | $($(self.portal).deliver); $(call flux.retry.sh,! $(self.__alive__),200); }
 
-  self.stop: self.serve.stop
-    '''The protocol stop is the drain, run in this process'''
+  # the stop as a macro, so a caller in the same run drains without re-entering make
+  self.stop = $(self.__drain__)
+  self.stop:
+    '''The protocol stop is the drain, run in this process; also a macro'''
+    $(self.stop)
 
   self.deliver:
     '''Envelope tagged to=${self}, handed to this actor's portal'''
@@ -280,15 +268,12 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
     '''The blocking form: register, then hold until the registration is drained'''
     while self.__alive__; do sleep 1; done
 
+  # the registration as a macro, so a caller in the same run registers without re-entering make
+  self.serve.bg = { stackf=`printenv "events__${self}.mbox"`; pre=""; [ "$${CMK_FMAKE:-1}" != 0 ] && pre="fmake --client ${beam.portal.sock} -- "; [ -z "$${CMK_PORTAL_RCMD_ENV:-}" ] || pre="$${CMK_PORTAL_RCMD_ENV} $$pre"; rcmd="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 CMK_PLUGINS_DIR=.cmk $${pre}make -sS --no-print-directory -f /tmp/twin.mk 'events__${self}.mbox=$$stackf' ${self}.recv"; msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" --arg r "$$rcmd" '{jsonrpc:"2.0",method:"portal.register",params:{name:$$n,recv:$$r},to:$$t}'`; printf '%s\n' "$$msg" | $($(self.portal).deliver); $(call flux.retry.sh,$(self.__alive__),200); }
+
   self.serve.bg:
     '''Register with the portal, detached; returns when the actor's queue is live'''
-    stackf=`printenv "events__${self}.mbox"`; \
-    pre=""; [ "$${CMK_FMAKE:-1}" != 0 ] && pre="fmake --client ${beam.portal.sock} -- "; \
-    [ -z "$${CMK_PORTAL_RCMD_ENV:-}" ] || pre="$${CMK_PORTAL_RCMD_ENV} $$pre"; \
-    rcmd="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 CMK_PLUGINS_DIR=.cmk $${pre}make -sS --no-print-directory -f /tmp/twin.mk 'events__${self}.mbox=$$stackf' ${self}.recv"; \
-    msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" --arg r "$$rcmd" '{jsonrpc:"2.0",method:"portal.register",params:{name:$$n,recv:$$r},to:$$t}'`; \
-    """$$msg""" | $($(self.portal).deliver)
-    cmk.flux.retry.sh(self.__alive__, 200)
+    $(self.serve.bg)
 
   self.serve.stop:
     '''Deregister via control envelope; idempotent, and drains before the process exits'''
@@ -297,7 +282,7 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
   self.teardown:
     '''Release at exit: drain if needed, always drop the mailbox'''
     self.__drain__ || true
-    ${self}.mbox.purge()
+    self.mbox.purge()
 |]
 
 class beam.portal.PortalAsk(bases=Askable,beam.portal.PortalActor)[|
