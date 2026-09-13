@@ -1240,6 +1240,7 @@ func main() {
 		m.evalOut = er; m.children = append(m.children, m.evalCmd) }
 	if rg.Read != "" {
 		readCmd := exec.Command(runner, rg.Read); readCmd.Env = childEnv
+		readCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}  // own group, so teardown reaps the feeder loop under the launcher
 		ro, _ := readCmd.StdoutPipe(); _ = readCmd.Start()
 		m.readScan = bufio.NewScanner(ro); m.readCmd = readCmd; m.children = append(m.children, readCmd) }
 	if rg.Minimap != "" {                            // OPTIONAL minimap: a looping target -> a buffered RHS pane
@@ -1292,7 +1293,7 @@ func main() {
 		case <-time.After(2 * time.Second): if dbg { fmt.Fprintf(term, "[tux-repl] TIMEOUT reaping %s -- abandoned\n", name) } } }
 	reap("print", final.printCmd, true)
 	reap("eval", final.evalCmd, true)
-	reap("read", final.readCmd, false)
+	reap("read", final.readCmd, true)
 	reap("minimap", final.minimapCmd, true)
 	reap("events", final.eventsCmd, true)
 	if final.printPty != nil { _ = final.printPty.Close() }

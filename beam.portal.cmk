@@ -13,13 +13,26 @@ beam-actor spike doc under scratch and demos/cmk/experimental/beam-portal.cmk.
 import log
 import jb, flux
 from cmk import class
-from agents import Agent, SocketActor, Askable
+from agents import Agent, SocketActor
 from platform.beam import beam.node.ensure
 
 PORTAL_MIN_NODES ?= 0
 
 # Where the in-container zygote listens; routing is on unless CMK_FMAKE=0, which keeps every message cold.
 beam.portal.sock ?= /tmp/cmk-portal.sock
+
+# True inside the node, where the container env carries the flag, so a send from a leaf dials the router's loopback port instead of the host socket.
+beam.portal.inside ?= $(if $(filter environment,$(origin CMK_PORTAL_INSIDE)),1)
+beam.portal.loopback = 127.0.0.1/4455
+
+# the in-node send: one line to the router over loopback, the container half of the relay, with the sender named on failure
+beam.portal.inject = { msg=$$(${jq.run} -c --arg t "$(1)" '.to=$$t' 2>/dev/null); [ -n "$$msg" ] || { echo "cmk: $(1).deliver refused an empty message inside the node errno=EMPTY_MESSAGE" >&2; exit 65; }; printf '%s\n' "$$msg" | bash -c 'exec 3<>/dev/tcp/${beam.portal.loopback}; cat >&3' || { echo "cmk: $(1).deliver: the router at ${beam.portal.loopback} refused the line inside the node errno=TIMEOUT" >&2; exit 124; }; }
+
+# Inside the node every socket send goes through the gateway: the router routes a neighbor locally and hands the rest outward.
+agents.gateway = $(if ${beam.portal.inside},beam.portal.inject)
+
+# The docker namespace is machine-wide while the socket is per tree, so the container name carries the tree too.
+beam.portal.tree := $(shell pwd | cksum | awk '{print $$1}')
 # The rearm lists are declared once, by the module that owns the binary reading them.
 beam.portal.rearm ?= ${fmake.rearm}
 beam.portal.rearm.pid ?= ${fmake.rearm.pid}
@@ -34,11 +47,13 @@ portal.node.exs(|
       System.put_env("CMK_PORTAL_REG", reg)
       boot = System.get_env("CMK_PORTAL_BOOT") || "true"
       run_quiet(boot)
+      :persistent_term.put(:cmk_aliases, alias_map())
+      {:ok, _} = :pg.start_link()
       {:ok, lsock} = :gen_tcp.listen(4455, [:binary, packet: :line, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
       parent = self()
       spawn_link(fn -> acceptor(lsock, parent) end)
       File.write!(up, "")
-      IO.puts("cmk-portal up: " <> who)
+      IO.puts("cmk-portal up: " <> who <> " aliases=" <> Integer.to_string(map_size(aliases())))
       consume(who, up, %{})
     end
 
@@ -89,10 +104,15 @@ portal.node.exs(|
         {:msg, line} ->
           msg = decoded(line)
           to = field(msg, "to")
+          method = field(msg, "method")
           actors2 =
             cond do
               msg == :error ->
                 IO.puts("cmk-portal drop: undecodable line")
+                actors
+              method in flux_heads() ->
+                parent = self()
+                spawn_link(fn -> flux(parent, method, msg) end)
                 actors
               to == who ->
                 control(who, up, actors, msg)
@@ -100,7 +120,12 @@ portal.node.exs(|
                 send(Map.fetch!(actors, to), {:msg, line})
                 actors
               true ->
-                IO.puts("cmk-portal drop: unknown actor [" <> to <> "]")
+                case System.get_env("CMK_PORTAL_OUT") do
+                  nil -> IO.puts("cmk-portal drop: unknown actor [" <> to <> "]")
+                  out ->
+                    File.write!(out, line <> "\n", [:append])
+                    IO.puts("cmk-portal egress: [" <> to <> "]")
+                end
                 actors
             end
           consume(who, up, actors2)
@@ -121,6 +146,11 @@ portal.node.exs(|
           File.write!(System.get_env("CMK_PORTAL_REG") <> name, "")
           IO.puts("cmk-portal register: " <> name)
           Map.put(actors, name, pid)
+        "portal.cancel" ->
+          apps = :pg.get_members(:cmk_apps)
+          Enum.each(apps, fn pid -> send(pid, :cancel) end)
+          IO.puts("cmk-portal cancel: " <> Integer.to_string(length(apps)) <> " running")
+          actors
         "portal.drain" ->
           case Map.fetch(actors, name) do
             {:ok, pid} -> send(pid, :drain)
@@ -137,6 +167,140 @@ portal.node.exs(|
           IO.puts("cmk-portal drop: unknown op [" <> op <> "]")
           actors
       end
+    end
+
+    # the whitelist: a method here is interpreted by the node; every other envelope routes on to.
+    defp flux_heads, do: ["flux.and", "flux.or", "flux.mux", "flux.pool"]
+
+    # one request: a process in the apps group; denote the head, then reinject the Response to reply_to.
+    defp flux(parent, head, msg) do
+      :ok = :pg.join(:cmk_apps, self())
+      goals = String.split(field(Map.get(msg, "params"), "arg"), ",", trim: true)
+      rc = application(head, goals, nil)
+      reply = %{"jsonrpc" => "2.0", "id" => field(msg, "id"), "result" => Integer.to_string(rc), "to" => field(msg, "reply_to")}
+      send(parent, {:msg, IO.iodata_to_binary(:json.encode(reply))})
+    end
+
+    # one application, top-level or nested: an open and a close span around the denotation; a nested one keeps the goal it was spelled as.
+    defp application(head, goals, parent, goal \\ nil) do
+      sid = Integer.to_string(:erlang.unique_integer([:positive]))
+      base = %{"id" => sid, "op" => head, "goals" => goals}
+      base = if parent, do: Map.put(base, "parent", parent), else: base
+      base = if goal, do: Map.put(base, "goal", goal), else: base
+      span(Map.put(base, "phase", "open"))
+      t0 = now()
+      rc = denote(head, goals, sid)
+      status = if rc == 130, do: "cancelled", else: "done"
+      span(Map.merge(base, %{"phase" => "close", "rc" => rc, "ms" => now() - t0, "status" => status}))
+      rc
+    end
+
+    # a goal denotes inline when it is a whitelisted head, spelled literally or through a twin alias; else it is a leaf.
+    defp run(goal, parent) do
+      case literal(goal) || Map.get(aliases(), goal) do
+        {head, goals} -> application(head, goals, parent, goal)
+        nil -> leaf(goal, parent)
+      end
+    end
+
+    defp literal(goal) do
+      case String.split(goal, "/", parts: 2) do
+        [head, rest] -> if head in flux_heads(), do: {head, String.split(rest, ",", trim: true)}, else: nil
+        _ -> nil
+      end
+    end
+
+    defp aliases, do: :persistent_term.get(:cmk_aliases, %{})
+
+    # prereq-only rules whose single prereq is a whitelisted head, read once from the twin's rule database.
+    defp alias_map do
+      cmd = "CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 CMK_PLUGINS_DIR=.cmk make -sS --no-print-directory -f /tmp/twin.mk -pq flux.noop 2>/dev/null < /dev/null"
+      {out, _} = System.cmd("sh", ["-c", cmd])
+      out
+      |> String.split("\n\n")
+      |> Enum.reduce(%{}, fn block, acc ->
+        with [rule | rest] <- String.split(block, "\n"),
+             [target, prereq] <- String.split(rule, ": ", parts: 2),
+             false <- String.contains?(target, [" ", "\t", "#", "%", "$"]),
+             true <- Enum.all?(rest, fn l -> not String.starts_with?(l, "\t") end),
+             {head, goals} <- literal(String.trim(prereq)) do
+          Map.put(acc, target, {head, goals})
+        else
+          _ -> acc
+        end
+      end)
+    end
+
+    # a cancel lands between leaves; the head stops there and reports the interrupt code.
+    defp cancelled? do
+      receive do
+        :cancel -> true
+      after
+        0 -> false
+      end
+    end
+
+    defp denote("flux.and", goals, sid) do
+      Enum.reduce_while(goals, 0, fn g, _ ->
+        if cancelled?(), do: {:halt, 130}, else: (case run(g, sid) do 0 -> {:cont, 0}; rc -> {:halt, rc} end)
+      end)
+    end
+    defp denote("flux.or", goals, sid) do
+      Enum.reduce_while(goals, 0, fn g, _ ->
+        if cancelled?(), do: {:halt, 130}, else: (case run(g, sid) do 0 -> {:halt, 0}; rc -> {:cont, rc} end)
+      end)
+    end
+    # the join reports the last goal's rc, as the native wait over a pid list does.
+    defp denote("flux.mux", goals, sid) do
+      if cancelled?() do
+        130
+      else
+        goals
+        |> Task.async_stream(fn g -> run(g, sid) end, ordered: true, timeout: :infinity, max_concurrency: max(length(goals), 1))
+        |> Enum.map(fn {:ok, rc} -> rc end)
+        |> List.last()
+        |> Kernel.||(0)
+      end
+    end
+    # the bounded pool: the first goal is the worker count, as in the native spelling.
+    defp denote("flux.pool", [n | goals], sid) do
+      if cancelled?(), do: 130, else: pool(goals, String.to_integer(n), sid, %{}, 0)
+    end
+    defp denote("flux.pool", [], _sid), do: 0
+
+    # launch up to n goals, stop launching after the first failure, and let the running ones finish.
+    defp pool(goals, n, sid, running, rc) do
+      cond do
+        rc == 0 and goals != [] and map_size(running) < n ->
+          [g | rest] = goals
+          t = Task.async(fn -> run(g, sid) end)
+          pool(rest, n, sid, Map.put(running, t.ref, t), rc)
+        map_size(running) == 0 ->
+          rc
+        true ->
+          receive do
+            {ref, r} when is_map_key(running, ref) ->
+              Process.demonitor(ref, [:flush])
+              pool(goals, n, sid, Map.delete(running, ref), if(rc == 0, do: r, else: rc))
+          end
+      end
+    end
+
+    # a leaf is one goal on the twin through the hop command the host handed over at boot; stdin closed.
+    defp leaf(goal, parent) do
+      lid = Integer.to_string(:erlang.unique_integer([:positive]))
+      span(%{"id" => lid, "parent" => parent, "op" => goal, "phase" => "open"})
+      t0 = now()
+      {out, rc} = System.cmd("sh", ["-c", System.get_env("CMK_PORTAL_LEAF") <> " " <> goal <> " < /dev/null"], stderr_to_stdout: true)
+      IO.write(out)
+      span(%{"id" => lid, "parent" => parent, "op" => goal, "phase" => "close", "rc" => rc, "ms" => now() - t0})
+      rc
+    end
+
+    defp now, do: System.monotonic_time(:millisecond)
+
+    defp span(rec) do
+      IO.puts("cmk-span " <> IO.iodata_to_binary(:json.encode(Map.put(rec, "t", now()))))
     end
 
     defp await_all(0), do: :ok
@@ -167,13 +331,33 @@ portal.node.exs(|
   PortalNode.main()
 |)
 
+# the timeline renderer: one row per closed span, leaves indented, bar width from measured ms.
+portal.timeline.jq(|
+  def rep(s; n): if n > 0 then s * n else "" end;
+  def title: (if .parent then "  " else "" end) + .op + (if .goals then "/" + (.goals | join(",")) else "" end) | .[0:30];
+  if length == 0 then "no spans" else
+    (map(select(.phase == "open")) | map(.t) | min) as $t0
+    | (map(select(.phase == "close")) | map(.t) | max) as $t1
+    | (([$t1 - $t0, 60] | max) / 60) as $scale
+    | map(select(.phase == "close"))
+    | sort_by(.t - .ms)
+    | .[]
+    | title as $lab
+    | ((.t - .ms - $t0) / $scale | floor) as $lead
+    | ([(.ms / $scale | floor), 1] | max) as $w
+    | $lab + rep(" "; 32 - ($lab | length)) + rep(" "; $lead) + rep("#"; $w)
+      + " " + (.ms | tostring) + "ms rc=" + (.rc | tostring)
+      + (if .status == "cancelled" then " cancelled" else "" end)
+  end
+|)
+
 # the relay's container half: exec'd per connection, pipes stdin to the internal listener.
 portal.inject.sh(|
   exec 3<>/dev/tcp/127.0.0.1/4455
   cat >&3
 |)
 
-class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
+class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container,cmk.namespace)[|
   '''
   The portal is actor zero, literally: serve.bg brings up the resident node
   and a host socat relay behind the unix socket the base already names, and
@@ -181,8 +365,22 @@ class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
   uses.  deliver is inherited from SocketActor unchanged.  Its lifecycle is
   the container's, and stop is the graceful reap that CMK_POST also runs.
   '''
-  self.__cname__ = cmk-portal-${self}
+  self.__cname__ = cmk-portal-${self}-${beam.portal.tree}
   self.__alive__ = $(call docker.is.running,$(self.__cname__))
+  # the outward face: the router appends what it cannot route here, and the follower delivers it on the host
+  self.__outbox__ = ${CMK_SCRATCH}.portal.${self}.out
+  self.egress:
+    '''Follow the outbox until the reap removes it, delivering each line on the host by the recipient's own transport'''
+    out=$(self.__outbox__); n=0; \
+    while [ -e "$$out" ]; do \
+      total=`wc -l < "$$out"`; \
+      while [ $$n -lt $$total ]; do \
+        n=$$((n+1)); line=`sed -n "$${n}p" "$$out"`; \
+        to=`printf '%s' "$$line" | ${jq.run} -r '.to // ""'`; \
+        [ -z "$$to" ] || printf '%s\n' "$$line" | ${make} $$to.deliver || self.log(${yellow}egress to $$to failed${no_ansi}); \
+      done; \
+      sleep 0.2; \
+    done
   self.__ident__ = $(self.__cname__)
   # the up line names the container, the socket, and the registered actor roster
   self.__status_up__ = sock=$$(${self}.get_sock()); regs=$$(ls ${CMK_SCRATCH}.portal.reg.* 2>/dev/null | sed 's/^${CMK_SCRATCH}.portal.reg.//' | tr '\n' ' ' || true); cmk.log(${self} ${sep} ${green}up ${sep} ${dim}$(self.__cname__) @ $$sock ${sep} actors: $${regs:-none})
@@ -201,7 +399,7 @@ class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
     docker wait $(self.__cname__) >/dev/null
 
   # the bring-up as a macro, so a caller in the same run starts the portal without re-entering make
-  self.serve.bg = { sock=$$(${self}.get_sock()); $(call container.ensure,beam.node) $(call mk.def.to.file,portal.node.exs,${CMK_SCRATCH}.portal.${self}.exs); $(call mk.def.to.file,portal.inject.sh,${CMK_SCRATCH}.portal.${self}.inject); $(call docker.rm,cmk-portal-${self}); rm -f ${CMK_SCRATCH}.portal.${self}.up "$$sock" "$$sock.pid"; ws="$${DOCKER_HOST_WORKSPACE:-$$(pwd)}"; prog="$${__file__\#$$ws/}"; cid=$$(cksum < '${cmk.self}' 2>/dev/null | awk '{print $$1"-"$$2}'); cidkey=$$(case '${docker.cmk.bin}' in /*) echo '${docker.cmk.bin}';; *) echo "/workspace/$$(basename '${docker.cmk.bin}')";; esac); boot="NO_COLOR=1 TERM=dumb CMK_INTERNAL=0 CMK_COMPILER_VERBOSE=0 CMK_PLUGINS_DIR=.cmk ${docker.cmk.bin} cmk compile $$prog > /tmp/twin.mk < /dev/null"; [ "$${CMK_FMAKE:-1}" != 0 ] && boot="$$boot; (fmake --serve ${beam.portal.sock} -f /tmp/twin.mk flux.ok < /dev/null > /dev/null 2>&1 &)"; route=""; [ "$${CMK_FMAKE:-1}" != 0 ] && route="-e FMAKE_CLIENT=\"fmake --client ${beam.portal.sock} -- \" -e FMAKE_REARM=\"${beam.portal.rearm}\" -e FMAKE_REARM_PID=\"${beam.portal.rearm.pid}\""; extra="$${CMK_PORTAL_DOCKER_ARGS:-}"; ( export docker_args="-e CMK_PORTAL_NAME=${self} -e CMK_PORTAL_UP=${CMK_SCRATCH}.portal.${self}.up -e CMK_PORTAL_REG=${CMK_SCRATCH}.portal.reg. -e _CMK_CORE_ID=$$cid -e _CMK_CORE_ID_KEY=$$cidkey $$route $$extra -e CMK_PORTAL_BOOT=\"$$boot\"" detach=1 name=cmk-portal-${self} img=compose.mk:beam.node entrypoint=none cmd="elixir ${CMK_SCRATCH}.portal.${self}.exs"; ${docker.run.sh} ) >/dev/null; $(call flux.retry.sh,[ -f ${CMK_SCRATCH}.portal.${self}.up ],1200) || { docker logs cmk-portal-${self} 2>&1 | tail -5 >&2; exit 96; }; ( socat UNIX-LISTEN:"$$sock",fork EXEC:"docker exec -i cmk-portal-${self} bash /workspace/${CMK_SCRATCH}.portal.${self}.inject" >/dev/null 2>&1 & echo $$! > "$$sock.pid" ); ${self}.log(portal up ${sep} $$sock); }
+  self.serve.bg = { sock=$$(${self}.get_sock()); $(call container.ensure,beam.node) $(call mk.def.to.file,portal.node.exs,${CMK_SCRATCH}.portal.${self}.exs); $(call mk.def.to.file,portal.inject.sh,${CMK_SCRATCH}.portal.${self}.inject); $(call docker.rm,$(self.__cname__)); rm -f ${CMK_SCRATCH}.portal.${self}.up "$$sock" "$$sock.pid"; : > $(self.__outbox__); ws="$${DOCKER_HOST_WORKSPACE:-$$(pwd)}"; prog="$${__file__\#$$ws/}"; cid=$$(cksum < '${cmk.self}' 2>/dev/null | awk '{print $$1"-"$$2}'); cidkey=$$(case '${docker.cmk.bin}' in /*) echo '${docker.cmk.bin}';; *) echo "/workspace/$$(basename '${docker.cmk.bin}')";; esac); boot="NO_COLOR=1 TERM=dumb CMK_INTERNAL=0 CMK_COMPILER_VERBOSE=0 ${docker.cmk.bin} cmk compile $$prog > /tmp/twin.mk < /dev/null"; [ "$${CMK_FMAKE:-1}" != 0 ] && boot="$$boot; (fmake --serve ${beam.portal.sock} -f /tmp/twin.mk flux.ok < /dev/null > /dev/null 2>&1 &)"; route=""; [ "$${CMK_FMAKE:-1}" != 0 ] && route="-e FMAKE_CLIENT=\"fmake --client ${beam.portal.sock} -- \" -e FMAKE_REARM=\"${beam.portal.rearm}\" -e FMAKE_REARM_PID=\"${beam.portal.rearm.pid}\""; lpre=""; [ "$${CMK_FMAKE:-1}" != 0 ] && lpre="fmake --client ${beam.portal.sock} -- "; leaf="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 $${lpre}make -sS --no-print-directory -f /tmp/twin.mk"; extra="$${CMK_PORTAL_DOCKER_ARGS:-}"; ( export docker_args="-e CMK_PORTAL_NAME=${self} -e CMK_PORTAL_INSIDE=1 -e CMK_PORTAL_OUT=$(self.__outbox__) -e CMK_PORTAL_UP=${CMK_SCRATCH}.portal.${self}.up -e CMK_PORTAL_REG=${CMK_SCRATCH}.portal.reg. -e _CMK_CORE_ID=$$cid -e _CMK_CORE_ID_KEY=$$cidkey $$route $$extra -e CMK_PORTAL_LEAF=\"$$leaf\" -e CMK_PORTAL_BOOT=\"$$boot\"" detach=1 name=$(self.__cname__) img=compose.mk:beam.node entrypoint=none cmd="elixir ${CMK_SCRATCH}.portal.${self}.exs"; ${docker.run.sh} ) >/dev/null; $(call flux.retry.sh,[ -f ${CMK_SCRATCH}.portal.${self}.up ],1200) || { docker logs $(self.__cname__) 2>&1 | tail -5 >&2; echo "cmk: timed out waiting for the ${self} node to write ${CMK_SCRATCH}.portal.${self}.up errno=TIMEOUT" >&2; exit 96; }; ( socat UNIX-LISTEN:"$$sock",fork EXEC:"docker exec -i $(self.__cname__) bash /workspace/${CMK_SCRATCH}.portal.${self}.inject" >/dev/null 2>&1 & echo $$! > "$$sock.pid" ); ( $(call flux.bg,${self}.egress) ) >/dev/null 2>&1; ${self}.log(portal up ${sep} $$sock); }
 
   self.serve.bg:
     '''Bring up the resident node and the socket relay, detached; cells are run-scoped scratch'''
@@ -213,13 +411,31 @@ class beam.portal.Portal(bases=SocketActor,Agent,lifecycle.container)[|
     if self.__alive__ 2>/dev/null; then \
       msg=`${jq.run} -cn --arg t "${self}" '{jsonrpc:"2.0",method:"portal.stop",to:$$t}'`; \
       """$$msg""" | self.deliver() || true; \
-      cmk.flux.retry.sh(! self.__alive__ 2>/dev/null, 120); \
+      cmk.flux.retry.sh(! self.__alive__ 2>/dev/null, 120) \
+        || self.log(${yellow}graceful stop timed out${no_ansi} ${sep} forcing $(self.__cname__) down); \
     fi
     p=`cat "$$sock.pid" 2>/dev/null`
+    [ -z "$$p" ] || { kill "$$p" 2>/dev/null; cmk.flux.retry.sh(! kill -0 "$$p" 2>/dev/null, 50); } || true
+    p=`cat $(call flux.bg.pidfile,${self}.egress) 2>/dev/null`
     [ -z "$$p" ] || kill "$$p" 2>/dev/null || true
     $(call docker.rm,$(self.__cname__))
-    rm -f "$$sock" "$$sock.pid" ${CMK_SCRATCH}.portal.${self}.exs ${CMK_SCRATCH}.portal.${self}.inject 2>/dev/null || true
+    rm -f "$$sock" "$$sock.pid" $(self.__outbox__) $(call flux.bg.pidfile,${self}.egress) ${CMK_SCRATCH}.portal.${self}.exs ${CMK_SCRATCH}.portal.${self}.inject ${CMK_SCRATCH}.portal.${self}.jq 2>/dev/null || true
     self.mbox.purge()
+
+  self.spans:
+    '''The span stream: one open and one close record per application and per leaf the node ran'''
+    docker logs $(self.__cname__) 2>&1 | grep '^cmk-span ' | sed 's/^cmk-span //' || true
+
+  self.timeline:
+    '''The span stream as a gantt: a row per span, leaves indented under their application'''
+    $(call mk.def.to.file,portal.timeline.jq,${CMK_SCRATCH}.portal.${self}.jq)
+    self.spans() | ${jq.run} -s -r -f ${CMK_SCRATCH}.portal.${self}.jq
+
+  self.cancel:
+    '''Cancel every running application; the cancel lands between leaves'''
+    msg=`${jq.run} -cn --arg t "${self}" '{jsonrpc:"2.0",method:"portal.cancel",to:$$t}'`
+    """$$msg""" | self.deliver()
+    ${self}.log(cancel sent)
 
   self.scale/%:
     '''Grow or shrink the node pool to <n>; refuses until a pool exists'''
@@ -243,14 +459,16 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
   behind everything already queued.  Its identity is the registration
   marker the portal writes on register and removes on drain.
   '''
-  # required declaration kwarg; the actor's full address is (portal, name).
-  self.portal := $(call mk.kwargs.get,${__args__},portal)
+  # the enclosing portal by lexical placement, or the portal= kwarg for an actor declared outside one; the address is (portal, name).
+  self.portal := $(or $(call mk.kwargs.get,${__args__},portal),$(__name__))
+  # the mailbox file is named by the actor, not the run, so a leaf in the node and the host read the same file without an override
+  self.__minted__ = $(eval export events__${self}.mbox := .tmp.portal.$(if $(filter $(self.portal).%,${self}),${self},$(self.portal).${self}).mbox)cmk.channel(${self}.mbox)$(call __cmk_post__.append,${self}.teardown)
   # alive doubles as the dispatch gate: a registered actor answers a dispatch as an ask
   self.__marker__ = ${CMK_SCRATCH}.portal.reg.${self}
   self.__alive__ = test -f $(self.__marker__)
   self.__ident__ = registered @ $(self.portal)
   # deregister via control envelope; idempotent, and drains before the process exits
-  self.__drain__ = ! $(self.__alive__) || { msg=$$(${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" '{jsonrpc:"2.0",method:"portal.drain",params:{name:$$n},to:$$t}'); printf '%s\n' "$$msg" | $($(self.portal).deliver); $(call flux.retry.sh,! $(self.__alive__),200); }
+  self.__drain__ = ! $(self.__alive__) || { msg=$$(${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" '{jsonrpc:"2.0",method:"portal.drain",params:{name:$$n},to:$$t}'); printf '%s\n' "$$msg" | $($(self.portal).deliver) && $(call agents.await,! $(self.__alive__),200,$(self.portal) to drain ${self} and remove $(self.__marker__)); }
 
   # the stop as a macro, so a caller in the same run drains without re-entering make
   self.stop = $(self.__drain__)
@@ -259,17 +477,17 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
     $(self.stop)
 
   self.deliver:
-    '''Envelope tagged to=${self}, handed to this actor's portal'''
+    '''Envelope tagged to=${self}, handed to this actor's portal; inside the node it goes straight to the router over loopback'''
     msg <- ${stream.stdin}
     tagged <- """$$msg""" | ${jq.run} -c --arg t "${self}" '.to=$$t'
-    """$$tagged""" | $($(self.portal).deliver)
+    """$$tagged""" | $(if ${beam.portal.inside},$(call beam.portal.inject,${self}),$($(self.portal).deliver))
 
   self.serve: self.serve.bg
     '''The blocking form: register, then hold until the registration is drained'''
     while self.__alive__; do sleep 1; done
 
   # the registration as a macro, so a caller in the same run registers without re-entering make
-  self.serve.bg = { stackf=`printenv "events__${self}.mbox"`; pre=""; [ "$${CMK_FMAKE:-1}" != 0 ] && pre="fmake --client ${beam.portal.sock} -- "; [ -z "$${CMK_PORTAL_RCMD_ENV:-}" ] || pre="$${CMK_PORTAL_RCMD_ENV} $$pre"; rcmd="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 CMK_PLUGINS_DIR=.cmk $${pre}make -sS --no-print-directory -f /tmp/twin.mk 'events__${self}.mbox=$$stackf' ${self}.recv"; msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" --arg r "$$rcmd" '{jsonrpc:"2.0",method:"portal.register",params:{name:$$n,recv:$$r},to:$$t}'`; printf '%s\n' "$$msg" | $($(self.portal).deliver); $(call flux.retry.sh,$(self.__alive__),200); }
+  self.serve.bg = { stackf=`printenv "events__${self}.mbox"`; pre=""; [ "$${CMK_FMAKE:-1}" != 0 ] && pre="fmake --client ${beam.portal.sock} -- "; [ -z "$${CMK_PORTAL_RCMD_ENV:-}" ] || pre="$${CMK_PORTAL_RCMD_ENV} $$pre"; rcmd="NO_COLOR=1 TERM=dumb CMK_SUPERVISOR=0 CMK_INTERNAL=1 CMK_DISABLE_HOOKS=1 $${pre}make -sS --no-print-directory -f /tmp/twin.mk 'events__${self}.mbox=$$stackf' ${self}.recv"; msg=`${jq.run} -cn --arg t "$(self.portal)" --arg n "${self}" --arg r "$$rcmd" '{jsonrpc:"2.0",method:"portal.register",params:{name:$$n,recv:$$r},to:$$t}'`; printf '%s\n' "$$msg" | $($(self.portal).deliver) && $(call agents.await,$(self.__alive__),200,$(self.portal) to register ${self} and write $(self.__marker__)); }
 
   self.serve.bg:
     '''Register with the portal, detached; returns when the actor's queue is live'''
@@ -283,10 +501,6 @@ class beam.portal.PortalActor(bases=Agent,Lifecycle)[|
     '''Release at exit: drain if needed, always drop the mailbox'''
     self.__drain__ || true
     self.mbox.purge()
-|]
-
-class beam.portal.PortalAsk(bases=Askable,beam.portal.PortalActor)[|
-  '''The portal actor with the ask verb mixed in'''
 |]
 
 class beam.portal.PortalJqd(bases=beam.portal.PortalActor,Materializable)[|

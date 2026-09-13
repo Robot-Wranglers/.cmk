@@ -4,19 +4,22 @@
 '''
 platform.beam: cmk concurrency coordination hosted on the BEAM (Elixir).
 BEAM coordinates fan-out and join; cmk runs the polyglot leaves.
-See SPIKE-BEAM.md (working log) and IDEAS-BEAM.md (strategy).
+See the beam spike docs under scratch: beam-convergence for the strategy,
+beam-actor for the resident portal built on this plugin.
 '''
 
 import virtual-machine.cmk, plugin=1
 import fmake.cmk, plugin=1
 from cmk import Dockerfile
 
-# The opt-in BEAM+cmk image (Debian base + jq); see SPIKE-BEAM.md.  fmake rides along
+# The opt-in BEAM+cmk image (Debian base + jq).  fmake rides along
 # from its own image, which shares this base; stock make stays for the cold fallback.
 Dockerfile beam.node(|
   FROM elixir:1.20-otp-28-slim
   RUN apt-get update && apt-get install -y --no-install-recommends make gawk jq
   COPY --from=compose.mk:fmake /usr/local/bin/fmake /usr/local/bin/fmake
+  ADD https://raw.githubusercontent.com/h4l/json.bash/HEAD/json.bash /usr/local/bin/json.bash
+  RUN chmod +x /usr/local/bin/json.bash && ln -s json.bash /usr/local/bin/jb
 |)
 
 # Acquiring the binary means the image it comes from must exist first.
@@ -26,7 +29,7 @@ beam.branch:
   '''
   One fork branch: run ACTOR_GOAL in a fresh _vm.ambient keyed by ACTOR_KEY,
   then emit its record on stdout -- os_rc, semantic verdict, and K frames.
-  The cmk leaf BEAM drives; see SPIKE-BEAM.md.
+  The cmk leaf BEAM drives.
   '''
   run="$${MAKE_SUPER:-$$$$}"; \
   key="$${ACTOR_KEY:-$${run}.beam.branch}"; \
@@ -42,7 +45,7 @@ beam.branch:
 # The Elixir orchestrator: Port leaf executor + fan-out/gather.
 beam.node.exs(|
   defmodule CmkLeaf do
-    # Port shape per SPIKE-BEAM: stdout to a file, stderr apart, stdin closed.
+    # Port shape: stdout to a file, stderr apart, stdin closed.
     def run(cmd, env) when is_binary(cmd) and is_map(env) do
       vf = Map.get(env, "CMK_VALUE_FILE") || tmp("val")
       env = Map.put(env, "CMK_VALUE_FILE", vf)
@@ -432,7 +435,7 @@ beam.node.ensure: beam.node.build
   d=${CMK_SCRATCH}.beam.src; mkdir -p $$d; \
   cp "$(call cmk.plugin.find,beam-node-server.exs)" "$(call cmk.plugin.find,beam-tramp.exs)" $$d/; \
   docker run -d --name ${CMK_BEAM_CLUSTER} --network ${CMK_BEAM_CLUSTER}-net \
-    --label cmk.run="$${MAKE_SUPER:-none}" -e CMK_PLUGINS_DIR=.cmk \
+    --label cmk.run="$${MAKE_SUPER:-none}" \
     ${docker.cmk.mount} -v "$${DOCKER_HOST_WORKSPACE:-$$(pwd)}":/workspace \
     -w /workspace ${beam.node.img} \
     elixir $$d/beam-node-server.exs >/dev/null; \

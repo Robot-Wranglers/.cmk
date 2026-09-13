@@ -1,0 +1,26 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+#
+# aop.cmk: 
+#   Reusable components for aspect-oriented programming
+#
+# Built on top of the more basic compiler-level support, this includes
+# decorator-style lifecycle aspects for targets, lightweight helpers 
+# for typing assertions, etc.
+#
+# cmk_pragma ::: { "kind": "module" } :::
+
+
+# aop.enter: the target is starting.
+aop.enter=cmk.log(${dim}enter ${sep} ${dim_green}${@})
+
+# aop.returned: the target body succeeded.
+aop.returned=cmk.log(${green}returned ${sep} ${dim_green}${@})
+
+# aop.finally: the body finished either way, and this also supplies the target's exit code.
+aop.finally=cmk.log(${dim}finished ${sep} ${dim_green}${@})
+
+# aop.caught: the body failed.  One brace group, else the catch leaks onto the success path.
+aop.caught={ rc=$$? ; cmk.log.warn(failed ${sep} exit=$${rc}) ; }
+
+# aop.tag: a labeled marker, for naming the concern at the use site.
+aop.tag=cmk.log(${bold}$(strip $(1))${no_ansi} ${sep} ${dim}${@})

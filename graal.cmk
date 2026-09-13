@@ -74,8 +74,16 @@ dockerfs graal_app(bind=graal_polyglot path=/build/App.java mode=0644)(|
       if (mirror) {
         Value pb = ctx.getPolyglotBindings();
         for (String k : g.getMemberKeys())
-          if (!before.contains(k) && g.getMember(k).canExecute()) pb.putMember(k, g.getMember(k));
+          if (!before.contains(k) && !k.startsWith("_") && shareable(g.getMember(k)))
+            pb.putMember(k, g.getMember(k));
       }
+    }
+    // a name crosses the heap when it is callable, structured, or a plain scalar.
+    static boolean shareable(Value v) {
+      if (v.isNull()) return false;
+      return v.canExecute() || v.canInstantiate() || v.hasHashEntries()
+        || v.hasArrayElements() || v.hasMembers()
+        || v.isString() || v.isNumber() || v.isBoolean();
     }
     static String dedent(String s) {
       int min = Integer.MAX_VALUE;
@@ -94,7 +102,7 @@ dockerfs graal_app(bind=graal_polyglot path=/build/App.java mode=0644)(|
 
 # graal base dsl; .shape carries a lang marker so + composes sections.
 dsl graal(machine=graal_polyglot classvars='__lang__=')(|
-  self.shape := $(if $(filter //!,$(firstword $(value ${self}))),,$(if self.__lang__,//! lang=$(${self}.__lang__)$(nl)))$(value ${self})
+  self.shape := $(if $(filter //!,$(firstword $(value ${self}))),,$(if self.__lang__,//! lang=$(self.__lang__)$(nl)))$(value ${self})
   self.__add__ = $(call ${self}.__concat__,${__args__})
   self.mirror = GRAAL_MIRROR=1 env=GRAAL_MIRROR self.__call__
 |)

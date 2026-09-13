@@ -4,11 +4,11 @@
 '''
 agents: a message-passing stack layered over the core Actor transport.
 
-Four classes: SocketActor puts the transport over a unix socket, Agent
-folds a mailbox and the JSON-RPC envelope onto the inproc transport,
-Askable adds the reply plane, and jqd is the socketed agent with a jq
-fold as its step.  The transmit verbs are cast, xcast, dispatch, ask,
-and handler, a placeholder name for the stdin stream of targets.
+Three classes: SocketActor puts the transport over a unix socket, Agent
+folds a mailbox, the JSON-RPC envelope, and the reply plane onto the
+inproc transport, and jqd is the socketed agent with a jq fold as its
+step.  The transmit verbs are cast, xcast, dispatch, ask, xask, and
+handler, a placeholder name for the stdin stream of targets.
 
 Library only: this module declares no instances, so importing it costs
 nothing but the classes.  See demos/cmk/jqd.cmk for the worked example.
@@ -23,6 +23,15 @@ from cmk import Actor
 # explicitly once its casts have drained never waits this out.
 CMK_ACTOR_TTL ?= 30
 
+# the ttl as a retry count, so a bounded wait is sized in seconds
+agents.ttl.tries = $$(awk 'BEGIN{print int(${CMK_ACTOR_TTL}/${FLUX_RETRY_DELAY})}')
+
+# a bounded wait that fails loudly: the retry cap, then a line naming what was awaited and a nonzero exit
+agents.await = { $(call flux.retry.sh,$(1),$(2)) || { echo "cmk: timed out waiting for $(3) errno=TIMEOUT" >&2; exit 124; }; }
+
+# an enclosing place may name a macro here, taking the recipient, and every socket send then goes through that gateway instead of dialing
+agents.gateway ?=
+
 class agents.SocketActor(bases=Actor,lifecycle.process,Iterator)[|
   '''
   Socket transport: an out-of-process mailbox over a unix socket.  One
@@ -32,13 +41,14 @@ class agents.SocketActor(bases=Actor,lifecycle.process,Iterator)[|
   owns.  Iterator but not Iterable: a fifo read cannot be undone.
   '''
   self.__pid__ = cat "$$(${self}.get_sock()).pid" 2>${devnull}
-  self.__stop__ = ${make} ${self}.serve.stop
+  self.__stop__ = self.serve.stop()
   # take-one: one framed message off the fifo on stdin, false at end of stream
   self.__next__ = IFS= read -r env && printf '%s\n' "$${env}"
   # the send as a macro, so a caller in the same run delivers without re-entering make
-  self.deliver = { sock=$$(${self}.get_sock()); msg=$$(cat); $(call flux.retry.sh,printf '%s\n' "$$msg" | socat - UNIX-CONNECT:"$$sock" 2>/dev/null); }
+  self.deliver = $(if ${agents.gateway},$(call ${agents.gateway},${self}),$(self.deliver.sock))
+  self.deliver.sock = { sock=$$(${self}.get_sock()); msg=$$(cat); [ -n "$$msg" ] || { echo "cmk: ${self}.deliver refused an empty message for $$sock errno=EMPTY_MESSAGE" >&2; exit 65; }; $(call flux.retry.sh,printf '%s\n' "$$msg" | socat - UNIX-CONNECT:"$$sock" 2>/dev/null,${agents.ttl.tries}) || { echo "cmk: ${self}.deliver: no listener on $$sock within ${CMK_ACTOR_TTL}s: $$(printf '%s\n' "$$msg" | socat - UNIX-CONNECT:"$$sock" 2>&1 >/dev/null | tail -1) errno=TIMEOUT" >&2; exit 124; }; }
   self.deliver:
-    '''Connect and send one message, retrying while the listener starts'''
+    '''Connect and send one message, retrying while the listener starts; an empty message or a listener that never answers within the ttl is an error naming the socket'''
     $(self.deliver)
 
   self.serve:
@@ -62,7 +72,7 @@ class agents.SocketActor(bases=Actor,lifecycle.process,Iterator)[|
     one slow recv per queued message.'''
     sock <- self.get_sock()
     p=`cat "$${sock}.pid" 2>/dev/null`; [ -n "$$p" ] && kill "$$p" 2>/dev/null || true
-    cmk.flux.retry.sh([ ! -e "$${sock}.fifo" ], 600)
+    $(call agents.await,[ ! -e "$${sock}.fifo" ],600,the ${self} queue at $${sock}.fifo to drain)
 |]
 
 class agents.Agent(bases=Actor)[|
@@ -102,12 +112,31 @@ class agents.Agent(bases=Actor)[|
   self.__ambient_parent__ ?= host.local
   self.__alive__ = false
   self.dispatch/%:
-    '''Run one target with a machine's promise, exit code and stdout back to the caller; a served agent needs the reply plane for that'''
-    if self.__alive__; then echo 'cmk: dispatch into ${self} refused: a loop is serving it and it has no reply plane (mix in Askable, or stream targets through handler) errno=NOT_DISPATCHABLE' >&2; exit 70; fi
-    """${*}""" | self.handler()
+    '''Run one target: in this process while no loop is alive, otherwise a blocking ask whose reply carries the exit code'''
+    if self.__alive__; then printf '{}' | self.ask(${*}); else """${*}""" | self.handler(); fi
+
+  # the reply plane: a request carries a correlation id and this actor as the reply address, and the asker polls its own mailbox for the Response
+  self.ask/%:
+    '''One round-trip: JSON params on stdin, the correlated result on stdout; a failing target comes back as an error carrying its exit code'''
+    params <- ${stream.stdin.maybe}
+    corr="c$$$$"
+    req=`${jq.run} -cn --arg m "${*}" --arg c "$$corr" --arg t "${self}" --argjson p "$${params:-null}" '{jsonrpc:"2.0",method:$$m,id:$$c,reply_to:$$t,params:($$p // {})}'`
+    """$$req""" | self.deliver()
+    $(call agents.await,${make} ${self}.reply.ready/$$corr 2>/dev/null,600,the Response to ${*} for ${self} with id $$corr)
+    rep=`self.mbox.filter(id,$$corr) | ${jq.run} -c '.[0]'`
+    printf '%s' "$$rep" | ${jq.run} -r '.result // .error.data // empty'
+    exit `printf '%s' "$$rep" | ${jq.run} -r '.error.code // 0'`
+
+  self.xask/%:
+    '''Frame the kwargs on stdin as the params object, then ask'''
+    ${jb.run} `${stream.stdin.maybe}` | self.ask(${*})
+
+  self.reply.ready/%:
+    '''True once this actor's mailbox holds the Response with the given id'''
+    self.mbox.filter(id,${*}) | ${jq.run} -e 'length>0' >/dev/null 2>&1
 
   # handle-one: a push folds into the mailbox, a Response lands there raw, any other method runs as targets and answers when the request asks; a reply to self skips the transport
-  self.__step__ = env=`${stream.stdin}` && method=`printf '%s' "$${env}" | ${jq.run} -r '.method // ""'` && if [ "$${method}" = "cmk.push" ]; then xform=`${mk.def.read}/${self} 2>/dev/null`; [ -n "$${xform}" ] || xform='.'; obj=`printf '%s' "$${env}" | ${jq.run} -c '.params // {}'`; n=`${make} ${self}.mbox.count`; printf '%s' "$${obj}" | ${jq.run} -c "$${xform}" | ${jq.run} -c --argjson s "$$((n+1))" '.seq=$$s' | $(${self}.mbox.push); elif [ -z "$${method}" ]; then n=`${make} ${self}.mbox.count`; printf '%s' "$${env}" | ${jq.run} -c --argjson s "$$((n+1))" '.seq=$$s' | $(${self}.mbox.push); else case "$${method}" in cmk.run) goals=`printf '%s' "$${env}" | ${jq.run} -r '.params.goals // ""'`;; *) goals="$${method}";; esac; rid=`printf '%s' "$${env}" | ${jq.run} -r '.id // ""'`; who=`printf '%s' "$${env}" | ${jq.run} -r '.reply_to // ""'`; if [ -n "$${rid}" ] && [ -n "$${who}" ]; then rc=0; result=`printf '%s\n' "$${goals}" | CMK_EVENT="$${env}" ${make} mk.kernel.each` || rc=$$?; if [ "$${who}" = "${self}" ]; then n=`${make} ${self}.mbox.count`; ${jq.run} -cn --arg c "$${rid}" --arg r "$${result}" --argjson x "$${rc}" --argjson s "$$((n+1))" '{jsonrpc:"2.0",id:$$c,seq:$$s} + (if $$x == 0 then {result:$$r} else {error:{code:$$x,data:$$r}} end)' | $(${self}.mbox.push); else ${jq.run} -cn --arg c "$${rid}" --arg r "$${result}" --argjson x "$${rc}" '{jsonrpc:"2.0",id:$$c} + (if $$x == 0 then {result:$$r} else {error:{code:$$x,data:$$r}} end)' | ${make} $${who}.deliver; fi; else printf '%s\n' "$${goals}" | CMK_EVENT="$${env}" ${make} mk.kernel.each; fi; fi
+  self.__step__ = env=`${stream.stdin}` && method=`printf '%s' "$${env}" | ${jq.run} -r '.method // ""'` && if [ "$${method}" = "cmk.push" ]; then xform=`${mk.def.read}/${self} 2>/dev/null`; [ -n "$${xform}" ] || xform='.'; obj=`printf '%s' "$${env}" | ${jq.run} -c '.params // {}'`; n=`self.mbox.count()`; printf '%s' "$${obj}" | ${jq.run} -c "$${xform}" | ${jq.run} -c --argjson s "$$((n+1))" '.seq=$$s' | $(self.mbox.push); elif [ -z "$${method}" ]; then n=`self.mbox.count()`; printf '%s' "$${env}" | ${jq.run} -c --argjson s "$$((n+1))" '.seq=$$s' | $(self.mbox.push); else case "$${method}" in cmk.run) goals=`printf '%s' "$${env}" | ${jq.run} -r '.params.goals // ""'`;; *) goals="$${method}";; esac; rid=`printf '%s' "$${env}" | ${jq.run} -r '.id // ""'`; who=`printf '%s' "$${env}" | ${jq.run} -r '.reply_to // ""'`; if [ -n "$${rid}" ] && [ -n "$${who}" ]; then rc=0; result=`printf '%s\n' "$${goals}" | CMK_EVENT="$${env}" ${make} mk.kernel.each` || rc=$$?; if [ "$${who}" = "${self}" ]; then n=`self.mbox.count()`; ${jq.run} -cn --arg c "$${rid}" --arg r "$${result}" --argjson x "$${rc}" --argjson s "$$((n+1))" '{jsonrpc:"2.0",id:$$c,seq:$$s} + (if $$x == 0 then {result:$$r} else {error:{code:$$x,data:$$r}} end)' | $(self.mbox.push); else ${jq.run} -cn --arg c "$${rid}" --arg r "$${result}" --argjson x "$${rc}" '{jsonrpc:"2.0",id:$$c} + (if $$x == 0 then {result:$$r} else {error:{code:$$x,data:$$r}} end)' | ${make} $${who}.deliver; fi; else printf '%s\n' "$${goals}" | CMK_EVENT="$${env}" ${make} mk.kernel.each; fi; fi
 
   self.recv:
     '''Dispatch one message off the wire: the handle-one step'''
@@ -119,38 +148,6 @@ class agents.Agent(bases=Actor)[|
     p=`cat "$${sock}.pid" 2>/dev/null`; [ -n "$$p" ] && kill "$$p" 2>/dev/null || true
     self.mbox.purge()
     rm -f -- "$$sock" "$${sock}.pid" "$${sock}.fifo" $(call flux.bg.pidfile,${self}.serve)
-|]
-
-class agents.Askable[|
-  '''
-  The reply plane as a mixin: ask/<method> transmits a request carrying a
-  correlation id and this actor as the reply address, then polls its own
-  mailbox for the correlated Response.  The responder's step posts that
-  Response itself, so a target answering an ask just prints its result, and
-  a failing target comes back as an error carrying its exit code.
-  '''
-  self.ask/%:
-    '''One round-trip: JSON params on stdin, the correlated result on stdout'''
-    params <- ${stream.stdin.maybe}
-    corr="c$$$$"
-    req=`${jq.run} -cn --arg m "${*}" --arg c "$$corr" --arg t "${self}" --argjson p "$${params:-null}" '{jsonrpc:"2.0",method:$$m,id:$$c,reply_to:$$t,params:($$p // {})}'`
-    """$$req""" | self.deliver()
-    cmk.flux.retry.sh(${make} ${self}.reply.ready/$$corr 2>/dev/null, 600)
-    rep=`${make} ${self}.mbox.filter/id,$$corr | ${jq.run} -c '.[0]'`
-    printf '%s' "$$rep" | ${jq.run} -r '.result // .error.data // empty'
-    exit `printf '%s' "$$rep" | ${jq.run} -r '.error.code // 0'`
-
-  self.dispatch/%:
-    '''Run one target: in this process while no loop is alive, otherwise a blocking ask whose reply carries the exit code'''
-    if self.__alive__; then printf '{}' | ${make} ${self}.ask/${*}; else """${*}""" | self.handler(); fi
-
-  self.xask/%:
-    '''Frame the kwargs on stdin as the params object, then ask'''
-    ${jb.run} `${stream.stdin.maybe}` | ${make} ${self}.ask/${*}
-
-  self.reply.ready/%:
-    '''True once this actor's mailbox holds the Response with the given id'''
-    ${make} ${self}.mbox.filter/id,${*} | ${jq.run} -e 'length>0' >/dev/null 2>&1
 |]
 
 class agents.jqd(bases=agents.SocketActor,agents.Agent,Materializable)[|

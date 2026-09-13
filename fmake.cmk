@@ -20,7 +20,7 @@ from cmk import Dockerfile, dockerfs
 import log
 
 # Per-execution names a shared parse would freeze; the pid list takes the child's own.
-rearm ?= _mk.run.id CMK_IO_STACK CMK_BRF_PREFIX CMK_SCRATCH
+rearm ?= _mk.run.id CMK_IO_STACK CMK_BRF_PREFIX CMK_SCRATCH FMAKE_CLIENT
 rearm.pid ?= _cmk.pid
 
 # A stale zygote answers a later run with the wrong program, so liveness is caller-facing status.

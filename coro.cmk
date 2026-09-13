@@ -1,0 +1,77 @@
+#!/usr/bin/env -S ./compose.mk cmk compile
+
+# cmk_pragma ::: { "kind": "module" } :::
+
+'''
+coro.cmk: asymmetric coroutines over the reflective virtual machine.
+A coroutine is a set of step targets named for it, entered at its `enter` step, where
+every transfer names its destination.  State lives in the reflective environment, which
+is what survives a transfer.  Lua supplies the surface and protothreads the resumption
+strategy; see .cmk/docs/coro.md for the lineage and for why await was rejected.
+'''
+
+import log
+
+max_resumes ?= 12
+
+# a step reads its own identity off the target name, so no verb has to repeat it.
+coro.self = $(firstword $(subst ., ,${@}))
+coro.here = $(lastword $(subst ., ,${@}))
+
+# the state slots, one family per coroutine, all spelled at parse time.
+coro.ip = coro_$(strip ${1})_ip
+coro.st = coro_$(strip ${1})_st
+coro.res = coro_$(strip ${1})_res
+coro.ct = coro_$(strip ${1})_ct
+
+coro.status = printf '%s\n' "$${cmk.coro.st(${1}):-suspended}"
+coro.dead? = test "$${cmk.coro.st(${1}):-suspended}" = dead
+
+# the decorator: marks a step, and checks it belongs to whoever is running.
+coro.step = { test "$${coro_current:-}" = "$(coro.self)" \
+	|| { cmk.log.warn(coro ${sep} $(coro.self).$(coro.here) entered while $${coro_current:-nobody} is running) ; \
+		exit 1 ; } ; }
+
+# a resume ceiling, since a label that stops advancing would otherwise spin forever.
+coro.guard = export cmk.coro.ct(${1})=$$(( $${cmk.coro.ct(${1}):-0} + 1 )) \
+	&& { test "$${cmk.coro.ct(${1})}" -le ${max_resumes} \
+		|| { cmk.log.warn(coro ${sep} $(strip ${1}) exceeded ${max_resumes} resumes) ; exit 1 ; } ; }
+
+# resume: record the caller, mark it normal, then enter the target at its saved label.
+coro.resume = cmk.coro.guard(${1}) \
+	&& export cmk.coro.res(${1})="$${coro_current:-}" \
+	&& { test -z "$${coro_current:-}" \
+		|| { _ck="coro_$${coro_current}_st" ; export "$${_ck}=normal" ; } ; } \
+	&& export coro_current=$(strip ${1}) \
+	&& export cmk.coro.ip(${1})="$${cmk.coro.ip(${1}):-enter}" \
+	&& export cmk.coro.st(${1})=running \
+	&& cmk.vm.goto($(strip ${1}).$${cmk.coro.ip(${1})})
+
+# resume.then: resume, but come back to a named step instead of to this one.
+coro.resume.then = export cmk.coro.ip($(coro.self))=$(strip ${2}) \
+	&& cmk.coro.resume(${1})
+
+# yield.to: suspend, publish a value, and name the step the next resume lands on.
+coro.yield.to = export yielded="$(strip ${2})" \
+	&& export cmk.coro.ip($(coro.self))=$(strip ${1}) \
+	&& export cmk.coro.st($(coro.self))=suspended \
+	&& ${coro.back}
+
+# yield: the resume-here case of yield.to, which is what Lua's yield does.
+coro.yield = cmk.coro.yield.to($(coro.here),${1})
+
+# goto: move to another of this coroutine's steps and continue there, keeping control.
+coro.goto = export cmk.coro.ip($(coro.self))=$(strip ${1}) \
+	&& cmk.vm.goto($(coro.self).$(strip ${1}))
+
+coro.exit = export yielded="$(strip ${1})" \
+	&& export cmk.coro.st($(coro.self))=dead \
+	&& ${coro.back}
+
+# back: hand control to the resumer, restoring it to running as control lands.
+coro.back = _r="$${cmk.coro.res($(coro.self))}" \
+	&& { test -n "$${_r}" || { log(coro ${sep} top level reached) ; exit 0 ; } ; } \
+	&& export coro_current="$${_r}" \
+	&& _rs="coro_$${_r}_st" && export "$${_rs}=running" \
+	&& _rk="coro_$${_r}_ip" \
+	&& cmk.vm.goto($${_r}.$${!_rk})

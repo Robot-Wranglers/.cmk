@@ -47,14 +47,14 @@ constructor strategy(umbrella=1)[|
   frontier) and the self-labeling `.log` / `.log.error`.  `umbrella=1` mints each instance
   under `strategy.` -- so `strategy.posix`, not a bare `posix`.
   '''
-  ${self}.owner  ?= us
-  ${self}.kind   ?= or
-  ${self}.select ?= $(firstword $1)
-  ${self}.push   ?= append
-  ${self}.admit  ?= all
-  ${self}.eval      = $(call __strategies__.eval,${self},$1)
-  ${self}.log       = $(call log,${self} ${sep} $1)
-  ${self}.log.error = $(call log.error,${self} ${sep} $1)
+  self.owner  ?= us
+  self.kind   ?= or
+  self.select ?= $(firstword $1)
+  self.push   ?= append
+  self.admit  ?= all
+  self.eval      = $(call __strategies__.eval,${self},$1)
+  self.log       = $(call log,${self} ${sep} $1)
+  self.log.error = $(call log.error,${self} ${sep} $1)
   $(call lang.seed.into!,${self},${1},${body1})
   $(call __strategies__.add,${self})
 |]
@@ -69,20 +69,20 @@ class StrategyRegistry[|
   active selection (`.default` / `.active` / `.eval.active`).
   '''
   ${self} ?=
-  ${self}.has     = $(strip $(filter $(firstword $(1)),$(${self})))
-  ${self}.add     = $(if $(call ${self}.has,$(1)),,$(eval ${self} += $(1)))
-  ${self}.require = $(if $(call ${self}.has,$(1)),,$(error strategy $(firstword $(1)) was never constructed))
-  ${self}._prereq = $(if $(filter-out undefined,$(origin prereq.$(strip $(1)))),$(prereq.$(strip $(1))),)
-  ${self}._push   = $(if $(filter prepend,$($(1).push)),$(2) $(3),$(3) $(2))
-  ${self}._admit  = $(if $(filter unbuilt-and-stale,$($(1).admit)),$(filter-out $(3) ${up_to_date},$(2)),$(2))
-  ${self}._step   = $(if $(call ${self}._admit,$(1),$(4),$(3)),$(4) $(call ${self}._walk,$(1),$(call ${self}._push,$(1),$(call ${self}._prereq,$(4)),$(filter-out $(4),$(2))),$(3) $(4)),$(call ${self}._walk,$(1),$(filter-out $(4),$(2)),$(3)))
-  ${self}._walk   = $(if $(strip $(2)),$(call ${self}._step,$(1),$(2),$(3),$(call $(1).select,$(2))))
-  ${self}.eval    = $(strip $(call ${self}._walk,$(1),$(2),))
-  ${self}.default     = $(if $(filter-out undefined,$(origin CMK_PRAGMA_STRATEGY)),${CMK_PRAGMA_STRATEGY},strategy.step)
-  ${self}.active      = $(or ${__strategy__},$(${self}.default))
-  ${self}.active.doc  = $($(${self}.active).__doc__)
-  ${self}.eval.active = $(call $(${self}.active).eval,$(1))
-  ${self}.log         = $(call log,${self} ${sep} $(1))
+  self.has     = $(strip $(filter $(firstword $(1)),$(${self})))
+  self.add     = $(if $(call ${self}.has,$(1)),,$(eval ${self} += $(1)))
+  self.require = $(if $(call ${self}.has,$(1)),,$(error strategy $(firstword $(1)) was never constructed))
+  self._prereq = $(if $(filter-out undefined,$(origin prereq.$(strip $(1)))),$(prereq.$(strip $(1))),)
+  self._push   = $(if $(filter prepend,$($(1).push)),$(2) $(3),$(3) $(2))
+  self._admit  = $(if $(filter unbuilt-and-stale,$($(1).admit)),$(filter-out $(3) ${up_to_date},$(2)),$(2))
+  self._step   = $(if $(call ${self}._admit,$(1),$(4),$(3)),$(4) $(call ${self}._walk,$(1),$(call ${self}._push,$(1),$(call ${self}._prereq,$(4)),$(filter-out $(4),$(2))),$(3) $(4)),$(call ${self}._walk,$(1),$(filter-out $(4),$(2)),$(3)))
+  self._walk   = $(if $(strip $(2)),$(call ${self}._step,$(1),$(2),$(3),$(call $(1).select,$(2))))
+  self.eval    = $(strip $(call ${self}._walk,$(1),$(2),))
+  self.default     = $(if $(filter-out undefined,$(origin CMK_PRAGMA_STRATEGY)),${CMK_PRAGMA_STRATEGY},strategy.step)
+  self.active      = $(or ${__strategy__},$(self.default))
+  self.active.doc  = $($(self.active).__doc__)
+  self.eval.active = $(call $(self.active).eval,$(1))
+  self.log         = $(call log,${self} ${sep} $(1))
 |]
 cmk.StrategyRegistry(__strategies__)
 
@@ -110,7 +110,7 @@ strategy portfolio(|
   portfolio strategy: the swarm racer.  Rotate the frontier by SEED before consuming,
   so different seeds explore in different orders (swarm-search.cmk as a declaration).
   '''
-  ${self}.select = $(word $(shell expr $(strip ${SEED}) % $(strip $(words $1)) + 1),$1)
+  self.select = $(word $(shell expr $(strip ${SEED}) % $(strip $(words $1)) + 1),$1)
 |)
 
 strategy best_first(|
@@ -120,7 +120,7 @@ strategy best_first(|
   single-digit costs so a lexical sort on cost:goal keys orders numerically; a real
   impl would zero-pad or sort -n.)
   '''
-  ${self}.select = $(word 2,$(subst :, ,$(firstword $(sort $(foreach g,$1,${cost.$g}:$g)))))
+  self.select = $(word 2,$(subst :, ,$(firstword $(sort $(foreach g,$1,${cost.$g}:$g)))))
 |)
 
 strategy posix(|
@@ -130,11 +130,11 @@ strategy posix(|
   DFS over the prereq DAG via push=prepend; post-order;
   build-once + timestamp-pruned and up-to-date via admit.
   '''
-  ${self}.owner  := build
-  ${self}.kind   := and
-  ${self}.select  = $(firstword $1)
-  ${self}.push   := prepend
-  ${self}.admit  := unbuilt-and-stale
+  self.owner  := build
+  self.kind   := and
+  self.select  = $(firstword $1)
+  self.push   := prepend
+  self.admit  := unbuilt-and-stale
 |)
 
 # __main__: ( run the module directly to list the strategies it provides )

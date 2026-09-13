@@ -102,15 +102,22 @@ Dockerfile j2c(|
   RUN wget -q https://github.com/mattvonrocketstein/tux.progress/releases/latest/download/tux.progress-linux-amd64 -O /usr/local/bin/tux.progress && chmod +x /usr/local/bin/tux.progress
 |)
 
-docs.render.io/%:; j2c.dispatch(self.docs.render.io/${*})
+# Guard before the container spins up: a directory, or a template resolved the way the driver resolves it.
+docs.render.resolvable=[ -d "$(strip ${1})" ] || [ -f "$(strip ${1})" ] || [ -f "$(strip ${1}).j2" ] || [ -f "$(strip ${1}).md.j2" ] || { $(call log.error, no such docs template or directory ${sep} ${bold}$(strip ${1})) ; $(call mk.die, no such docs template or directory, errno=FILE_MISSING, file=$(strip ${1})) ; }
+
+docs.render.io/%:
   '''Render one template to an explicit comma-delimited input,output.'''
+  $(call assert.file, $(call mk.unpack.arg, 1))
+  j2c.dispatch(self.docs.render.io/${*})
 
 self.docs.render.io/%:
   '''Render one template with explicit input,output (runs in the container).'''
   python3 ⬥_docs.render.py $(call mk.unpack.arg, 1) -o $(call mk.unpack.arg, 2)
 
-docs.render/%:; j2c.dispatch(self.docs.render/${*})
+docs.render/%:
   '''Render one template, or every template under one directory, in place.'''
+  $(call docs.render.resolvable, ${*})
+  j2c.dispatch(self.docs.render/${*})
 
 self.docs.render/%:
   '''Render in place (in the container).  Accepts foo.md.j2, foo.md, or bare foo --

@@ -5,7 +5,7 @@ if ! command -v "${_fmake_}" >/dev/null 2>&1; then
   _cmk_bootloader_log "fmake loader: ${_fmake_} is not on PATH; running cold"
   return 0
 fi
-export FMAKE_REARM="${FMAKE_REARM:-_mk.run.id CMK_IO_STACK CMK_BRF_PREFIX CMK_SCRATCH}"
+export FMAKE_REARM="${FMAKE_REARM:-_mk.run.id CMK_IO_STACK CMK_BRF_PREFIX CMK_SCRATCH FMAKE_CLIENT}"
 export FMAKE_REARM_PID="${FMAKE_REARM_PID:-_cmk.pid}"
 _fmake_sock_="${TMPDIR:-/tmp}/cmk-fmake.$$.sock"
 "${_fmake_}" --serve "${_fmake_sock_}" ${_mkflags_} -f "${CMK_TWIN_PATH:-${0}}" flux.ok </dev/null >/dev/null 2>&1 &
